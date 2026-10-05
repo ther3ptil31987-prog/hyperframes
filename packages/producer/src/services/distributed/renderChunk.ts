@@ -63,6 +63,7 @@ import {
   resolveConfig,
 } from "@hyperframes/engine";
 import { defaultLogger } from "../../logger.js";
+import { applyRenderWarningPolicy } from "../renderOrchestrator.js";
 import { runEncodeStage } from "../render/stages/encodeStage.js";
 import { runCaptureStage } from "../render/stages/captureStage.js";
 import { resolveVideoCaptureBeyondViewport } from "../render/captureBeyondViewport.js";
@@ -78,6 +79,7 @@ import {
   buildVirtualTimeShim,
   closeFileServerSafely,
   createFileServer,
+  resolveRenderFpsConfig,
   type FileServerHandle,
 } from "../fileServer.js";
 import {
@@ -678,6 +680,7 @@ export async function renderChunk(
               planVideos.extracted,
               v2Manifest === null ? "dense-v1" : "sparse-v2",
             ),
+            resolveRenderFpsConfig(job.config.fps).value,
           )
         : null;
     const createChunkVideoFrameInjector = createChunkVideoFrameInjectorFactory(videoFrameLookup);
@@ -922,6 +925,11 @@ export async function renderChunk(
         },
       });
       captureStageMs = Date.now() - captureStarted;
+      applyRenderWarningPolicy(
+        job,
+        capturePerfs.flatMap((perf) => perf.warnings ?? []),
+        log,
+      );
       framesEncoded = framesInChunk;
 
       // ── Encode the chunk ──

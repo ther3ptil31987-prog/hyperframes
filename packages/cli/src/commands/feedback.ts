@@ -6,7 +6,7 @@ import * as clack from "@clack/prompts";
 import open from "open";
 import type { Example } from "./_examples.js";
 import { trackCatalogSearchMiss, trackRenderFeedback } from "../telemetry/events.js";
-import { shouldTrack, flush } from "../telemetry/client.js";
+import { shouldTrack } from "../telemetry/client.js";
 import { getDoctorSummary } from "../telemetry/feedback.js";
 import { readConfig, type RecentRenderRecord } from "../telemetry/config.js";
 import { publishProjectArchive } from "../utils/publishProject.js";
@@ -15,6 +15,7 @@ import { buildIssueUrl, HYPERFRAMES_REPO_URL } from "../utils/feedbackIssue.js";
 import { VERSION } from "../version.js";
 import { c } from "../ui/colors.js";
 import { parseFeedbackRating } from "../utils/feedbackRating.js";
+import { feedbackEmail, parseFeedbackSource } from "../utils/feedbackSource.js";
 import { lintFeedbackComment, type FeedbackLintInput } from "../utils/feedbackLint.js";
 
 export const examples: Example[] = [
@@ -155,7 +156,7 @@ async function fileGithubIssue(opts: {
 }
 
 export default defineCommand({
-  meta: { name: "feedback", description: "Submit anonymous feedback about your experience" },
+  meta: { name: "feedback", description: "Submit feedback about your experience" },
   args: {
     rating: {
       type: "string",
@@ -166,6 +167,10 @@ export default defineCommand({
     comment: {
       type: "string",
       description: "Optional details about your experience",
+    },
+    source: {
+      type: "string",
+      description: 'Who wrote the report: "person" or "agent"',
     },
     "search-miss": {
       type: "string",
@@ -208,7 +213,6 @@ export default defineCommand({
       const wanted = normalizeComment(args.wanted);
       const tier = normalizeComment(args.tier);
       trackCatalogSearchMiss({ query: searchMiss, wanted, tier });
-      await flush();
       // Ack before the forward, which is best-effort and bounded, so the
       // reporter is never left waiting on it.
       console.log(c.dim("Logged the gap. Thanks — that is how the catalog grows."));
@@ -221,6 +225,12 @@ export default defineCommand({
     const rating = args.rating === undefined ? null : parseFeedbackRating(args.rating);
     if (rating === null) {
       console.error(c.error("Rating must be an integer between 0 and 10"));
+      failCommand();
+    }
+
+    const source = parseFeedbackSource(args.source);
+    if (source === null) {
+      console.error(c.error('Source must be "person" or "agent"'));
       failCommand();
     }
 
@@ -259,11 +269,17 @@ export default defineCommand({
       recentRenderIds: config.recentRenders?.map((r) => r.id),
     });
 
-    await flush();
     // Ack first so the user isn't kept waiting on the best-effort forward (which
     // is bounded to a few seconds and never surfaces an error either way).
     console.log(c.dim("Thanks for the feedback!"));
-    await submitFeedback({ rating, comment, cliVersion: VERSION, env: envWithJoinKeys });
+    await submitFeedback({
+      rating,
+      comment,
+      cliVersion: VERSION,
+      env: envWithJoinKeys,
+      source,
+      email: feedbackEmail(),
+    });
 
     if (args["file-issue"] === true) {
       await fileGithubIssue({

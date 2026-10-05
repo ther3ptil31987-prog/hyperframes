@@ -949,6 +949,7 @@ function reportWithFindings(overrides: Partial<CheckReport> = {}): CheckReport {
   return {
     ok: true,
     strict: false,
+    browserSkipped: false,
     lint: { ...emptySection(), filesScanned: 0 },
     runtime: emptySection(),
     layout: {
@@ -1047,6 +1048,7 @@ describe("check pipeline", () => {
     const envelope = JSON.parse(output);
     expect(envelope).toMatchObject({
       ok: true,
+      browserSkipped: false,
       lint: { ok: true },
       runtime: { ok: true },
       layout: { ok: true },
@@ -1057,7 +1059,7 @@ describe("check pipeline", () => {
     });
   });
 
-  it("short-circuits on lint errors without launching a browser", async () => {
+  it("short-circuits on lint errors without launching a browser, and flags the skipped sections", async () => {
     const lint = lintWith(
       "error",
       "root_missing_composition_id",
@@ -1069,6 +1071,42 @@ describe("check pipeline", () => {
     expect(checkExitCode(report)).toBe(1);
     expect(report.lint.findings).toHaveLength(1);
     expect(browser).not.toHaveBeenCalled();
+    // The browser sections look clean either way; only browserSkipped tells them apart.
+    expect(report.browserSkipped).toBe(true);
+    expect(report.runtime).toMatchObject({ ok: true, errorCount: 0, findings: [] });
+    expect(report.layout).toMatchObject({ ok: true, errorCount: 0, findings: [], duration: 0 });
+    expect(report.motion).toMatchObject({ ok: true, errorCount: 0, findings: [] });
+    expect(report.contrast).toMatchObject({ ok: true, errorCount: 0, findings: [] });
+  });
+
+  it("marks browserSkipped true when the linter itself crashes", async () => {
+    const { deps } = dependencies(fakeDriver());
+    deps.lintProject = vi.fn(async () => {
+      throw new Error("unreadable index.html");
+    });
+    const report = await runCheckPipeline(PROJECT, DEFAULT_CHECK_OPTIONS, deps);
+
+    expect(report.ok).toBe(false);
+    expect(report.browserSkipped).toBe(true);
+    expect(report.runtime.findings[0]?.code).toBe("check_lint_failure");
+  });
+
+  it("marks browserSkipped false once a browser session actually runs", async () => {
+    const { report } = await runScenario(fakeDriver());
+    expect(report.browserSkipped).toBe(false);
+  });
+
+  it("marks browserSkipped true when the browser session throws before producing results", async () => {
+    const { deps } = dependencies(fakeDriver());
+    deps.runBrowserCheck = vi.fn(async () => {
+      throw new Error("Chrome launch failed");
+    });
+    const report = await runCheckPipeline(PROJECT, DEFAULT_CHECK_OPTIONS, deps);
+
+    expect(report.ok).toBe(false);
+    expect(report.browserSkipped).toBe(true);
+    expect(report.runtime.findings).toHaveLength(1);
+    expect(report.layout).toMatchObject({ ok: true, errorCount: 0, findings: [] });
   });
 
   it("gates AA contrast failures and --no-contrast skips the pass", async () => {
@@ -1477,6 +1515,29 @@ describe("check pipeline", () => {
             finding.message.includes("did not advance"),
         ),
       ).toBe(true);
+    });
+
+    it("does not flag --at times the user picked on a still end card", async () => {
+      const driver = fakeDriver({
+        getDuration: vi.fn(async () => 53.7),
+        collectLayoutGeometry: vi.fn(async () => "frozen"),
+      });
+      const { report } = await runScenario(driver, { at: [51, 52.5] });
+
+      expect(report.layout.samples).toEqual([51, 52.5]);
+      expect(report.layout.findings.some((finding) => finding.code === "sweep_static")).toBe(false);
+    });
+
+    it("still judges the spread samples --at-transitions adds to an --at run", async () => {
+      const driver = fakeDriver({
+        getDuration: vi.fn(async () => 53.7),
+        getTransitionBoundaries: vi.fn(async () => [10, 20]),
+        collectLayoutGeometry: vi.fn(async () => "frozen"),
+      });
+      const { report } = await runScenario(driver, { at: [51, 52.5], atTransitions: true });
+
+      expect(report.layout.samples).toEqual([10, 15, 20, 51, 52.5]);
+      expect(report.layout.findings.some((finding) => finding.code === "sweep_static")).toBe(true);
     });
 
     it("does not flag intentional static content declared with data-no-timeline", async () => {

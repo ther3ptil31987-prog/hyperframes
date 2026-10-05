@@ -5,9 +5,12 @@ import { describe, expect, it, vi } from "vitest";
 import { shouldUseSdkCutover } from "../utils/sdkCutover";
 import type { PatchOperation } from "../utils/sourcePatcher";
 import type { Composition } from "@hyperframes/sdk";
+import type { GsapAnimation } from "@hyperframes/core/gsap-parser";
 import type { DomEditSelection } from "../components/editor/domEditingTypes";
 import type { TimelineElement } from "../player";
 import type { UseDomEditSessionParams } from "./useDomEditSession";
+import { makeSelection } from "./domSelectionTestHarness";
+import { readTranslatePx } from "../components/editor/plainTranslate";
 
 const styleOp = (property: string, value: string): PatchOperation => ({
   type: "inline-style",
@@ -62,6 +65,9 @@ const domEditSelectionRef: { current: DomEditSelection | null } = { current: nul
 const domEditGroupSelectionsRef: { current: DomEditSelection[] } = { current: [] };
 const groupSelectionSpy = vi.fn();
 const gsapCommitMutation = Object.assign(vi.fn(), { batch: vi.fn() });
+const neverParsed = new Promise<{ animations: GsapAnimation[] }>(() => undefined);
+const parsedFile = { current: neverParsed };
+const groupCommitSpy = vi.fn(async () => {});
 
 function createSessionParams(
   overrides: Partial<UseDomEditSessionParams> = {},
@@ -99,6 +105,7 @@ function createSessionParams(
     reloadPreview: vi.fn(),
     setRefreshKey: vi.fn(),
     handleTimelineElementsDelete: vi.fn(),
+    readOnlyPreview: false,
     ...overrides,
   };
 }
@@ -128,26 +135,30 @@ vi.mock("./useDomEditCommits", () => ({
     };
   },
 }));
+const iframesHandedOn: Array<{ hook: string; iframe: unknown }> = [];
 vi.mock("./useDomSelection", () => ({
-  useDomSelection: () => ({
-    domEditSelection: domEditSelectionRef.current,
-    domEditGroupSelections: [],
-    domEditHoverSelection: null,
-    activeGroupElement: null,
-    domEditSelectionRef,
-    domEditGroupSelectionsRef,
-    setActiveGroupElement: vi.fn(),
-    applyDomSelection: vi.fn(),
-    clearDomSelection: vi.fn(),
-    buildDomSelectionFromTarget: vi.fn(),
-    resolveDomSelectionFromPreviewPoint: vi.fn(),
-    resolveAllDomSelectionsFromPreviewPoint: vi.fn(),
-    updateDomEditHoverSelection: vi.fn(),
-    buildDomSelectionForTimelineElement: vi.fn(),
-    handleTimelineElementSelect: vi.fn(),
-    refreshDomEditSelectionFromPreview: vi.fn(),
-    applyMarqueeSelection: vi.fn(),
-  }),
+  useDomSelection: ({ previewIframe }: { previewIframe: unknown }) => {
+    iframesHandedOn.push({ hook: "selection", iframe: previewIframe });
+    return {
+      domEditSelection: domEditSelectionRef.current,
+      domEditGroupSelections: [],
+      domEditHoverSelection: null,
+      activeGroupElement: null,
+      domEditSelectionRef,
+      domEditGroupSelectionsRef,
+      setActiveGroupElement: vi.fn(),
+      applyDomSelection: vi.fn(),
+      clearDomSelection: vi.fn(),
+      buildDomSelectionFromTarget: vi.fn(),
+      resolveDomSelectionFromPreviewPoint: vi.fn(),
+      resolveAllDomSelectionsFromPreviewPoint: vi.fn(),
+      updateDomEditHoverSelection: vi.fn(),
+      buildDomSelectionForTimelineElement: vi.fn(),
+      handleTimelineElementSelect: vi.fn(),
+      refreshDomEditSelectionFromPreview: vi.fn(),
+      applyMarqueeSelection: vi.fn(),
+    };
+  },
 }));
 vi.mock("./useAskAgentModal", () => ({
   useAskAgentModal: () => ({
@@ -165,7 +176,12 @@ vi.mock("./useAskAgentModal", () => ({
 vi.mock("./useStudioSelectionPublisher", () => ({
   useStudioSelectionPublisher: () => {},
 }));
-vi.mock("./useGsapTweenCache", () => ({
+vi.mock("./keyframeCacheAstLoad", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./keyframeCacheAstLoad")>()),
+  fetchParsedAnimations: () => parsedFile.current,
+}));
+vi.mock("./useGsapTweenCache", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("./useGsapTweenCache")>()),
   useGsapCacheVersion: () => ({ version: 0, bump: vi.fn() }),
 }));
 vi.mock("./useGsapScriptCommits", () => ({
@@ -199,33 +215,36 @@ vi.mock("./useGroupCommits", () => ({
   }),
 }));
 vi.mock("./useDomEditWiring", () => ({
-  useDomEditWiring: () => ({
-    onClickToSource: vi.fn(),
-    selectedGsapAnimations: [],
-    gsapMultipleTimelines: false,
-    gsapUnsupportedTimelinePattern: false,
-    trackGsapInteractionFailure: vi.fn(),
-    makeFetchFallback: vi.fn(),
-    handleGsapUpdateProperty: vi.fn(),
-    handleGsapUpdateMeta: vi.fn(),
-    handleGsapDeleteAnimation: vi.fn(),
-    handleGsapDeleteAllForElement: vi.fn(),
-    handleGsapAddAnimation: vi.fn(),
-    handleGsapAddProperty: vi.fn(),
-    handleGsapRemoveProperty: vi.fn(),
-    handleGsapUpdateFromProperty: vi.fn(),
-    handleGsapAddFromProperty: vi.fn(),
-    handleGsapRemoveFromProperty: vi.fn(),
-    handleGsapAddKeyframe: vi.fn(),
-    handleGsapAddKeyframeBatch: vi.fn(),
-    handleGsapRemoveKeyframe: vi.fn(),
-    handleGsapMoveKeyframeToPlayhead: vi.fn(),
-    handleGsapMoveKeyframe: vi.fn(),
-    handleGsapResizeKeyframedTween: vi.fn(),
-    handleGsapConvertToKeyframes: vi.fn(),
-    handleGsapRemoveAllKeyframes: vi.fn(),
-    handleResetSelectedElementKeyframes: vi.fn(),
-  }),
+  useDomEditWiring: ({ previewIframe }: { previewIframe: unknown }) => {
+    iframesHandedOn.push({ hook: "wiring", iframe: previewIframe });
+    return {
+      onClickToSource: vi.fn(),
+      selectedGsapAnimations: [],
+      gsapMultipleTimelines: false,
+      gsapUnsupportedTimelinePattern: false,
+      trackGsapInteractionFailure: vi.fn(),
+      makeFetchFallback: vi.fn(),
+      handleGsapUpdateProperty: vi.fn(),
+      handleGsapUpdateMeta: vi.fn(),
+      handleGsapDeleteAnimation: vi.fn(),
+      handleGsapDeleteAllForElement: vi.fn(),
+      handleGsapAddAnimation: vi.fn(),
+      handleGsapAddProperty: vi.fn(),
+      handleGsapRemoveProperty: vi.fn(),
+      handleGsapUpdateFromProperty: vi.fn(),
+      handleGsapAddFromProperty: vi.fn(),
+      handleGsapRemoveFromProperty: vi.fn(),
+      handleGsapAddKeyframe: vi.fn(),
+      handleGsapAddKeyframeBatch: vi.fn(),
+      handleGsapRemoveKeyframe: vi.fn(),
+      handleGsapMoveKeyframeToPlayhead: vi.fn(),
+      handleGsapMoveKeyframe: vi.fn(),
+      handleGsapResizeKeyframedTween: vi.fn(),
+      handleGsapConvertToKeyframes: vi.fn(),
+      handleGsapRemoveAllKeyframes: vi.fn(),
+      handleResetSelectedElementKeyframes: vi.fn(),
+    };
+  },
 }));
 vi.mock("./usePreviewInteraction", () => ({
   usePreviewInteraction: () => ({
@@ -239,7 +258,7 @@ vi.mock("./usePreviewInteraction", () => ({
 vi.mock("./useGsapAwareEditing", () => ({
   useGsapAwareEditing: () => ({
     handleGsapAwarePathOffsetCommit: vi.fn(),
-    handleGsapAwareGroupPathOffsetCommit: vi.fn(),
+    handleGsapAwareGroupPathOffsetCommit: groupCommitSpy,
     handleGsapAwareBoxSizeCommit: vi.fn(),
     handleGsapAwareRotationCommit: vi.fn(),
     commitAnimatedProperty: vi.fn(),
@@ -301,32 +320,9 @@ describe("onReorderShadow source filter", () => {
 describe("bulk segment ease commits", () => {
   it("uses one ordered batch for many ids and sane paths for one or no ids", async () => {
     const { useDomEditSession } = await import("./useDomEditSession");
-    const selection: DomEditSelection = {
-      id: "hero",
-      element: document.createElement("div"),
-      label: "Hero",
-      tagName: "DIV",
-      sourceFile: "index.html",
-      compositionPath: "index.html",
-      isCompositionHost: false,
-      isInsideLockedComposition: false,
-      boundingBox: { x: 0, y: 0, width: 100, height: 100 },
-      textContent: null,
-      dataAttributes: {},
-      inlineStyles: {},
-      computedStyles: {},
-      textFields: [],
-      capabilities: {
-        canSelect: true,
-        canEditStyles: true,
-        canCrop: true,
-        canMove: true,
-        canResize: true,
-        canApplyManualOffset: true,
-        canApplyManualSize: true,
-        canApplyManualRotation: true,
-      },
-    };
+    const hero = document.createElement("div");
+    hero.id = "hero";
+    const selection = makeSelection("Hero", hero);
     domEditSelectionRef.current = selection;
     gsapCommitMutation.mockClear();
     gsapCommitMutation.batch.mockClear();
@@ -407,6 +403,48 @@ describe("bulk segment ease commits", () => {
       }
     } finally {
       domEditSelectionRef.current = null;
+      act(() => root.unmount());
+    }
+  });
+});
+
+describe("the session hands out selections narrowed to what the GSAP commit accepts", () => {
+  it("closes the move of a helper-loop element once its preflight lands", async () => {
+    const { useDomEditSession } = await import("./useDomEditSession");
+    domEditSelectionRef.current = {
+      id: "hero",
+      selector: "#hero",
+      element: document.createElement("div"),
+      sourceFile: "index.html",
+      capabilities: {
+        canApplyManualOffset: true,
+        canApplyManualSize: true,
+        canApplyManualRotation: true,
+      },
+    } as unknown as DomEditSelection;
+    const loop = { targetSelector: "#hero", properties: { x: 100 }, provenance: { kind: "loop" } };
+    parsedFile.current = Promise.resolve({ animations: [loop as unknown as GsapAnimation] });
+    const seen: { selection?: DomEditSelection | null } = {};
+    function Probe() {
+      seen.selection = useDomEditSession(createSessionParams()).domEditSelection;
+      return null;
+    }
+    const root = createRoot(document.createElement("div"));
+    try {
+      act(() => root.render(<Probe />));
+      expect(seen.selection?.capabilities.canApplyManualOffset).toBe(false);
+      await act(async () => {
+        for (let tick = 0; tick < 10; tick++) await Promise.resolve();
+      });
+      expect(seen.selection?.capabilities).toMatchObject({
+        canApplyManualOffset: false,
+        canApplyManualSize: true,
+        canApplyManualRotation: true,
+        reasonIfDisabled: expect.stringContaining("helper or loop"),
+      });
+    } finally {
+      domEditSelectionRef.current = null;
+      parsedFile.current = neverParsed;
       act(() => root.unmount());
     }
   });
@@ -548,5 +586,51 @@ describe("handleDomEditElementDelete routing", () => {
     });
     expect(handleTimelineElementsDelete).toHaveBeenCalledWith([clipA, clipB]);
     expect(handleDomEditElementsDeleteMock).not.toHaveBeenCalled();
+  });
+});
+
+describe("a shadow reload promoted without a host re-render", () => {
+  it("hands the promoted iframe to the session's selection and preview sync", async () => {
+    const { useDomEditSession } = await import("./useDomEditSession");
+    const { announcePreviewPromoted } = await import("../player/sceneSwap");
+    const [host, promoted] = [0, 1].map(() => document.createElement("iframe"));
+    function Probe() {
+      useDomEditSession(createSessionParams({ previewIframe: host! }));
+      return null;
+    }
+    const root = createRoot(document.createElement("div"));
+    act(() => root.render(<Probe />));
+    act(() => announcePreviewPromoted({ retired: host!, live: promoted! }));
+    const last = (hook: string) => iframesHandedOn.findLast((seen) => seen.hook === hook)?.iframe;
+    expect(last("selection")).toBe(promoted);
+    expect(last("wiring")).toBe(promoted);
+    act(() => root.unmount());
+  });
+});
+
+describe("handleDomGroupMoveBy", () => {
+  it("saves through the group drag's commit, leaving a refusal for the host to explain", async () => {
+    const { useDomEditSession } = await import("./useDomEditSession");
+    const element = document.createElement("div");
+    document.body.append(element);
+    element.getBoundingClientRect = () => {
+      const { x, y } = readTranslatePx(element);
+      return new DOMRect(x, y, 40, 20);
+    };
+    const selection = makeSelection("card", element);
+    let moveBy!: ReturnType<typeof useDomEditSession>["handleDomGroupMoveBy"];
+    function Probe() {
+      moveBy = useDomEditSession(createSessionParams()).handleDomGroupMoveBy;
+      return null;
+    }
+    const root = createRoot(document.createElement("div"));
+    act(() => root.render(<Probe />));
+    await act(() => moveBy([{ selection, delta: { x: 10, y: 0 } }]));
+    expect(groupCommitSpy).toHaveBeenCalledWith(
+      [{ selection, next: { x: 10, y: 0 }, plainTranslate: true }],
+      { refusalToast: false },
+    );
+    act(() => root.unmount());
+    element.remove();
   });
 });

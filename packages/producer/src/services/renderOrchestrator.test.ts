@@ -65,6 +65,9 @@ import {
   shouldUseStreamingEncode,
   resolveObservedCaptureMode,
   createCaptureObservabilityUpdater,
+  applyRenderWarningPolicy,
+  createRenderJob,
+  RenderQualityError,
 } from "./renderOrchestrator.js";
 import { probeRequiresBrowser } from "./render/stages/probeStage.js";
 import { EncoderInterruptedError } from "./render/encoderInterruption.js";
@@ -2432,6 +2435,54 @@ describe("shouldPreferSingleWorkerDrawElement (DE priority inversion)", () => {
       // default) when there's no root tag at all to compare against.
       expect(scan.rootBodyMismatch).toBeUndefined();
       expect(scan.rootBodyDeltaPxBucket).toBeUndefined();
+      // data-vfx-chain: no hosts, so vfxCapture never ran ("undefined", not
+      // "none" — there is nothing to have a capture requirement).
+      expect(scan.vfxHostCount).toBe(0);
+      expect(scan.vfxTypes).toBe("");
+      expect(scan.vfxCapture).toBeUndefined();
+    });
+
+    it("counts data-vfx-chain hosts, unions sorted def ids across every chain, and takes the strongest capture", () => {
+      const html =
+        '<div data-vfx-chain=\'{"version":1,"nodes":[{"type":"fractal-noise","id":"n1","params":{}}]}\'></div>' +
+        '<div data-vfx-chain=\'{"version":1,"nodes":[{"type":"wave-warp","id":"n1","params":{}},' +
+        '{"type":"displacement-map","id":"n2","params":{}}]}\'></div>';
+      const scan = scanElementTags(html);
+      expect(scan.vfxHostCount).toBe(2);
+      // fractal-noise is capture "none"; wave-warp/displacement-map are "self"
+      // — the strongest of the two hosts wins.
+      expect(scan.vfxCapture).toBe("self");
+      expect(scan.vfxTypes).toBe("displacement-map,fractal-noise,wave-warp");
+    });
+
+    it("excludes a disabled node's type from vfxTypes but still counts its host", () => {
+      const html =
+        '<div data-vfx-chain=\'{"version":1,"nodes":[' +
+        '{"type":"wave-warp","id":"n1","enabled":false,"params":{}},' +
+        '{"type":"fractal-noise","id":"n2","params":{}}]}\'></div>';
+      const scan = scanElementTags(html);
+      expect(scan.vfxHostCount).toBe(1);
+      expect(scan.vfxTypes).toBe("fractal-noise");
+      // The only enabled node is fractal-noise (capture "none") — the
+      // disabled self-capture node must not inflate the chain's capture.
+      expect(scan.vfxCapture).toBe("none");
+    });
+
+    it("decodes the &quot;-escaped data-vfx-chain form the compile pipeline emits", () => {
+      const html =
+        '<div data-vfx-chain="{&quot;version&quot;:1,&quot;nodes&quot;:[{&quot;type&quot;:' +
+        '&quot;fractal-noise&quot;,&quot;id&quot;:&quot;n1&quot;,&quot;params&quot;:{}}]}"></div>';
+      const scan = scanElementTags(html);
+      expect(scan.vfxHostCount).toBe(1);
+      expect(scan.vfxTypes).toBe("fractal-noise");
+    });
+
+    it("does not crash on a malformed data-vfx-chain attribute; still counts the host, no type or capture signal from it", () => {
+      const html = "<div data-vfx-chain='{not json'></div>";
+      const scan = scanElementTags(html);
+      expect(scan.vfxHostCount).toBe(1);
+      expect(scan.vfxTypes).toBe("");
+      expect(scan.vfxCapture).toBeUndefined();
     });
 
     describe("rootBodyMismatch / rootBodyDeltaPxBucket", () => {
@@ -2532,6 +2583,8 @@ describe("shouldPreferSingleWorkerDrawElement (DE priority inversion)", () => {
         audioGroupCount: 0,
         colorGradingCount: 0,
         hasLut: false,
+        vfxHostCount: 0,
+        vfxTypes: "",
       });
     });
 
@@ -2549,6 +2602,8 @@ describe("shouldPreferSingleWorkerDrawElement (DE priority inversion)", () => {
         audioGroupCount: 0,
         colorGradingCount: 0,
         hasLut: false,
+        vfxHostCount: 0,
+        vfxTypes: "",
       });
     });
 
@@ -2573,6 +2628,8 @@ describe("shouldPreferSingleWorkerDrawElement (DE priority inversion)", () => {
         audioGroupCount: 0,
         colorGradingCount: 0,
         hasLut: false,
+        vfxHostCount: 0,
+        vfxTypes: "",
       });
     });
 
@@ -2590,6 +2647,8 @@ describe("shouldPreferSingleWorkerDrawElement (DE priority inversion)", () => {
         audioGroupCount: 0,
         colorGradingCount: 0,
         hasLut: false,
+        vfxHostCount: 0,
+        vfxTypes: "",
       });
     });
 
@@ -3829,5 +3888,17 @@ describe("isParallelStreamForced: the plan carries the manual interleave opt-in"
     expect(isParallelStreamForced({}, { ...flagsOff, captureParallelStreamForced: true })).toBe(
       true,
     );
+  });
+});
+
+describe("applyRenderWarningPolicy", () => {
+  it("fails a best-effort render whose VFX chain failed, since its layer renders without the effect", () => {
+    const job = createRenderJob({ fps: 30, quality: "standard" });
+    const vfx = {
+      code: "vfx_failure" as const,
+      message: "A VFX chain failed",
+      details: { sources: ["runtime-error:vfx: #host: unknown effect"] },
+    };
+    expect(() => applyRenderWarningPolicy(job, [vfx])).toThrow(RenderQualityError);
   });
 });

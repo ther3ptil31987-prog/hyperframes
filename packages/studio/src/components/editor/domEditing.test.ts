@@ -17,6 +17,7 @@ import {
   resolveDomEditCapabilities,
   resolveDomEditSelection,
 } from "./domEditing";
+import { buildElementLabel, normalizeTimelineCompositionSource } from "./domEditingDom";
 
 function createDocument(markup: string): Document {
   const window = new Window();
@@ -908,6 +909,42 @@ describe("resolveDomEditSelection", () => {
     });
 
     expect(first).not.toBe(second);
+  });
+
+  it("reads a preview prefix only from a URL, not from a project folder named preview", () => {
+    expect(normalizeTimelineCompositionSource("sections/preview/x.html")).toBe(
+      "sections/preview/x.html",
+    );
+    expect(
+      normalizeTimelineCompositionSource(
+        "http://localhost:5190/api/projects/p/preview/sections/x.html",
+      ),
+    ).toBe("sections/x.html");
+    expect(normalizeTimelineCompositionSource("/api/projects/p/preview/comp/sections/x.html")).toBe(
+      "sections/x.html",
+    );
+  });
+
+  it("names a repeated section by its authored id, not its runtime instance id", () => {
+    const document = createDocument(`
+      <div data-composition-id="benefit-fresh__hf2" data-hf-original-composition-id="benefit-fresh"></div>
+    `);
+
+    expect(buildElementLabel(document.querySelector("div") as HTMLElement)).toBe("Benefit Fresh");
+  });
+
+  it("finds a composition host authored with a ./ path", () => {
+    const document = createDocument(`
+      <div data-composition-id="scene" data-composition-file="./compositions/scene.html"></div>
+    `);
+
+    expect(
+      findElementForTimelineElement(
+        document,
+        { id: "scene", compositionSrc: "./compositions/scene.html" },
+        { activeCompositionPath: null, isMasterView: true },
+      )?.getAttribute("data-composition-id"),
+    ).toBe("scene");
   });
 
   it("resolves generated timeline ids without throwing", () => {

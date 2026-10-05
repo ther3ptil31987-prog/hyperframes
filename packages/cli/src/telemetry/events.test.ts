@@ -1,4 +1,5 @@
 import { describe, expect, it, vi, beforeEach } from "vitest";
+import { CliRuntimeError } from "../utils/commandResult.js";
 
 const trackEvent = vi.fn();
 const flush = vi.fn(() => Promise.resolve());
@@ -396,6 +397,34 @@ describe("render telemetry events", () => {
     expect(props.browser_version_major).toBe(118);
   });
 
+  it("carries the browser install path facts on both render events, never the path", () => {
+    const browserInstall = {
+      build: "152.0.7928.2",
+      pathAscii: false,
+      pathLength: "200_to_259",
+      drive: "windows_other",
+    } as const;
+    trackRenderComplete({
+      durationMs: 1,
+      fps: 30,
+      quality: "draft",
+      docker: false,
+      gpu: false,
+      browserInstall,
+    });
+    trackRenderError({ fps: 30, quality: "draft", docker: false, browserInstall });
+    for (const call of trackEvent.mock.calls) {
+      const props = call[1] as Record<string, unknown>;
+      expect(props).toMatchObject({
+        browser_build: "152.0.7928.2",
+        browser_path_ascii: false,
+        browser_path_length: "200_to_259",
+        browser_path_drive: "windows_other",
+      });
+      expect(Object.keys(props)).not.toContain("browser_path");
+    }
+  });
+
   it("omits toolchain majors on a Docker render", () => {
     trackRenderComplete({ durationMs: 1, fps: 30, quality: "draft", docker: true, gpu: false });
     const props = trackEvent.mock.calls[0]?.[1] as Record<string, unknown>;
@@ -558,6 +587,48 @@ describe("render telemetry events", () => {
     expect(props.audio_group_count).toBe(0);
     expect(props.color_grading_count).toBe(0);
     expect(props.has_lut).toBe(false);
+  });
+
+  it("carries the vfx chain scan's node count, capture class, and def types", () => {
+    trackRenderComplete({
+      durationMs: 1000,
+      fps: 30,
+      quality: "high",
+      docker: false,
+      gpu: false,
+      vfxHostCount: 2,
+      vfxCapture: "self",
+      vfxTypes: "displacement-map,wave-warp",
+    });
+    const props = trackEvent.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(props.vfx_host_count).toBe(2);
+    expect(props.vfx_capture).toBe("self");
+    expect(props.vfx_types).toBe("displacement-map,wave-warp");
+  });
+
+  it("reports a zero node count and empty types rather than dropping the properties", () => {
+    trackRenderComplete({
+      durationMs: 1000,
+      fps: 30,
+      quality: "high",
+      docker: false,
+      gpu: false,
+      vfxHostCount: 0,
+      vfxTypes: "",
+    });
+    const props = trackEvent.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(props.vfx_host_count).toBe(0);
+    expect(props.vfx_types).toBe("");
+    // No vfx-chain host means chainCapture never ran — undefined, not "none".
+    expect(props.vfx_capture).toBeUndefined();
+  });
+
+  it("omits the vfx fields entirely when the caller never resolved them", () => {
+    trackRenderComplete({ durationMs: 1000, fps: 30, quality: "high", docker: false, gpu: false });
+    const props = trackEvent.mock.calls[0]?.[1] as Record<string, unknown>;
+    expect(props.vfx_host_count).toBeUndefined();
+    expect(props.vfx_capture).toBeUndefined();
+    expect(props.vfx_types).toBeUndefined();
   });
 
   // emitStudioRenderComplete never resolves perfSummary.drawElement, only the
@@ -1059,6 +1130,25 @@ describe("trackCliError", () => {
 });
 
 describe("trackCommandFailure", () => {
+  it("reports an extra-positional usage error by count, never the arguments", async () => {
+    const { resolveExtraPositionals } = await import("../utils/reject-extra-positionals.js");
+    const quiet = vi.spyOn(console, "error").mockImplementation(() => {});
+    const cmd = { args: { dir: { type: "positional" } } } as Parameters<
+      typeof resolveExtraPositionals
+    >[0];
+    let thrown: unknown;
+    try {
+      resolveExtraPositionals(cmd, "render", { _: ["./p", "Jane", "555-0100"] });
+    } catch (error) {
+      thrown = error;
+    }
+    quiet.mockRestore();
+    trackCommandFailure("render", thrown);
+    const payload = JSON.stringify(trackEvent.mock.calls.at(-1));
+    expect(payload).toContain("2 unexpected extra arguments for hyperframes render");
+    expect(payload).not.toMatch(/Jane|555-0100/);
+  });
+
   beforeEach(() => {
     trackEvent.mockClear();
   });
@@ -1077,6 +1167,39 @@ describe("trackCommandFailure", () => {
         // stack_trace is asserted (redacted) in the trackCliError suite; the
         // raw err.stack no longer matches once paths are stripped.
       }),
+    );
+  });
+
+  it("reports the same error once, however many places report it", () => {
+    const err = new Error("not a project");
+    trackCommandFailure("info", err);
+    trackCommandFailure("info", err);
+
+    expect(trackEvent).toHaveBeenCalledTimes(1);
+  });
+
+  it("reports the failure a CliRuntimeError carries, through every wrapper, once", () => {
+    const cause = new Error("not a project");
+    const inner = new CliRuntimeError("Command failed", { exitCode: 1, cause });
+    trackCommandFailure("figma:asset", inner);
+    trackCommandFailure("figma", new CliRuntimeError("x", { exitCode: 1, cause: inner }));
+
+    expect(trackEvent).toHaveBeenCalledTimes(1);
+    expect(trackEvent).toHaveBeenCalledWith(
+      "cli_error",
+      expect.objectContaining({ error_message: "not a project" }),
+    );
+  });
+
+  it("takes a caller's error name and endpoint", () => {
+    trackCommandFailure("figma:asset", new Error("No token"), {
+      error_name: "NO_TOKEN",
+      endpoint: "images",
+    });
+
+    expect(trackEvent).toHaveBeenCalledWith(
+      "cli_error",
+      expect.objectContaining({ error_name: "NO_TOKEN", endpoint: "images" }),
     );
   });
 

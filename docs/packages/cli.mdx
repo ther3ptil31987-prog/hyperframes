@@ -59,8 +59,9 @@ from any command's output, without a second call:
 }
 ```
 
-The version numbers come from a cache refreshed at most once a day. `--json`
-never makes a network request of its own. Deprecated commands add
+The version numbers come from a cache refreshed at most once a day, in a
+background process, and never under CI or `HYPERFRAMES_NO_UPDATE_CHECK=1`.
+`--json` never makes a network request of its own. Deprecated commands add
 `_meta.deprecated: true`.
 
 **Flags, not prompts.** A missing required flag fails immediately with a usage
@@ -172,8 +173,15 @@ npx hyperframes catalog --human-friendly         # picker; installs on select
 
 Filter with `--type` (`block` or `component`) and `--tag` (`social`,
 `transition`, `text`, …). Default output is a table of name, type, description,
-and tags, shaped for agents to parse; `--json` is the structured form.
+and tags, shaped for agents to parse; `--json` is the structured form. Each
+`--json` row has the item's name, type, title, description and tags, plus its
+dimensions, duration and `preview` (`video` and `poster` URLs) when it has them.
 `--human-friendly` opens a picker that runs `add` on whatever you select.
+
+`--query "<what you want>"` searches by description instead of listing
+everything, and `--on-device` switches that search from word match to meaning
+search after a one-time 33 MB download. What each does, what is downloaded and
+what stays on your machine: [How catalog search works](/developers/catalog-search).
 
 ## Bring in source material
 
@@ -267,19 +275,22 @@ npx hyperframes transcribe transcript.json --to srt
 | Flag              | Description                                                                                                                                                                                       |
 | ----------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `--dir, -d`       | Project directory (default: current directory)                                                                                                                                                     |
-| `--engine, -e`    | ASR engine: `auto` (default — Parakeet if installed, else whisper), `parakeet`, or `whisper`                                                                                                        |
+| `--engine, -e`    | ASR engine: `auto` (default — Parakeet if installed and the language is one of its 25, else whisper), `parakeet` (fails if Parakeet is missing, broken, or lacks the `--language`), or `whisper` |
 | `--model, -m`     | Whisper model (default `small.en`): `tiny.en`, `base.en`, `small.en`, `medium.en`, `large-v3`                                                                                                       |
 | `--language, -l`  | Language code (`en`, `es`, `ja`, …). Filters out speech in other languages.                                                                                                                        |
 | `--to`            | Export a sidecar instead: `srt` or `vtt`                                                                                                                                                           |
 | `--output, -o`    | Where the exported SRT/VTT goes                                                                                                                                                                    |
 | `--preserve-cues` | Keep each transcript entry as its own caption cue, skipping word-level grouping                                                                                                                    |
-| `--optional`      | Skip and exit 0 when whisper-cpp is unavailable, instead of failing. For pipelines that can carry on without captions.                                                                              |
+| `--optional`      | Skip and exit 0 when whisper-cpp is unavailable, instead of failing. For pipelines that can carry on without captions. A broken Parakeet install is a real failure: it exits 1 even when whisper-cpp is missing. |
 | `--timeout`       | Whisper spawn timeout in ms, overriding the auto-scaled default. Raise it on slow or emulated CPUs where large models take many seconds per audio second. Whisper only — Parakeet has its own. Minimum 5000. Env: `HYPERFRAMES_TRANSCRIBE_TIMEOUT_MS`. |
 | `--json`          | Output the result as JSON                                                                                                                                                                          |
 
 The command works out what you gave it. Audio and video are transcribed
-locally — Parakeet when it is installed (`uv pip install parakeet-mlx`; faster
-and more accurate), whisper.cpp otherwise. Transcript files are imported and
+locally — Parakeet when it is installed (`hyperframes models install parakeet`;
+faster and more accurate), whisper.cpp otherwise. Parakeet covers en, es, fr,
+de, bg, hr, cs, da, nl, et, fi, el, hu, it, lv, lt, mt, pl, pt, ro, sk, sl, sv,
+ru and uk; `auto` uses whisper for any other `--language`. If Parakeet fails under
+`auto`, the run says why, names the repair command, and uses whisper. Transcript files are imported and
 normalized instead: whisper.cpp JSON, OpenAI Whisper API JSON with word
 timestamps, SRT, and VTT all land as the same `[{text, start, end}]` word array
 in `transcript.json`. If the project has caption HTML, it is patched
@@ -295,6 +306,26 @@ cues with no internal spaces — single-word or CJK captions.
   production content, transcribe through the OpenAI or Groq Whisper API and import
   the JSON.
 </Tip>
+
+### `models`
+
+Download an on-device model. Only asked-for installs happen; nothing downloads
+on first use.
+
+```bash
+npx hyperframes models install parakeet          # progress on stderr
+npx hyperframes models install parakeet --json   # one JSON result
+```
+
+`parakeet` installs the sherpa-onnx runtime from npm and NVIDIA's Parakeet TDT
+0.6B v3 speech model (int8, about 640 MB, CC-BY-4.0) into
+`~/.cache/hyperframes`. Every file is checked against a pinned size and
+sha256. Re-running loads the runtime in a separate process and re-checks each
+model file's sha256, reinstalls whichever fails, and changes nothing on a good
+install. It runs on macOS
+(arm64, x64), Windows (x64, ia32) and Linux (x64, arm64, glibc 2.32 or newer),
+and refuses up front anywhere else. Ctrl-C stops the download and keeps no
+partial file.
 
 ### `tts`
 
@@ -369,12 +400,13 @@ Which format do you want?
 | `.mov` (ProRes 4444) | Editing round-trip in Premiere / Resolve / DaVinci        | ~50 MB            |
 | `.png`               | Single-image cutout                                       | varies            |
 
-The model is `u2net_human_seg` (MIT, ~168 MB ONNX). It downloads to
+The model is `u2net_human_seg` (Apache-2.0, ~168 MB ONNX). It downloads to
 `~/.cache/hyperframes/background-removal/models/` on first run and is reused
 after that. Peak inference RAM is about 1.5 GB.
 
 `--device auto` picks CoreML on Apple Silicon, CUDA where available, CPU
-otherwise. The CLI bundles the CPU build of `onnxruntime-node`; for CUDA, set
+otherwise. The first run installs the CPU build of `onnxruntime-node` into
+`~/.cache/hyperframes/optional/` (one line on stderr, once, no prompt); for CUDA, set
 `HYPERFRAMES_CUDA=1` and supply a GPU-enabled build.
 
 <Tip>
@@ -609,7 +641,7 @@ npx hyperframes lint [dir] --json
 ◆  Linting my-project/index.html
 
   ✗ missing_gsap_script: Composition uses GSAP but no GSAP script is loaded.
-  ⚠ unmuted-video [clip-1]: Video should have the 'muted' attribute for reliable autoplay.
+  ⚠ video_missing_muted [clip-1]: <video id="clip-1"> has data-start but declares neither muted nor data-has-audio. If the file has sound, add data-has-audio="true" (the sound stays on this clip). If it is silent, add muted.
 
 ◇  1 error(s), 1 warning(s)
 ```
@@ -630,7 +662,7 @@ did, in one command and one browser session.
 
 ```bash
 npx hyperframes check [dir]
-npx hyperframes check [dir] --json         # {ok, lint, runtime, layout, motion, contrast, snapshots}
+npx hyperframes check [dir] --json         # {ok, browserSkipped, lint, runtime, layout, motion, contrast, hdr, snapshots}
 npx hyperframes check [dir] --snapshots
 npx hyperframes check [dir] --at 1.5,4,7.25
 npx hyperframes check [dir] --strict       # warnings fail too
@@ -641,6 +673,10 @@ Then it loads the bundled composition once and sweeps a single seek grid,
 running every audit at every sample: runtime console errors and failed requests,
 layout defects (overflow, clipping, held overlaps, occlusion, coordinate-frame
 drift), `*.motion.json` assertions, and WCAG AA contrast.
+
+When the browser never ran (lint errors, a linter crash, or a browser launch
+failure), `browserSkipped` is `true` and the `layout`, `motion` and `contrast`
+sections are empty, not clean.
 
 | Flag                                         | Description                                                                                                                 |
 | -------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------- |
@@ -714,6 +750,16 @@ HTML. Without a sidecar, nothing changes.
 | `before(a, b)`                 | Broken stagger order — `a` must first appear strictly before `b` (`motion_out_of_order`)                        |
 | `staysInFrame(selector)`       | Off-frame drift — once visible, the box never leaves the canvas (`motion_off_frame`)                            |
 | `keepsMoving(withinSelector?)` | A frozen shot — no fully static window longer than `maxStaticSec`, default 2s (`motion_frozen`)                 |
+
+`keepsMoving` uses the same motion classifier as the frozen-sweep guard: box
+geometry, opacity, text and generated content, form-control state, painted CSS
+counters, clip-path, variable-font axes, and the pixels of visible
+canvas/video/img elements all count as motion — so a playing same-origin (or
+CORS-readable) background video keeps a scope live on its own. Elements under
+`data-layout-ignore` inside the scope never count; the opt-out does not apply to
+the scope element itself, since naming it in an assertion outranks it. Content
+the browser does not paint (`display: none` subtrees, `visibility: hidden`
+boxes, skipped `content-visibility` contents) never counts as motion either.
 
 `duration`, `keepsMoving.withinSelector`, and `keepsMoving.maxStaticSec` are
 optional. Findings use the same shape and envelope as layout findings and are
@@ -889,7 +935,7 @@ How it uses the machine, and when it gives up:
 | `--low-memory-mode` / `--no-low-memory-mode`             | auto at 8 GB RAM or less                   | Safe profile: one worker, screenshot capture, no calibration. See the note below.                                   |
 | `--gpu`                                                  | off                                        | Hardware FFmpeg encoding (NVENC, VideoToolbox, AMF, VAAPI, QSV)                                                    |
 | `--browser-gpu` / `--no-browser-gpu`                     | auto locally, off in Docker                | Host GPU for Chrome and WebGL capture, or software rendering. Auto probes WebGL once and falls back.                |
-| `--page-side-compositing` / `--no-page-side-compositing`  | on                                         | Page-side WebGL for compatible SDR shader transitions, ~6× faster. HDR, alpha, and video disable it themselves.     |
+| `--page-side-compositing` / `--no-page-side-compositing`  | on                                         | Page-side WebGL for SDR shader transitions in mp4, hls and gif, ~6× faster. webm and mov use the layered path; gif always uses page-side WebGL, even with `--no-page-side-compositing`. |
 | `--experimental-fast-capture`                            | on where it can engage                     | Chrome's draw-element capture, ~2× faster; falls back to screenshots on its own. Env: `PRODUCER_EXPERIMENTAL_FAST_CAPTURE`. |
 | `--frames-cache-dir`                                     | `<tmpdir>/hyperframes-extract-cache-<uid>` | Where extracted source frames cache. `off`, `none`, `false`, or `0` disables it. `doctor` reports the live value.   |
 | `--max-concurrent-renders`                               | `2`                                        | Concurrent jobs on the Producer server, 1–10                                                                       |
@@ -1105,6 +1151,27 @@ In JSON mode, paths inside `detail` and `hint` are redacted — your home
 directory becomes the literal `$HOME`, so output is safe to paste into a bug
 report or an agent context.
 
+### `clean`
+
+Find and remove what HyperFrames left on disk.
+
+```bash
+npx hyperframes clean --dry-run   # list it, remove nothing
+npx hyperframes clean
+npx hyperframes clean --snapshots # also remove snapshots/ folders
+npx hyperframes clean --json
+```
+
+It looks in the current project (not its subfolders) and every project the Studio history knows, and removes:
+
+- frames and staging folders left by renders that were killed or crashed (a render that is still running keeps its own);
+- work folders of `--debug` renders nothing has written to for six hours;
+- the history of projects that no longer exist;
+- extracted video frames and video proxies nobody has used for an hour (they rebuild on demand).
+
+`snapshots/` folders are listed as also reclaimable and removed only with `--snapshots`. Rendered outputs, source
+files, the browser download and models are never touched.
+
 ### `info` and `compositions`
 
 `npx hyperframes info [dir]` prints project metadata: name, resolution,
@@ -1165,7 +1232,8 @@ Topics: `data-attributes`, `examples`, `rendering`, `gsap`, `troubleshooting`,
 
 ### `feedback`
 
-Send anonymous feedback about how it went.
+Send feedback about how it went. It is anonymous unless the app that launched
+the CLI attaches your email (below).
 
 ```bash
 npx hyperframes feedback --rating 10
@@ -1173,7 +1241,9 @@ npx hyperframes feedback --rating 7 --comment "render succeeded but GSAP timelin
 npx hyperframes feedback --rating 3 --comment "GSAP timeline froze on seek" --file-issue
 ```
 
-`--rating` is required, 0–10. `--comment` adds free text. `--file-issue`
+`--rating` is required, 0–10. `--comment` adds free text. `--source person`
+or `--source agent` says who wrote a rating report (a `--search-miss` report
+carries neither), so the team can tell a person's feedback from an agent's. `--file-issue`
 also opens a GitHub issue, `--dir` picks the project published as its repro
 (default: current directory), and `--yes, -y` skips the consent prompt for
 scripts.
@@ -1185,7 +1255,12 @@ submit yourself. No token, no backend. See
 
 Agents can call this after a render;
 [About feedback data](/guides/feedback#about-feedback-data) covers what the
-surface includes. With telemetry disabled it prints
+surface includes. An app that launches the CLI can attach its signed-in
+person's email with the `HYPERFRAMES_FEEDBACK_EMAIL` environment variable. It
+is never a flag and never read from a project `.env`, and it goes only into
+the feedback report, not telemetry. It is not verified: treat it as a way to
+reply, not as proof of who sent the report. With
+telemetry disabled it prints
 `Telemetry is disabled. Feedback not sent.` and exits cleanly.
 
 ### `telemetry`
@@ -1199,15 +1274,17 @@ npx hyperframes telemetry status
 Telemetry collects command names, render performance, render checkpoint and
 error names, aggregate browser diagnostic counts, browser initialization
 duration and tween count, aggregate video-extraction workload counts (extracted
-frames, VFR preflights), example choices, the names of registry items `add`
-installs, and system info — including a coarse
+frames, VFR preflights), example choices, the names of registry items `add` or
+Studio installs and which of the two installed them, and system info — including a coarse
 environment fingerprint: OS, kernel string, CPU and memory shape, sandbox
 runtime such as gVisor or Docker, and the _name_ of a coding agent driving the
 CLI when one is detected (`claude_code`, `codex`, `cursor`). That name is
-inferred from which well-known environment variables exist; their values are
-never read. Local paths and URL query strings are redacted from error and
+inferred from which well-known environment variables exist. Local paths and URL query strings are redacted from error and
 checkpoint messages. Project names, video content, and environment variable
-values are never collected.
+values are never collected, except short self-identifying names: `AGENT`,
+`AI_AGENT` and `TERM_PROGRAM` (filtered to short slugs), and `HYPERFRAMES_CLIENT`,
+the `<app>/<version>/<channel>` tag an app that launches the CLI sets, sent as
+`client` so reports from that app can be told apart.
 
 Nothing personally identifying is collected until you sign in. When you run
 `hyperframes auth login`, your HeyGen account email — or username, if the

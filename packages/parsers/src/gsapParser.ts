@@ -22,6 +22,7 @@ import {
   safeJsKey as safeKey,
   resolveConversionProps,
   mergePercentageKeyframes,
+  authorsKeyframes,
 } from "./gsapSerialize";
 
 export type {
@@ -49,8 +50,17 @@ export {
   classifyPropertyGroup,
   classifyTweenPropertyGroup,
 } from "./gsapConstants";
-import { classifyPropertyGroup, classifyTweenPropertyGroup } from "./gsapConstants";
+import {
+  classifyPropertyGroup,
+  classifyTweenPropertyGroup,
+  GSAP_DEFAULT_DURATION,
+  isXYPositionWrite,
+  holdScope,
+  keyframeHoldForAnimation,
+} from "./gsapConstants";
 import type { PropertyGroupName } from "./gsapConstants";
+import { BUILTIN_VAR_KEYS, DROPPED_VAR_KEYS, EXTRAS_KEYS, isTweenConfigKey } from "./gsapConstants";
+import { clipTweenMatcher, hasExplicitTime } from "./clipTweens";
 import {
   findObjectArrayKeyframeIndex,
   getCompatibleObjectArrayKeyframeTiming,
@@ -402,6 +412,23 @@ function lookupBinding(name: string, path: AstPath, bindings: TargetBindings): s
   return null;
 }
 
+function hasUnresolvedArrayPart(
+  node: AstNode,
+  path: AstPath,
+  scope: ScopeBindings,
+  bindings: TargetBindings,
+  helpers: TargetHelpers,
+): boolean {
+  return (
+    node?.type === "ArrayExpression" &&
+    node.elements.some(
+      (el: AstNode) =>
+        !resolveTargetSelector(el, path, scope, bindings, helpers) ||
+        hasUnresolvedArrayPart(el, path, scope, bindings, helpers),
+    )
+  );
+}
+
 /**
  * Resolve a tween's first argument to a CSS selector. Handles inline string
  * literals, element variables (lexically scoped), arrays of elements (joined
@@ -585,6 +612,7 @@ interface TweenCallInfo {
   node: AstNode;
   method: GsapMethod;
   selector: string;
+  selectorPartial?: boolean;
   varsArg: AstNode;
   fromArg?: AstNode;
   positionArg?: AstNode;
@@ -649,6 +677,9 @@ function findAllTweenCalls(
         const selectorValue =
           resolveTargetSelector(args[0], path, scope, targetBindings, targetHelpers) ??
           "__unresolved__";
+        const partial = hasUnresolvedArrayPart(args[0], path, scope, targetBindings, targetHelpers)
+          ? { selectorPartial: true }
+          : {};
 
         if (method === "fromTo") {
           results.push({
@@ -656,6 +687,7 @@ function findAllTweenCalls(
             node,
             method: "fromTo",
             selector: selectorValue,
+            ...partial,
             fromArg: args[1],
             varsArg: args[2],
             positionArg: args[3],
@@ -666,6 +698,7 @@ function findAllTweenCalls(
             node,
             method: method as GsapMethod,
             selector: selectorValue,
+            ...partial,
             varsArg: args[1],
             positionArg: args[2],
             ...(isGlobalSet ? { global: true } : {}),
@@ -677,23 +710,6 @@ function findAllTweenCalls(
   });
   return results;
 }
-
-/** Keys that are stored on dedicated GsapAnimation fields (not in properties/extras). */
-const BUILTIN_VAR_KEYS = new Set(["duration", "ease", "delay"]);
-
-/** Keys that are never preserved (callbacks / advanced patterns). */
-const DROPPED_VAR_KEYS = new Set(["onComplete", "onStart", "onUpdate", "onRepeat"]);
-
-/** Keys that belong in `extras` — non-editable GSAP config that must survive round-trips. */
-const EXTRAS_KEYS = new Set([
-  "stagger",
-  "yoyo",
-  "repeat",
-  "repeatDelay",
-  "snap",
-  "overwrite",
-  "immediateRender",
-]);
 
 /**
  * Extract raw source text for a property in an ObjectExpression AST node.
@@ -1072,7 +1088,7 @@ function tweenCallToAnimation(
         percentage: waypoints.length > 1 ? Math.round((i / (waypoints.length - 1)) * 100) : 0,
         properties: { x: wp.x, y: wp.y },
       }));
-      keyframesData = { format: "percentage", keyframes: kf };
+      keyframesData = { format: "percentage", keyframes: kf, fromMotionPath: true };
     } else {
       // Merge waypoint positions into existing keyframes at matching percentages.
       // If keyframe count matches waypoint count, assign positionally.
@@ -1134,12 +1150,11 @@ function tweenCallToAnimation(
   if (motionPathResult) anim.arcPath = motionPathResult.arcPath;
   if (hasUnresolvedKeyframes) anim.hasUnresolvedKeyframes = true;
   if (call.selector === "__unresolved__") anim.hasUnresolvedSelector = true;
+  if (call.selectorPartial) anim.hasPartialSelector = true;
   return anim;
 }
 
 // ── Timeline Position Resolution ──────────────────────────────────────────
-
-const GSAP_DEFAULT_DURATION = 0.5;
 
 // NOTE: Label-based positions (e.g. "myLabel+=0.5") are not yet resolved —
 // they fall through to parseFloat which returns null for non-numeric strings.
@@ -1178,7 +1193,11 @@ function applyTimelineDefaults(
     if (anim.duration === undefined && defaults.duration !== undefined) {
       anim.duration = defaults.duration;
     }
-    if (anim.ease === undefined && defaults.ease !== undefined) {
+    if (
+      anim.ease === undefined &&
+      defaults.ease !== undefined &&
+      (!anim.keyframes || anim.keyframes.fromMotionPath)
+    ) {
       anim.ease = defaults.ease;
     }
   }
@@ -1357,7 +1376,7 @@ function isObjectProperty(prop: AstNode): boolean {
 
 /** A key the inspector treats as an editable transform/style property. */
 function isEditablePropertyKey(key: string): boolean {
-  return !BUILTIN_VAR_KEYS.has(key) && !DROPPED_VAR_KEYS.has(key) && !EXTRAS_KEYS.has(key);
+  return !isTweenConfigKey(key);
 }
 
 function makeObjectProperty(key: string, value: number | string | boolean): AstNode {
@@ -1463,9 +1482,10 @@ function findStatementPath(path: AstPath): AstPath | null {
 
 function insertAfterAnchor(parsed: ParsedGsapAst, newStatement: AstNode): void {
   const lastCall = parsed.located[parsed.located.length - 1]?.call;
-  const anchorPath = lastCall
-    ? findStatementPath(lastCall.path)
-    : findTimelineDeclarationPath(parsed.ast, parsed.timelineVar);
+  const lastPath = lastCall ? findStatementPath(lastCall.path) : null;
+  const timeline = findTimelineDeclarationPath(parsed.ast, parsed.timelineVar);
+  const beforeTimeline = !!timeline && !!lastPath && lastPath.node.start < timeline.node.start;
+  const anchorPath = !lastCall || beforeTimeline ? timeline : lastPath;
   if (anchorPath) {
     anchorPath.insertAfter(newStatement);
   } else {
@@ -1533,7 +1553,7 @@ export function updateAnimationInScript(
     return script;
   }
   const target = parsed.located.find((l) => l.id === animationId);
-  if (!target) return script;
+  if (!target || (updates.properties && target.animation.hasUnresolvedKeyframes)) return script;
   applyUpdatesToCall(target.call, updates);
   return recast.print(parsed.ast).code;
 }
@@ -1542,7 +1562,9 @@ export function shiftPositionsInScript(
   script: string,
   targetSelector: string,
   delta: number,
+  root?: ParentNode,
 ): string {
+  const carries = clipTweenMatcher(targetSelector, root);
   let parsed: ParsedGsapAst;
   try {
     parsed = parseGsapAst(script);
@@ -1552,8 +1574,7 @@ export function shiftPositionsInScript(
   }
   let changed = false;
   for (const entry of parsed.located) {
-    if (entry.animation.targetSelector !== targetSelector) continue;
-    if (typeof entry.animation.position !== "number") continue;
+    if (!carries(entry.animation) || !hasExplicitTime(entry.animation)) continue;
     const newPos = Math.max(0, Math.round((entry.animation.position + delta) * 1000) / 1000);
     applyUpdatesToCall(entry.call, { position: newPos });
     changed = true;
@@ -1568,9 +1589,11 @@ export function scalePositionsInScript(
   oldDuration: number,
   newStart: number,
   newDuration: number,
+  root?: ParentNode,
 ): string {
   if (oldDuration <= 0 || newDuration <= 0) return script;
   const ratio = newDuration / oldDuration;
+  const carries = clipTweenMatcher(targetSelector, root);
   let parsed: ParsedGsapAst;
   try {
     parsed = parseGsapAst(script);
@@ -1580,13 +1603,14 @@ export function scalePositionsInScript(
   }
   let changed = false;
   for (const entry of parsed.located) {
-    if (entry.animation.targetSelector !== targetSelector) continue;
-    if (typeof entry.animation.position !== "number") continue;
-    const newPos = Math.max(
-      0,
-      Math.round((newStart + (entry.animation.position - oldStart) * ratio) * 1000) / 1000,
-    );
-    const updates: Partial<GsapAnimation> = { position: newPos };
+    if (!carries(entry.animation) || typeof entry.animation.position !== "number") continue;
+    const updates: Partial<GsapAnimation> = {};
+    if (hasExplicitTime(entry.animation)) {
+      updates.position = Math.max(
+        0,
+        Math.round((newStart + (entry.animation.position - oldStart) * ratio) * 1000) / 1000,
+      );
+    }
     if (typeof entry.animation.duration === "number" && entry.animation.duration > 0) {
       updates.duration = Math.max(
         0.001,
@@ -1760,8 +1784,8 @@ function removeCallFromAst(call: TweenCallInfo): void {
 /**
  * Recast twin of {@link dedupePositionWritesInScript} (acorn). Enforce "exactly
  * one position write per element": keep `keepId` (or the LAST position write in
- * source order if stale), remove every OTHER pure-position write
- * (`propertyGroup === "position"` — tl.to/from/fromTo flat-or-keyframed, tl.set,
+ * source order if stale), remove every OTHER x/y position write
+ * (`isXYPositionWrite` — tl.to/from/fromTo flat-or-keyframed, tl.set,
  * standalone gsap.set, incl. degenerate duration:0 tweens). Non-position writes
  * for the selector are left untouched.
  */
@@ -1777,7 +1801,7 @@ export function dedupePositionWritesInScript(
     return script;
   }
   const posWrites = parsed.located.filter(
-    (l) => l.animation.targetSelector === selector && l.animation.propertyGroup === "position",
+    (l) => l.animation.targetSelector === selector && isXYPositionWrite(l.animation),
   );
   if (posWrites.length <= 1) return script;
   const keeper = posWrites.find((l) => l.id === keepId) ?? posWrites[posWrites.length - 1]!;
@@ -1839,11 +1863,19 @@ export function isStudioHoldSet(anim: GsapAnimation): boolean {
  * so this pass owns it: every call wipes the prior holds and recomputes from the
  * current keyframes, keeping them in sync as keyframes are added/moved/deleted.
  *
- * Idempotent. Only position props (x/y/xPercent/yPercent) are held — opacity/scale
- * keep their authored pre-tween behavior. A tween already starting at 0 needs no
- * hold (no gap before it).
+ * Idempotent. Only position and size props are held — opacity/scale keep their
+ * authored pre-tween behavior. A tween already starting at 0 needs no hold, unless
+ * it is a lone keyframe, which GSAP never renders by itself.
  */
-export function syncPositionHoldsBeforeKeyframes(script: string): string {
+function animationsOf(script: string): GsapAnimation[] | null {
+  try {
+    return parseGsapScript(script).animations;
+  } catch {
+    return null;
+  }
+}
+
+export function syncPositionHoldsBeforeKeyframes(script: string, previous?: string): string {
   let parsed: ParsedGsap;
   try {
     parsed = parseGsapScript(script);
@@ -1855,24 +1887,20 @@ export function syncPositionHoldsBeforeKeyframes(script: string): string {
   const staleHoldIds = parsed.animations.filter(isStudioHoldSet).map((a) => a.id);
   for (const id of staleHoldIds) result = removeAnimationFromScript(result, id);
 
-  // 2. Re-add a hold for each position-keyframed tween that starts after t=0.
+  // 2. Re-add a hold for each keyframed tween keyframeHoldForAnimation pins.
   let reparsed: ParsedGsap;
   try {
     reparsed = parseGsapScript(result);
   } catch {
     return result;
   }
+  const scope = holdScope(
+    parsed.animations,
+    previous === undefined ? null : animationsOf(previous),
+  );
   for (const anim of reparsed.animations) {
-    if (!anim.keyframes) continue;
-    const start = anim.resolvedStart ?? (typeof anim.position === "number" ? anim.position : 0);
-    if (!(start > 0.001)) continue;
-    const firstKf = [...anim.keyframes.keyframes].sort((a, b) => a.percentage - b.percentage)[0];
-    if (!firstKf) continue;
-    const posProps: Record<string, number | string> = {};
-    for (const [k, v] of Object.entries(firstKf.properties)) {
-      if (classifyPropertyGroup(k) === "position" && typeof v === "number") posProps[k] = v;
-    }
-    if (Object.keys(posProps).length === 0) continue;
+    const posProps = keyframeHoldForAnimation(anim, reparsed.animations, scope);
+    if (!posProps) continue;
     result = insertInheritedStateSet(result, anim.targetSelector, 0, {
       ...posProps,
       data: STUDIO_HOLD_MARKER,
@@ -1929,14 +1957,14 @@ export function splitAnimationsInScript(
     const dur = anim.duration ?? 0;
     const animEnd = pos + dur;
 
-    if (anim.keyframes) {
+    if (authorsKeyframes(anim)) {
       if (pos >= opts.splitTime) {
         result = updateAnimationSelector(result, anim.id, newSelector);
       } else if (animEnd > opts.splitTime) {
         // Spanning keyframes can't be correctly split without renormalizing
         // percentages and durations — leave on original, warn the caller.
         skippedSelectors.push(`${originalSelector} (keyframes spanning split)`);
-        const kfs = anim.keyframes.keyframes;
+        const kfs = anim.keyframes?.keyframes ?? [];
         for (const kf of kfs) {
           const kfTime = pos + (kf.percentage / 100) * dur;
           if (kfTime <= opts.splitTime) {
@@ -1947,7 +1975,10 @@ export function splitAnimationsInScript(
         }
       } else {
         // Entirely before split — extract final keyframe properties
-        const kfs = anim.keyframes.keyframes;
+        if (anim.hasUnresolvedKeyframes) {
+          skippedSelectors.push(`${originalSelector} (unreadable keyframes before split)`);
+        }
+        const kfs = anim.keyframes?.keyframes ?? [];
         if (kfs.length > 0) {
           for (const [k, v] of Object.entries(kfs[kfs.length - 1]!.properties)) {
             inheritedProps[k] = v;
@@ -2213,7 +2244,7 @@ function convertArrayKeyframesToObjectNode(varsArg: AstNode, scope: ScopeBinding
     outerDuration,
   );
   if (!timing) return null;
-  if (timing.totalDuration !== undefined && findPropertyNode(varsArg, "duration") === undefined) {
+  if (findPropertyNode(varsArg, "duration") === undefined) {
     setVarsKey(varsArg, "duration", timing.totalDuration);
   }
   const entries = els.map((el: AstNode, i: number) => {
@@ -2222,7 +2253,7 @@ function convertArrayKeyframesToObjectNode(varsArg: AstNode, scope: ScopeBinding
     );
     return `${JSON.stringify(`${timing.percentages[i]}%`)}: ${recast.print(el).code}`;
   });
-  prop.value = parseExpr(`{ ${entries.join(", ")} }`);
+  prop.value = parseExpr(`{ ${entries.join(", ")}, easeEach: "none" }`);
   return prop.value;
 }
 
@@ -2703,7 +2734,7 @@ export function convertToKeyframesInScript(
   if (!loc) return script;
 
   const anim = loc.target.animation;
-  if (anim.keyframes) return script;
+  if (authorsKeyframes(anim)) return script;
 
   const { fromProps, toProps } = resolveConversionProps(anim, resolvedFromValues);
   const varsArg = loc.target.call.varsArg;
@@ -3252,6 +3283,7 @@ export function splitIntoPropertyGroups(
   if (!loc) return { script, ids: [animationId] };
 
   const anim = loc.target.animation;
+  if (anim.hasUnresolvedKeyframes) return { script, ids: [animationId] };
 
   // Collect the properties to partition. For keyframed tweens, gather the
   // union of all properties across all keyframes. For flat tweens, use the

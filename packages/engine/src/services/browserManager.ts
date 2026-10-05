@@ -11,6 +11,7 @@ import { execSync } from "child_process";
 import { existsSync, readdirSync } from "fs";
 import { join } from "path";
 import { homedir } from "os";
+import { chromeMajorCeiling, exceedsChromeCeiling } from "./chromeHostCeiling.js";
 import { DEFAULT_CONFIG, type EngineConfig } from "../config.js";
 import { getSystemTotalMb, LOW_MEMORY_TOTAL_MB_THRESHOLD } from "./systemMemory.js";
 import {
@@ -29,6 +30,15 @@ export type {
 } from "./browserLeasePool.js";
 
 let _puppeteer: PuppeteerNode | undefined;
+
+let hostHandlesSigint = false;
+
+/** Set while the host cancels renders on Ctrl+C; Puppeteer's own handler would exit before any cleanup ran. */
+export function setHostHandlesSigint(owned: boolean): void {
+  hostHandlesSigint = owned;
+}
+
+export const sigintLaunchOptions = () => ({ handleSIGINT: !hostHandlesSigint });
 
 interface WebGlProbeInfo {
   hasWebGL: boolean;
@@ -73,6 +83,7 @@ async function probeHardwareWebGlInfo(
   let probeBrowser: Browser | undefined;
   try {
     probeBrowser = await ppt.launch({
+      ...sigintLaunchOptions(),
       headless: true,
       args: options.args,
       defaultViewport: { width: 64, height: 64 },
@@ -162,8 +173,10 @@ function findCachedHeadlessShell(baseDir: string): string | undefined {
   const executable = cachedHeadlessShellExecutable();
   if (!executable) return undefined;
   try {
+    const ceiling = chromeMajorCeiling();
     const versions = readdirSync(baseDir).sort(compareBrowserVersionsDescending);
     for (const version of versions) {
+      if (exceedsChromeCeiling(version, ceiling)) continue;
       const binary = join(baseDir, version, ...executable);
       if (existsSync(binary)) return binary;
     }
@@ -696,6 +709,7 @@ async function launchBrowser(
   let browser: Browser | undefined;
   try {
     browser = await ppt.launch({
+      ...sigintLaunchOptions(),
       headless: true,
       args: [...fingerprint.args],
       defaultViewport: null,
@@ -727,6 +741,7 @@ async function launchBrowser(
         );
         captureMode = "screenshot";
         browser = await ppt.launch({
+          ...sigintLaunchOptions(),
           headless: true,
           args: stripBeginFrameFlags([...fingerprint.args]),
           defaultViewport: null,
@@ -790,6 +805,11 @@ export async function drainBrowserPool(): Promise<void> {
   await browserLeasePool.drain();
 }
 
+/** Terminal shutdown: drains the pool and makes every later acquire() reject. */
+export async function closeBrowserPool(): Promise<void> {
+  await browserLeasePool.close();
+}
+
 /** Test-only: reset all pool state. */
 export function _resetBrowserPoolForTests(): void {
   browserLeasePool.reset();
@@ -810,6 +830,7 @@ function probeNvidiaVramMb(): number | null {
       timeout: 3000,
       encoding: "utf-8",
       stdio: ["pipe", "pipe", "pipe"],
+      windowsHide: true,
     }).trim();
     const mb = parseInt(out.split("\n")[0] ?? "", 10);
     if (Number.isFinite(mb) && mb > 0) {
@@ -874,6 +895,7 @@ export function buildChromeArgs(
     ...getBrowserGpuArgs(browserGpuMode, platform),
     "--font-render-hinting=none",
     "--force-color-profile=srgb",
+    "--force-device-scale-factor=1",
     `--window-size=${options.width},${options.height}`,
     // Prevent Chrome from throttling background tabs/timers — critical when the
     // page is offscreen during headless capture

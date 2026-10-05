@@ -75,7 +75,7 @@ tmp/
 packages/core/src/generated/*
 !packages/core/src/generated/position-edits-render-inline.ts
 !packages/core/src/generated/position-edits-render-inline.test.ts
-packages/producer/src/services/fontData.generated.ts
+packages/core/src/fonts/fontData.generated.ts
 
 # Plan documents (working artifacts, not committed)
 docs/plans/
@@ -188,3 +188,7 @@ tmp/
 
 # Local Chrome-for-Testing downloads (large binaries, never commit)
 chrome/
+
+# Hosted catalog item files are generated output the docs host serves; the rules above match their folder names
+!docs/public/catalog/items/**/compositions/
+!docs/public/catalog/items/*-ad/

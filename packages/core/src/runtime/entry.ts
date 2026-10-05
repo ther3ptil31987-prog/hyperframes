@@ -1,13 +1,23 @@
-import { initSandboxRuntimeModular } from "./init";
+import {
+  initSandboxRuntimeModular,
+  installAuthoredMediaCapture,
+  installFlatGsapTransforms,
+} from "./init";
 import { installAuthoredOpacityCapture } from "./colorGrading";
+import { deferMediaUntilDue } from "./preloadMedia";
+import { hideTimedClipsUntilFirstPass } from "./timedClipHide";
 import { fitTextFontSize } from "../text/fitTextFontSize";
 import { pretext } from "../text/pretext";
+import { assetUrl } from "./assetUrl";
 import { getVariables } from "./getVariables";
 import { clearRuntimeData, registerRuntimeDataHandler, setRuntimeData } from "./runtimeData";
+import { runScriptsAfterFonts } from "./afterFonts";
+import { AFTER_FONTS_SCRIPTS } from "../compiler/scriptRuns";
 
 type HyperframeWindow = Window & {
   __hyperframeRuntimeBootstrapped?: boolean;
   __hyperframes?: {
+    assetUrl: typeof assetUrl;
     fitTextFontSize: typeof fitTextFontSize;
     getVariables: typeof getVariables;
     pretext: typeof pretext;
@@ -25,11 +35,17 @@ type HyperframeWindow = Window & {
 // composition's animation scripts (and the grading hide) mutate it — must run
 // at script evaluation time, while the document is still parsing.
 installAuthoredOpacityCapture();
+installAuthoredMediaCapture();
+installFlatGsapTransforms();
+
+hideTimedClipsUntilFirstPass();
+deferMediaUntilDue();
 
 // Expose runtime helpers immediately so composition scripts can use them
 // before DOMContentLoaded (font sizing runs during script evaluation, and
 // getVariables is read by composition setup before the timeline is built).
 (window as HyperframeWindow).__hyperframes = {
+  assetUrl,
   fitTextFontSize,
   getVariables,
   pretext,
@@ -47,8 +63,15 @@ function bootstrapHyperframeRuntime(): void {
   initSandboxRuntimeModular();
 }
 
+// Compiled composition scripts wait for web fonts, so what they measure matches every run.
+function startAfterCompositionScripts(): void {
+  const deferred = Array.from(document.querySelectorAll(AFTER_FONTS_SCRIPTS));
+  if (deferred.length === 0) bootstrapHyperframeRuntime();
+  else void runScriptsAfterFonts(deferred, bootstrapHyperframeRuntime);
+}
+
 if (document.readyState === "loading") {
-  document.addEventListener("DOMContentLoaded", bootstrapHyperframeRuntime, { once: true });
+  document.addEventListener("DOMContentLoaded", startAfterCompositionScripts, { once: true });
 } else {
-  bootstrapHyperframeRuntime();
+  startAfterCompositionScripts();
 }

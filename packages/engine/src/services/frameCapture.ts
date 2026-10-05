@@ -8,10 +8,17 @@
  * via Chrome's BeginFrame API or Page.captureScreenshot fallback.
  */
 
-import { type Browser, type Page, type Viewport, type ConsoleMessage } from "puppeteer-core";
+import {
+  type Browser,
+  type Page,
+  type Protocol,
+  type Viewport,
+  type ConsoleMessage,
+} from "puppeteer-core";
 import { existsSync, mkdirSync, writeFileSync } from "fs";
 import { join } from "path";
 import {
+  COMPOSITION_SOURCE_URL,
   quantizeSeekTime,
   quantizeTimeToFrame,
   fpsToNumber,
@@ -165,8 +172,19 @@ export interface CaptureSession {
    * were hitting that wall — a 705-render spike at the 45s setup bucket).
    */
   scriptLoadFailures: string[];
+  /** Uncaught page errors; a timed-out timeline wait with any of these becomes a script failure. */
+  pageErrors: string[];
+  /** The first VFX chain error; its frames would lack the effect, so it stops the render. */
+  vfxFailure?: string;
   /** Outcome of the sub-composition timeline wait: ready | timeout | script_failure. */
   subTimelineWaitOutcome?: SubTimelineWaitOutcome;
+  /**
+   * Composition ids still unregistered when the timeline wait gave up. Already
+   * computed for the stderr warning; kept on the session so the STRUCTURED
+   * warning can name them too — a programmatic caller reads `warnings`, not
+   * our console output.
+   */
+  pendingTimelineIds?: string[];
   /** Structured readiness warnings surfaced to the producer's render policy. */
   warnings: CaptureWarning[];
   initTelemetry?: {
@@ -672,6 +690,8 @@ export const LOCKED_WARMUP_TICKS = 60;
 export interface WarmupTickState {
   running: boolean;
   ticks: number;
+  /** Set when session init fails: stops the loop in either mode, since a closed page fails every tick. */
+  cancelled?: boolean;
 }
 
 export interface WarmupTickOptions {
@@ -787,12 +807,25 @@ export function prepareBeginFrameTimeline(
   };
 }
 
+/** Runs BeginFrame session setup; a failure stops the warm-up loop, which would otherwise tick forever. */
+export async function cancelWarmupOnError<T>(
+  state: WarmupTickState,
+  setup: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await setup();
+  } catch (error) {
+    state.cancelled = true;
+    throw error;
+  }
+}
+
 export async function driveWarmupTicks(
   options: WarmupTickOptions,
   state: WarmupTickState,
 ): Promise<void> {
   const sleep = options.sleep ?? realSleep;
-  while (true) {
+  while (!state.cancelled) {
     if (options.lockWarmupTicks) {
       // Locked mode exits on the iteration count, ignoring `state.running` —
       // the caller flips `running=false` after page-readiness but we keep
@@ -931,8 +964,8 @@ async function initDrawElementOrTransparentBackground(
       }
     }
     // Capability gate: `canvas.drawElementImage` is an unlaunched Blink feature
-    // that only exists on recent Dev/Canary Chrome builds (~151+); it is absent
-    // from Stable and from most pinned/system Chrome installs. The
+    // that only exists on recent Chrome builds (150+ behind a flag); it is absent
+    // from Stable and from most system Chrome installs. The
     // `--enable-features=CanvasDrawElement` flag no-ops silently on a build that
     // doesn't implement it, so without this probe the first drawElementImage()
     // call throws `TypeError: ... is not a function` deep inside the capture
@@ -955,7 +988,7 @@ async function initDrawElementOrTransparentBackground(
       console.log(
         `[engine] fast capture: falling back to ${session.launchCaptureMode} capture — ` +
           "this Chrome build does not implement canvas.drawElementImage (Dev/Canary-only " +
-          "feature, ~151+); run `hyperframes browser ensure --force` to fetch a supported " +
+          "feature); run `hyperframes browser ensure --force` to fetch a supported " +
           "build, or set HYPERFRAMES_BROWSER_PATH to one.",
       );
       await routeToFallback();
@@ -1464,7 +1497,7 @@ async function constructCaptureSession(
 
   // Transparent-background setup is intentionally NOT done here. Chrome resets
   // the default-background-color override on navigation, and the
-  // `[data-composition-id]{background:transparent}` stylesheet that
+  // `html,body{background:transparent}` stylesheet that
   // `initTransparentBackground` injects must land in a real `document.head`.
   // See `initializeSession()` below — it calls `initTransparentBackground` for
   // PNG captures after `page.goto(...)` and the `window.__hf` readiness poll.
@@ -1481,6 +1514,7 @@ async function constructCaptureSession(
     isInitialized: false,
     browserConsoleBuffer: [],
     scriptLoadFailures: [],
+    pageErrors: [],
     warnings: [],
     capturePerf: {
       frames: 0,
@@ -1730,6 +1764,11 @@ export async function pollSubCompositionTimelines(
   // is cut to `scriptFailureGraceMs` from its start.
   getScriptLoadFailures?: () => readonly string[],
   scriptFailureGraceMs: number = 2_000,
+  // Reports the composition ids still unregistered at bail time, so the caller
+  // can put them in the structured warning as well as in stderr.
+  onPending?: (ids: readonly string[]) => void,
+  // Ends the wait at once; the caller then fails the render for its own reason.
+  shouldStop?: () => boolean,
 ): Promise<SubTimelineWaitOutcome> {
   // Hosts may opt out of the timeline wait with `data-no-timeline` —
   // compositions driven purely by CSS animations / rAF (the render-compat
@@ -1753,7 +1792,7 @@ export async function pollSubCompositionTimelines(
   let scriptFailureBail = false;
   for (;;) {
     ready = Boolean(await page.evaluate(expression));
-    if (ready) break;
+    if (ready || shouldStop?.()) break;
     const now = Date.now();
     if (now >= deadline) break;
     const failures = getScriptLoadFailures?.() ?? [];
@@ -1788,7 +1827,7 @@ export async function pollSubCompositionTimelines(
   // reason — a script-failure bail used to skip this entirely, so a render
   // with multiple sub-compositions only named the failed script URL(s), not
   // which composition(s) it was still waiting on (review).
-  const missing = await page.evaluate(`(function() {
+  const evaluated = await page.evaluate(`(function() {
     var hosts = document.querySelectorAll("[data-composition-id]");
     var timelines = window.__timelines || {};
     var m = [];
@@ -1797,8 +1836,15 @@ export async function pollSubCompositionTimelines(
       var id = hosts[i].getAttribute("data-composition-id");
       if (id && !timelines[id]) m.push(id);
     }
-    return m.join(", ");
+    return m;
   })()`);
+  // This block exists to BUILD A WARNING, so it must never be the thing that
+  // throws. `page.evaluate` is loosely typed, and a caller that stubs it (or a
+  // runtime that returns nothing here) would turn a blind `as string[]` cast
+  // into a TypeError on the diagnostic path. Normalise instead of asserting.
+  const pendingIds = Array.isArray(evaluated) ? evaluated.map((id) => String(id)) : [];
+  onPending?.(pendingIds);
+  const missing = pendingIds.join(", ");
   if (scriptFailureBail) {
     console.warn(`[FrameCapture] Composition(s) still waiting on the failed script: ${missing}.`);
   } else {
@@ -1975,19 +2021,33 @@ function recordCaptureWarnings(session: CaptureSession, warnings: readonly Captu
   }
 }
 
-function recordSubTimelineWarning(session: CaptureSession, timeoutMs: number): void {
-  if (session.subTimelineWaitOutcome === "ready" || !session.subTimelineWaitOutcome) return;
-  const scriptFailure = session.subTimelineWaitOutcome === "script_failure";
-  const hasRuntimeErrors = session.scriptLoadFailures.some((f) => f.startsWith("runtime-error:"));
+export function recordSubTimelineWarning(session: CaptureSession, timeoutMs: number): void {
+  const outcome = session.subTimelineWaitOutcome;
+  if (outcome === "ready" || !outcome) return;
+  const threwThenTimedOut = outcome === "timeout" && session.pageErrors.length > 0;
+  const scriptFailure = outcome === "script_failure" || threwThenTimedOut;
+  const sources = [...session.scriptLoadFailures, ...session.pageErrors];
+  const pending = session.pendingTimelineIds ?? [];
+  const pendingSuffix = pending.length > 0 ? ` (still unregistered: ${pending.join(", ")})` : "";
   recordCaptureWarnings(session, [
     {
       code: scriptFailure ? "sub_timeline_script_failure" : "sub_timeline_readiness_timeout",
-      message: scriptFailure
-        ? hasRuntimeErrors
-          ? `A sub-composition script threw during execution — timeline registration never arrived (${session.scriptLoadFailures.join(", ")})`
-          : `A sub-composition timeline script failed to load (${session.scriptLoadFailures.join(", ")})`
-        : `Sub-composition timelines did not become ready within ${timeoutMs}ms`,
-      details: { timeoutMs, sources: [...session.scriptLoadFailures] },
+      message: threwThenTimedOut
+        ? `A composition script threw and a timeline did not register within ${timeoutMs}ms` +
+          `${pendingSuffix} (${sources.join(", ")}). Fix the error; a composition animated by ` +
+          `CSS or rAF rather than a GSAP timeline must mark its host with data-no-timeline.`
+        : scriptFailure
+          ? `A sub-composition timeline script failed to load (${sources.join(", ")})`
+          : `Sub-composition timelines did not become ready within ${timeoutMs}ms${pendingSuffix}. ` +
+            `This can be intentional: a composition driven by CSS animations or rAF never registers ` +
+            `window.__timelines[id], and marking its host with data-no-timeline skips the wait entirely. ` +
+            `Otherwise, a composition that sets up asynchronously must register window.__timelines[id] ` +
+            `once setup completes.`,
+      details: {
+        timeoutMs,
+        sources,
+        pendingCompositionIds: [...pending],
+      },
     },
   ]);
 }
@@ -2135,6 +2195,34 @@ async function waitForOptionalTailwindReady(page: Page, timeoutMs: number): Prom
   }
 }
 
+/** Thrown once a VFX chain fails: the frames it paints would render without the effect. */
+export class VfxFailureError extends Error {
+  constructor(readonly detail: string) {
+    super(`A VFX chain failed, so its frames would render without the effect (${detail})`);
+    this.name = "VfxFailureError";
+  }
+}
+
+function assertVfxIntact(session: CaptureSession): void {
+  if (session.vfxFailure) throw new VfxFailureError(session.vfxFailure);
+}
+
+// A `vfx:` detail is a chain that cannot paint, so every frame is wrong; `vfx-frame:` is one frame, a page error.
+function recordConsoleScriptError(session: CaptureSession, error: string | null): void {
+  if (!error?.startsWith("runtime-error:vfx:")) {
+    recordPageError(session, error);
+    return;
+  }
+  if (session.vfxFailure) return;
+  session.vfxFailure = error;
+  const message = new VfxFailureError(error).message;
+  recordCaptureWarnings(session, [{ code: "vfx_failure", message, details: { sources: [error] } }]);
+}
+
+function recordPageError(session: CaptureSession, error: string | null): void {
+  if (error && !session.pageErrors.includes(error)) session.pageErrors.push(error);
+}
+
 // A 4xx `response` and a `requestfailed` can both fire for the same script
 // (e.g. a `requestfailed` following the 4xx), and repeated <script> tags for
 // the same URL duplicate it further — dedupe so the fail-fast warning names
@@ -2145,13 +2233,17 @@ function recordScriptLoadFailure(session: CaptureSession, url: string): void {
   }
 }
 
+const SCRIPT_ERROR_LABEL = "[HyperFrames] composition script error:";
+
+/** `runtime-error:<first line>` for the error a framework wrapper logs when a composition script throws. */
+export function classifyConsoleScriptError(type: string, text: string): string | null {
+  if (type !== "error" || !text.startsWith(SCRIPT_ERROR_LABEL)) return null;
+  const [detail = ""] = text.slice(SCRIPT_ERROR_LABEL.length).trim().split("\n");
+  return `runtime-error:${detail.trimEnd() || "unknown"}`;
+}
+
 export function classifyConsoleScriptFailure(type: string, text: string): string | null {
   if (type !== "error") return null;
-  if (text.startsWith("[HyperFrames] composition script error:")) {
-    const detail = text.slice("[HyperFrames] composition script error:".length).trim();
-    const compId = detail.split(" ")[0] || "unknown";
-    return `runtime-error:${compId}`;
-  }
   if (
     /failed to find a valid digest in the ['"]integrity['"] attribute/i.test(text) &&
     /resource has been blocked/i.test(text)
@@ -2159,6 +2251,30 @@ export function classifyConsoleScriptFailure(type: string, text: string): string
     return "runtime-error:subresource-integrity";
   }
   return null;
+}
+
+function isPlayPauseAbort(message: string): boolean {
+  return /^AbortError:/.test(message) && message.includes("play()") && message.includes("pause()");
+}
+
+/** `runtime-error:<first line>` when a script served with the composition threw; null if not attributable to one. */
+export function classifyPageError(
+  details: Protocol.Runtime.ExceptionDetails,
+  projectScripts: ReadonlySet<string>,
+): string | null {
+  const exception = details.exception;
+  const message = String(exception?.description ?? exception?.value ?? details.text);
+  const [firstLine = ""] = message.split("\n");
+  if (isPlayPauseAbort(firstLine)) return null;
+  const frames = (details.stackTrace?.callFrames ?? []).map((frame) => frame.url);
+  // Frameless: a parse error names its script; a rejection names whatever document is current, so it is unattributable.
+  if (frames.length === 0 && details.text.startsWith("Uncaught (in promise)")) return null;
+  const urls = frames.length > 0 ? frames : [details.url];
+  // The render compiler names the composition's inline code.
+  // Inline handlers report the document, which a widget can move.
+  const owned = (url: string | undefined) =>
+    url !== undefined && (projectScripts.has(url) || url.startsWith(COMPOSITION_SOURCE_URL));
+  return urls.some(owned) ? `runtime-error:${firstLine}` : null;
 }
 
 // fallow-ignore-next-line unit-size
@@ -2175,12 +2291,10 @@ export async function initializeSession(session: CaptureSession): Promise<void> 
     if (!diagnostic.suppressHostLog) console.log(diagnostic.text);
     appendBrowserDiagnostic(session, diagnostic.text);
 
-    // Composition script runtime errors mean the GSAP timeline registration
-    // can never arrive — same fail-fast treatment as script load failures.
-    // Without this, pollSubCompositionTimelines burns the full timeout and
-    // the render silently succeeds with a degenerate 2-frame output (#3352).
+    // A blocked script can never register its timeline (#3352); a thrown one may still, so it only counts on timeout.
     const scriptFailure = classifyConsoleScriptFailure(type, text);
     if (scriptFailure) recordScriptLoadFailure(session, scriptFailure);
+    recordConsoleScriptError(session, classifyConsoleScriptError(type, text));
   });
 
   page.on("pageerror", (err) => {
@@ -2188,11 +2302,7 @@ export async function initializeSession(session: CaptureSession): Promise<void> 
     const text = `[Browser:PAGEERROR] ${message}`;
 
     // Benign play/pause race during frame capture — suppress terminal noise, keep in buffer.
-    const isPlayAbort =
-      /^AbortError:/.test(message) && message.includes("play()") && message.includes("pause()");
-    if (!isPlayAbort) {
-      console.error(text);
-    }
+    if (!isPlayPauseAbort(message)) console.error(text);
 
     appendBrowserDiagnostic(session, text);
   });
@@ -2216,14 +2326,18 @@ export async function initializeSession(session: CaptureSession): Promise<void> 
     );
   });
 
+  const projectScripts = new Set<string>();
   page.on("response", (response) => {
     const status = response.status();
-    if (status < 400) return;
-
     const request = response.request();
-    if (request.resourceType() === "script") {
-      recordScriptLoadFailure(session, response.url());
+    const isScript = request.resourceType() === "script";
+    const responseUrl = response.url();
+    if (status < 400) {
+      if (isScript && responseUrl.startsWith(`${serverUrl}/`)) projectScripts.add(responseUrl);
+      return;
     }
+
+    if (isScript) recordScriptLoadFailure(session, responseUrl);
     appendBrowserDiagnostic(
       session,
       formatHttpErrorDiagnostic({
@@ -2238,6 +2352,14 @@ export async function initializeSession(session: CaptureSession): Promise<void> 
 
   // Navigate to the file server
   const url = `${serverUrl}/index.html`;
+
+  // Unlike the pageerror Error, this keeps the script URL of syntax errors and thrown non-errors.
+  const runtimeClient = await getCdpSession(page);
+  runtimeClient.on("Runtime.exceptionThrown", ({ exceptionDetails }) => {
+    recordPageError(session, classifyPageError(exceptionDetails, projectScripts));
+  });
+  await runtimeClient.send("Runtime.enable");
+
   const pageNavigationTimeout =
     session.config?.pageNavigationTimeout ?? DEFAULT_CONFIG.pageNavigationTimeout;
   const initStart = Date.now();
@@ -2294,8 +2416,14 @@ export async function initializeSession(session: CaptureSession): Promise<void> 
       pageReadyTimeout,
       undefined,
       () => session.scriptLoadFailures,
+      undefined,
+      (ids) => {
+        session.pendingTimelineIds = [...ids];
+      },
+      () => session.vfxFailure !== undefined,
     );
     logInitPhase(`pollSubCompositionTimelines complete (${session.subTimelineWaitOutcome})`);
+    assertVfxIntact(session);
     recordSubTimelineWarning(session, pageReadyTimeout);
 
     await applyVideoMetadataHints(page, session.options.videoMetadataHints);
@@ -2431,91 +2559,95 @@ export async function initializeSession(session: CaptureSession): Promise<void> 
   warmupLoopPromise.catch(() => {});
   logInitPhase("warmup loop started");
 
-  await gotoEntryPage();
-  logInitPhase("page.goto complete");
+  await cancelWarmupOnError(warmupState, async () => {
+    await gotoEntryPage();
+    logInitPhase("page.goto complete");
 
-  // Flush the GSAP proxy queue synchronously. In BeginFrame mode the rAF-based
-  // batch drain runs on the warmup loop's 33ms ticks — for tween-heavy
-  // compositions this is the dominant init cost. Flushing synchronously
-  // eliminates the wait entirely.
-  await page.evaluate(`window.__hfFlushSync?.()`);
-  logInitPhase("GSAP proxy flush complete");
+    // Flush the GSAP proxy queue synchronously. In BeginFrame mode the rAF-based
+    // batch drain runs on the warmup loop's 33ms ticks — for tween-heavy
+    // compositions this is the dominant init cost. Flushing synchronously
+    // eliminates the wait entirely.
+    await page.evaluate(`window.__hfFlushSync?.()`);
+    logInitPhase("GSAP proxy flush complete");
 
-  // Poll for window.__hf readiness using manual evaluate loop (waitForFunction
-  // uses rAF polling internally, which won't fire in beginFrame mode).
-  const pageReadyTimeout = session.config?.playerReadyTimeout ?? DEFAULT_CONFIG.playerReadyTimeout;
-  try {
+    // Poll for window.__hf readiness using manual evaluate loop (waitForFunction
+    // uses rAF polling internally, which won't fire in beginFrame mode).
+    const pageReadyTimeout =
+      session.config?.playerReadyTimeout ?? DEFAULT_CONFIG.playerReadyTimeout;
     await pollHfReady(page, pageReadyTimeout);
     logInitPhase("pollHfReady complete");
-  } catch (err) {
-    warmupState.running = false;
-    throw err;
-  }
 
-  session.subTimelineWaitOutcome = await pollSubCompositionTimelines(
-    page,
-    pageReadyTimeout,
-    undefined,
-    () => session.scriptLoadFailures,
-  );
-  logInitPhase(`pollSubCompositionTimelines complete (${session.subTimelineWaitOutcome})`);
-  recordSubTimelineWarning(session, pageReadyTimeout);
-
-  await applyVideoMetadataHints(page, session.options.videoMetadataHints);
-  logInitPhase("applyVideoMetadataHints complete");
-
-  // Run independent readiness checks in parallel — videos, images, fonts,
-  // and Tailwind don't depend on each other's completion.
-  const bfSkipVideoIds = session.options.skipReadinessVideoIds ?? [];
-  const [bfVideosReady] = await Promise.all([
-    pollVideosReady(page, bfSkipVideoIds, pageReadyTimeout),
-    pollImagesReady(page, pageReadyTimeout).then(async (ready) => {
-      if (!ready) {
-        const failedImages = await page.evaluate(() => {
-          return Array.from(document.querySelectorAll("img"))
-            .filter((img) => {
-              const ie = img as HTMLImageElement;
-              const src = ie.getAttribute("src") || "";
-              if (!src || src.startsWith("data:")) return false;
-              return !(ie.complete && ie.naturalWidth > 0);
-            })
-            .map((img) => (img as HTMLImageElement).src || img.getAttribute("src") || "(no src)")
-            .join(", ");
-        });
-        console.warn(
-          `[FrameCapture] Some image elements did not load within ${pageReadyTimeout}ms: ${failedImages}. ` +
-            `Continuing render — affected images may appear blank/missing in early frames.`,
-        );
-      }
-      await decodeAllImages(page);
-      return ready;
-    }),
-    page.evaluate(`document.fonts?.ready`),
-    waitForOptionalTailwindReady(page, pageReadyTimeout),
-  ]);
-  logInitPhase("media + fonts + tailwind ready");
-
-  if (!bfVideosReady) {
-    const failedVideos = await page.evaluate((skipIdList: readonly string[]) => {
-      const skip = new Set(skipIdList);
-      return Array.from(document.querySelectorAll("video"))
-        .filter((v) => !skip.has(v.id))
-        .filter((v) => (v as HTMLVideoElement).readyState < 2 && !(v as HTMLVideoElement).error)
-        .map((v) => (v as HTMLVideoElement).src || v.getAttribute("src") || "(no src)")
-        .join(", ");
-    }, bfSkipVideoIds);
-    console.warn(
-      `[FrameCapture] Some video elements did not decode within ${pageReadyTimeout}ms: ${failedVideos}. ` +
-        `Continuing render — affected videos will appear as blank/black frames.`,
+    session.subTimelineWaitOutcome = await pollSubCompositionTimelines(
+      page,
+      pageReadyTimeout,
+      undefined,
+      () => session.scriptLoadFailures,
+      undefined,
+      (ids) => {
+        session.pendingTimelineIds = [...ids];
+      },
+      () => session.vfxFailure !== undefined,
     );
-  }
-  recordCaptureWarnings(
-    session,
-    await collectMediaReadinessWarnings(page, bfSkipVideoIds, pageReadyTimeout),
-  );
-  await recordLiveMapWarning(session, page);
+    logInitPhase(`pollSubCompositionTimelines complete (${session.subTimelineWaitOutcome})`);
+    assertVfxIntact(session);
+    recordSubTimelineWarning(session, pageReadyTimeout);
 
-  await recordSessionInitTelemetry(session, initStart);
+    await applyVideoMetadataHints(page, session.options.videoMetadataHints);
+    logInitPhase("applyVideoMetadataHints complete");
+
+    // Run independent readiness checks in parallel — videos, images, fonts,
+    // and Tailwind don't depend on each other's completion.
+    const bfSkipVideoIds = session.options.skipReadinessVideoIds ?? [];
+    const [bfVideosReady] = await Promise.all([
+      pollVideosReady(page, bfSkipVideoIds, pageReadyTimeout),
+      pollImagesReady(page, pageReadyTimeout).then(async (ready) => {
+        if (!ready) {
+          const failedImages = await page.evaluate(() => {
+            return Array.from(document.querySelectorAll("img"))
+              .filter((img) => {
+                const ie = img as HTMLImageElement;
+                const src = ie.getAttribute("src") || "";
+                if (!src || src.startsWith("data:")) return false;
+                return !(ie.complete && ie.naturalWidth > 0);
+              })
+              .map((img) => (img as HTMLImageElement).src || img.getAttribute("src") || "(no src)")
+              .join(", ");
+          });
+          console.warn(
+            `[FrameCapture] Some image elements did not load within ${pageReadyTimeout}ms: ${failedImages}. ` +
+              `Continuing render — affected images may appear blank/missing in early frames.`,
+          );
+        }
+        await decodeAllImages(page);
+        return ready;
+      }),
+      page.evaluate(`document.fonts?.ready`),
+      waitForOptionalTailwindReady(page, pageReadyTimeout),
+    ]);
+    logInitPhase("media + fonts + tailwind ready");
+
+    if (!bfVideosReady) {
+      const failedVideos = await page.evaluate((skipIdList: readonly string[]) => {
+        const skip = new Set(skipIdList);
+        return Array.from(document.querySelectorAll("video"))
+          .filter((v) => !skip.has(v.id))
+          .filter((v) => (v as HTMLVideoElement).readyState < 2 && !(v as HTMLVideoElement).error)
+          .map((v) => (v as HTMLVideoElement).src || v.getAttribute("src") || "(no src)")
+          .join(", ");
+      }, bfSkipVideoIds);
+      console.warn(
+        `[FrameCapture] Some video elements did not decode within ${pageReadyTimeout}ms: ${failedVideos}. ` +
+          `Continuing render — affected videos will appear as blank/black frames.`,
+      );
+    }
+    recordCaptureWarnings(
+      session,
+      await collectMediaReadinessWarnings(page, bfSkipVideoIds, pageReadyTimeout),
+    );
+    await recordLiveMapWarning(session, page);
+
+    await recordSessionInitTelemetry(session, initStart);
+  });
 
   // Stop warmup, then drain the loop in BOTH modes before any further
   // BeginFrame on this session (drawElement init, the render-frame commit tick
@@ -2590,7 +2722,10 @@ async function captureFrameErrorDiagnostics(
     const diagnosticsDir = join(session.outputDir, "diagnostics");
     if (!existsSync(diagnosticsDir)) mkdirSync(diagnosticsDir, { recursive: true });
     const base = join(diagnosticsDir, `frame-error-${frameIndex}`);
-    await session.page.screenshot({ path: `${base}.png`, type: "png", fullPage: true });
+    const pageScreenshotCanResolve = session.launchCaptureMode !== "beginframe";
+    if (pageScreenshotCanResolve) {
+      await session.page.screenshot({ path: `${base}.png`, type: "png", fullPage: true });
+    }
     const html = await session.page.content();
     writeFileSync(`${base}.html`, html, "utf-8");
     writeFileSync(
@@ -2668,6 +2803,7 @@ async function prepareFrameForCapture(
   if (!session.isInitialized) {
     throw new Error("[FrameCapture] Session not initialized");
   }
+  assertVfxIntact(session);
 
   const quantizedTime = quantizeSeekTime(
     time,
@@ -4393,6 +4529,7 @@ export async function captureFramesBatchPipelined(
   if (!session.isInitialized) {
     throw new Error("[FrameCapture] Session not initialized");
   }
+  assertVfxIntact(session);
   const startTime = Date.now();
   const fps = fpsToNumber(options.fps);
   const quantized = times.map((t) => quantizeTimeToFrame(t, fps));

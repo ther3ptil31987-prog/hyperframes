@@ -358,6 +358,28 @@ describe("parseGsapScript", () => {
 
 // ── resolvedStart ─────────────────────────────────────────────────────────────
 
+describe("timeline defaults", () => {
+  it("never gives a keyframed tween the timeline's default ease, as GSAP does not", () => {
+    const script = `
+      const tl = gsap.timeline({ defaults: { ease: "power2.out" } });
+      tl.to("#a", { keyframes: { "0%": { x: 0 }, "100%": { x: 100 } }, duration: 2 });
+      tl.to("#b", { x: 100, duration: 2 });
+    `;
+    const [keyed, flat] = parseGsapScriptAcorn(script).animations;
+    expect(keyed!.ease).toBeUndefined();
+    expect(flat!.ease).toBe("power2.out");
+  });
+
+  it("keeps a keyframes ease the file names by variable, so a rewrite can write it back", () => {
+    const script = `
+      const tl = gsap.timeline();
+      tl.to("#a", { keyframes: { "0%": { x: 0 }, "100%": { x: 100 }, ease: E, easeEach: F }, duration: 2 });
+    `;
+    const [anim] = parseGsapScriptAcorn(script).animations;
+    expect(anim!.keyframes).toMatchObject({ ease: "__raw:E", easeEach: "__raw:F" });
+  });
+});
+
 describe("resolvedStart — timeline position resolution", () => {
   it("resolves chained from() tweens with relative positions (sdk-test pattern)", () => {
     const script = `
@@ -885,6 +907,18 @@ describe("native GSAP keyframes parsing", () => {
     expectKeyframe(kfs[0], 21.7, { x: 0, opacity: 1 });
     expectKeyframe(kfs[1], 65.2, { x: 100 }, "power2.out");
     expectKeyframe(kfs[2], 100, { x: 200 });
+  });
+
+  it("leaves array keyframes it can read only in part to the runtime", () => {
+    for (const step of ["mid", "{ ...mid, y: 20 }", "{ x: 120, runBackwards: true }"]) {
+      const anim = parseSingleAnimation(`
+        const mid = { x: 120 };
+        const tl = gsap.timeline({ paused: true });
+        tl.to("#hero", { keyframes: [{ x: 60 }, ${step}, { x: 180 }], duration: 3 }, 0);
+      `);
+      expect(anim.keyframes).toBeUndefined();
+      expect(anim.hasUnresolvedKeyframes).toBe(true);
+    }
   });
 
   it("parses simple array keyframes format", () => {

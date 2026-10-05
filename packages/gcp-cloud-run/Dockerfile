@@ -21,7 +21,7 @@
 # Unlike the AWS Lambda adapter there is no ZIP-size ceiling and no runtime
 # Chrome decompression step — the binary lives in the image at a fixed path.
 
-FROM node:22-bookworm-slim AS beginframe-contract
+FROM node:22.23.3-bookworm-slim AS beginframe-contract
 
 # ── System dependencies (identical set to the producer's render image) ───────
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -78,7 +78,7 @@ WORKDIR /app
 # the container runs `bun dist/server.js` and relies on bun's ESM `require`
 # interop to load the producer bundle, so a future bun release changing that
 # behaviour shouldn't silently break the next image rebuild. Bump deliberately.
-RUN curl -fsSL https://bun.sh/install | bash -s "bun-v1.3.9"
+RUN curl -fsSL https://bun.sh/install | bash -s "bun-v1.4.2"
 ENV PATH="/root/.bun/bin:$PATH"
 
 # Install workspace dependencies. Copy manifests first for layer caching.
@@ -98,7 +98,11 @@ COPY packages/sdk/package.json packages/sdk/package.json
 COPY packages/sdk-playground/package.json packages/sdk-playground/package.json
 COPY packages/studio-server/package.json packages/studio-server/package.json
 COPY scripts/package-subpaths.mjs scripts/package-subpaths.mjs
-RUN bun install --frozen-lockfile
+# A corrupt tarball extraction can print an error and then hang instead of
+# exiting (seen in Dockerfile.test, run 35468046055). Bound each attempt and
+# retry once, so a prod deploy build fails fast instead of hanging.
+RUN timeout 300 bun install --frozen-lockfile \
+    || timeout 300 bun install --frozen-lockfile
 
 # Fail the image build closed if the packaged executable cannot perform the
 # same BeginFrame operation the distributed renderer relies on. Generate the
@@ -138,8 +142,8 @@ COPY packages/studio-server/ packages/studio-server/
 
 # Build workspace dependencies before the producer bundle. The published
 # workspace packages are not prebuilt in a fresh clone, so producer's esbuild
-# resolution otherwise fails on parsers/core compiler entrypoints. Generate
-# embedded font data so glyph layout matches production.
+# resolution otherwise fails on parsers/core compiler entrypoints. Core's build
+# also generates the embedded font data, so glyph layout matches production.
 RUN bun run --cwd packages/parsers build \
     && bun run --cwd packages/lint build \
     && bun run --cwd packages/studio-server build \
@@ -148,7 +152,6 @@ RUN bun run --cwd packages/parsers build \
     && bun run --cwd packages/sdk build \
     && bun run --cwd packages/sdk-playground build \
     && bun run --cwd packages/engine build \
-    && (cd packages/producer && bunx tsx scripts/generate-font-data.ts) \
     && bun run --cwd packages/producer build \
     && bun run --cwd packages/gcp-cloud-run build
 

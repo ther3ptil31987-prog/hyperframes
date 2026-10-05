@@ -20,6 +20,7 @@ describe("loadExternalCompositions", () => {
     delete (window as Window & { __hyperframes?: unknown }).__hyperframes;
     delete (window as Window & { __timelines?: unknown }).__timelines;
     delete (window as WindowWithScopedVars).__hfVariablesByComp;
+    delete (document as { fonts?: unknown }).fonts;
     vi.restoreAllMocks();
   });
 
@@ -34,6 +35,48 @@ describe("loadExternalCompositions", () => {
     const fetchSpy = vi.spyOn(globalThis, "fetch");
     await loadExternalCompositions({ ...defaultParams });
     expect(fetchSpy).not.toHaveBeenCalled();
+  });
+
+  it("binds a fetched composition's scripts to its own URL for __hyperframes.assetUrl", async () => {
+    const host = document.createElement("div");
+    host.setAttribute("data-composition-src", "https://example.com/blocks/blk/blk.html");
+    host.setAttribute("data-composition-id", "blk");
+    document.body.appendChild(host);
+    const compositionHtml =
+      `<div data-composition-id="blk"><script>window.__url = __hyperframes.assetUrl("assets/env.hdr");</scr` +
+      `ipt></div>`;
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(compositionHtml, { status: 200 }));
+
+    const injectedScripts: HTMLScriptElement[] = [];
+    await loadExternalCompositions({ ...defaultParams, injectedScripts });
+
+    expect(injectedScripts.map((script) => script.textContent).join("")).toContain(
+      'var __hfCompositionSrc = "https://example.com/blocks/blk/blk.html";',
+    );
+  });
+
+  it("injects a fetched composition's import map and module script bound to its own URL", async () => {
+    const host = document.createElement("div");
+    host.setAttribute("data-composition-src", "https://example.com/blocks/blk/blk.html");
+    host.setAttribute("data-composition-id", "blk");
+    document.body.appendChild(host);
+    const compositionHtml =
+      `<div data-composition-id="blk">` +
+      `<script type="importmap">{ "imports": { "three": "./lib/three.js" } }</scr` +
+      `ipt><script type="module">import "three"; window.__url = __hyperframes.assetUrl("a.png");</scr` +
+      `ipt></div>`;
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(compositionHtml, { status: 200 }));
+
+    const injectedScripts: HTMLScriptElement[] = [];
+    await loadExternalCompositions({ ...defaultParams, injectedScripts });
+
+    const importMap = injectedScripts.find((script) => script.type === "importmap");
+    const moduleScript = injectedScripts.find((script) => script.type === "module");
+    expect(JSON.parse(importMap?.textContent || "")).toEqual({
+      imports: { three: "https://example.com/blocks/blk/lib/three.js" },
+    });
+    expect(moduleScript?.textContent).toMatch(/^const __hyperframes = /);
+    expect(moduleScript?.textContent).toContain('"https://example.com/blocks/blk/blk.html"');
   });
 
   it("fetches and mounts external composition HTML", async () => {
@@ -65,6 +108,25 @@ describe("loadExternalCompositions", () => {
         (child) => child.getAttribute("data-composition-id") === "scene-1",
       ),
     ).toBe(false);
+  });
+
+  it("sizes a flattened inner root from a px-suffixed or fractional size", async () => {
+    const host = document.createElement("div");
+    host.setAttribute("data-composition-src", "https://example.com/comp.html");
+    host.setAttribute("data-composition-id", "scene-1");
+    document.body.appendChild(host);
+    const compositionHtml = `
+      <html><body>
+        <div data-composition-id="scene-1" data-width="1080px" data-height="540.5"><p>Hi</p></div>
+      </body></html>
+    `;
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(compositionHtml, { status: 200 }));
+
+    await loadExternalCompositions({ ...defaultParams });
+
+    const flattened = host.querySelector("p")?.parentElement;
+    expect(flattened?.style.width).toBe("1080px");
+    expect(flattened?.style.height).toBe("540.5px");
   });
 
   it("injects styles into document head", async () => {
@@ -126,6 +188,28 @@ describe("loadExternalCompositions", () => {
     expect(host.querySelectorAll("style, script")).toHaveLength(0);
     expect(host.querySelector("p")?.textContent).toBe("Scene");
   });
+
+  it.each(["scene", "different-host-id"])(
+    "hoists fragment stylesheets once for %s",
+    async (hostId) => {
+      const host = document.createElement("div");
+      host.setAttribute("data-composition-src", "https://example.com/compositions/scene.html");
+      host.setAttribute("data-composition-id", hostId);
+      document.body.appendChild(host);
+      const html = `<div data-composition-id="scene">
+<link rel="stylesheet" href="scene.css"><link rel="icon" href="icon.svg"><p>Styled scene</p></div>`;
+      vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(html, { status: 200 }));
+
+      await loadExternalCompositions({ ...defaultParams });
+
+      expect(
+        document.head.querySelectorAll('link[href="https://example.com/compositions/scene.css"]'),
+      ).toHaveLength(1);
+      expect(host.querySelectorAll('link[rel="stylesheet"]')).toHaveLength(0);
+      expect(host.querySelectorAll('link[rel="icon"]')).toHaveLength(1);
+      expect(host.querySelector("p")?.textContent).toBe("Styled scene");
+    },
+  );
 
   it("preserves head stylesheets when an external composition uses a template", async () => {
     const host = document.createElement("div");
@@ -418,6 +502,28 @@ describe("loadExternalCompositions", () => {
 
     expect(injectedScripts.length).toBeGreaterThan(0);
     expect(injectedScripts[0].textContent).toContain("console.log");
+  });
+
+  it("mounts the content, then runs its scripts only once web fonts are ready", async () => {
+    const host = document.createElement("div");
+    host.setAttribute("data-composition-src", "https://example.com/comp.html");
+    document.body.appendChild(host);
+    vi.spyOn(globalThis, "fetch").mockResolvedValue(
+      new Response(`<html><body><p>Text</p><script>void 0</script></body></html>`, {
+        status: 200,
+      }),
+    );
+    let fontsLoaded = () => {};
+    const ready = new Promise<void>((resolve) => (fontsLoaded = resolve));
+    Object.defineProperty(document, "fonts", { configurable: true, value: { ready } });
+    const injectedScripts: HTMLScriptElement[] = [];
+
+    const loading = loadExternalCompositions({ ...defaultParams, injectedScripts });
+    await vi.waitFor(() => expect(host.textContent).toContain("Text"));
+    expect(injectedScripts).toHaveLength(0);
+    fontsLoaded();
+    await loading;
+    expect(injectedScripts).toHaveLength(1);
   });
 
   it("scopes injected styles and document selectors to the mounted composition root", async () => {

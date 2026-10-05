@@ -7,9 +7,9 @@ const REPO_ROOT = resolve(__dirname, "../../../..");
 const STRUCTURE_CODES = new Set([
   "nested_structure_needs_subcomposition",
   "timeline_element_missing_timing",
-  "media_missing_duration",
   "caption_track_kind_missing",
   "multiple_caption_tracks",
+  "clip_ends_past_root_duration",
 ]);
 
 function htmlFiles(dir: string): string[] {

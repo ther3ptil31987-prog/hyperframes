@@ -1,11 +1,14 @@
 import type { LintContext, HyperframeLintFinding, OpenTag } from "../context";
-import { readDecodedAttr } from "../utils";
+import { readDecodedAttr, truncateSnippet } from "../utils";
 import {
   isSubCompositionHost,
   topLevelElements,
   trackKindOf,
   type StructureNode,
 } from "@hyperframes/parsers/top-level-elements";
+import { readClipTiming } from "@hyperframes/parsers/composition-contract";
+import { readDataDurationSeconds } from "@hyperframes/parsers/media-duration";
+import { TIMING_TOLERANCE_SECONDS } from "@hyperframes/parsers/composition-duration";
 
 interface TagNode extends StructureNode<TagNode> {
   children: TagNode[];
@@ -45,7 +48,8 @@ const OPAQUE_TAGS = new Set([
 ]);
 // Never layout: their content is code or inert markup.
 const NON_LAYOUT_TAGS = new Set(["style", "script", "template", "noscript"]);
-const MEDIA_TAGS = new Set(["img", "video", "audio"]);
+// Media has a default length (the file's, or the dropped-image default), so data-start alone is enough.
+const MEDIA_TAGS = new Set(["video", "audio", "img"]);
 const NODE_ATTRS = [
   "id",
   "class",
@@ -124,31 +128,21 @@ function nestedStructureFindings(rows: TagNode[], severity: Severity): Hyperfram
 }
 
 function missingDurationFindings(rows: TagNode[], severity: Severity): HyperframeLintFinding[] {
-  // A bare media element with no timing is a static layer, not a timeline clip.
-  const intendedClip = (row: TagNode) =>
-    !MEDIA_TAGS.has(row.tag) ||
-    row.attrs["data-start"] !== undefined ||
-    row.attrs["data-track-index"] !== undefined;
   return rows
     .filter(
       (row) =>
+        !MEDIA_TAGS.has(row.tag) &&
         row.attrs["data-duration"] === undefined &&
         row.attrs["data-end"] === undefined &&
-        !isSubCompositionHost(row) &&
-        intendedClip(row),
+        !isSubCompositionHost(row),
     )
-    .map((row) => {
-      const isMedia = MEDIA_TAGS.has(row.tag);
-      return {
-        code: isMedia ? "media_missing_duration" : "timeline_element_missing_timing",
-        severity,
-        message: isMedia
-          ? `${describe(row)} is media on the timeline without data-duration, so its clip has no length.`
-          : `${describe(row)} is a timeline element without data-duration, so the timeline cannot draw where it ends.`,
-        elementId: row.attrs.id,
-        fixHint: `Add data-duration (in seconds) to ${describe(row)}.`,
-      };
-    });
+    .map((row) => ({
+      code: "timeline_element_missing_timing",
+      severity,
+      message: `${describe(row)} is a timeline element without data-duration, so the timeline cannot draw where it ends.`,
+      elementId: row.attrs.id,
+      fixHint: `Add data-duration (in seconds) to ${describe(row)}.`,
+    }));
 }
 
 function captionFindings(rows: TagNode[], severity: Severity): HyperframeLintFinding[] {
@@ -176,6 +170,29 @@ function captionFindings(rows: TagNode[], severity: Severity): HyperframeLintFin
   return findings;
 }
 
+const hundredths = (seconds: number) => Math.round(seconds * 100) / 100;
+
+function clipsPastRootFindings(root: TagNode, rows: TagNode[]): HyperframeLintFinding[] {
+  if (root.attrs["data-composition-id"] === undefined) return [];
+  const rootDuration = readDataDurationSeconds((name) => root.attrs[name]);
+  if (rootDuration === null) return [];
+  const limit = hundredths(rootDuration);
+  return rows.flatMap((row) => {
+    const { start, end } = readClipTiming({ getAttribute: (name) => row.attrs[name] ?? null });
+    if (start === null || end === null || end <= rootDuration + TIMING_TOLERANCE_SECONDS) return [];
+    return [
+      {
+        code: "clip_ends_past_root_duration",
+        severity: "warning",
+        message: `${describe(row)} runs from ${hundredths(start)}s to ${hundredths(end)}s, past the root composition's data-duration of ${limit}s, so it is cut off in previews, posters and renders.`,
+        elementId: row.attrs.id,
+        fixHint: `Extend the root data-duration to ${hundredths(end)}, or make ${describe(row)} end at or before ${limit}s.`,
+        snippet: truncateSnippet(row.open.raw),
+      },
+    ];
+  });
+}
+
 export const structureRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = [
   (ctx) => {
     // The timeline shows the root composition's rows; a sub-composition file is the leaf where layout lives.
@@ -188,6 +205,7 @@ export const structureRules: Array<(ctx: LintContext) => HyperframeLintFinding[]
       ...nestedStructureFindings(rows, severity),
       ...missingDurationFindings(rows, severity),
       ...captionFindings(rows, severity),
+      ...clipsPastRootFindings(root, rows),
     ];
   },
 ];
