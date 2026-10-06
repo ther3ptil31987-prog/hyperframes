@@ -15,6 +15,23 @@ import { loadCompositions } from "../../../core/src/runtime/compositionLoader.js
 import { compileForRender } from "./htmlCompiler.js";
 import { getVerifiedHyperframeRuntimeSource } from "./hyperframeRuntimeLoader.js";
 
+vi.mock("../utils/urlDownloader.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../utils/urlDownloader.js")>()),
+  fetchPublicHttpsText: async () => {
+    throw new Error("offline test");
+  },
+}));
+Object.assign(
+  (
+    window as unknown as {
+      happyDOM: {
+        settings: { disableCSSFileLoading: boolean; handleDisabledFileLoadingAsSuccess: boolean };
+      };
+    }
+  ).happyDOM.settings,
+  { disableCSSFileLoading: true, handleDisabledFileLoadingAsSuccess: true },
+);
+
 const tempDirs: string[] = [];
 
 const nativeQuerySelector = Element.prototype.querySelector;
