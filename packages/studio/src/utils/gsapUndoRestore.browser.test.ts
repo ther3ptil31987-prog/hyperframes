@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import puppeteer, { type Browser } from "puppeteer-core";
-import { build } from "vite";
+import { build, type Plugin } from "esbuild";
 import { afterAll, beforeAll, expect, it, vi } from "vitest";
 import { findSystemChrome } from "../../vite.browser";
 import { writeFixture } from "../../tests/e2e/edit-accuracy/grid.mjs";
@@ -18,20 +18,29 @@ let browser: Browser;
 let undoBundle: string;
 let softReloadBundle: string;
 
+// recast imports these, and its code that uses them is dropped from the bundle. A new
+// built-in fails the build instead of turning into an empty module the way Vite makes it.
+const emptyNodeBuiltins: Plugin = {
+  name: "empty-node-builtins",
+  setup(build) {
+    build.onResolve({ filter: /^(node:)?(fs|os)$/ }, ({ path }) => ({ path, namespace: "empty" }));
+    build.onLoad({ filter: /.*/, namespace: "empty" }, () => ({ contents: "module.exports = {}" }));
+  },
+};
+
 async function bundle(file: string, name: string): Promise<string> {
   const out = await build({
-    configFile: false,
-    logLevel: "silent",
-    resolve: {
-      alias: { canvas: fileURLToPath(new URL("../shims/canvasBrowserStub.js", import.meta.url)) },
-    },
-    build: {
-      write: false,
-      minify: false,
-      lib: { entry: fileURLToPath(new URL(file, import.meta.url)), formats: ["iife"], name },
-    },
+    entryPoints: [fileURLToPath(new URL(file, import.meta.url))],
+    bundle: true,
+    write: false,
+    platform: "browser",
+    format: "iife",
+    globalName: name,
+    alias: { canvas: fileURLToPath(new URL("../shims/canvasBrowserStub.js", import.meta.url)) },
+    plugins: [emptyNodeBuiltins],
+    define: { "import.meta.env": "{}" },
   });
-  return (Array.isArray(out) ? out[0]! : (out as { output: [{ code: string }] })).output[0].code;
+  return out.outputFiles[0]!.text;
 }
 
 beforeAll(async () => {
