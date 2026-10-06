@@ -1,7 +1,8 @@
-import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve, win32 } from "node:path";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { readSeen } from "./appHistory.js";
 import {
   AGENT_HANDOFF_FILE,
   HANDOFF_READY,
@@ -144,6 +145,14 @@ describe("openInDesktop on Linux", () => {
 });
 
 describe("agent hand-off", () => {
+  // The seen record lives in the person's home: these tests get their own.
+  beforeEach(() => {
+    const home = mkdtempSync(join(tmpdir(), "hf-home-"));
+    vi.stubEnv("HOME", home);
+    vi.stubEnv("USERPROFILE", home);
+    return () => vi.unstubAllEnvs();
+  });
+
   let dir: string | undefined;
   afterEach(() => {
     if (dir) chmodSync(dir, 0o755);
@@ -157,11 +166,13 @@ describe("agent hand-off", () => {
       sessionId: "c-1",
     });
     expect(agentSession({ CODEX_THREAD_ID: "x-1" })).toEqual({ engine: "codex", sessionId: "x-1" });
+    expect(agentSession({ GROK_SESSION_ID: "g-1" })).toEqual({ engine: "grok", sessionId: "g-1" });
     expect(agentSession({})).toBeNull();
   });
 
   it("leaves the app the conversation once it has the folder", () => {
     dir = mkdtempSync(join(tmpdir(), "hf-handoff-"));
+    writeFileSync(join(dir, "CLAUDE.md"), "# HyperFrames Composition Project\n");
     const session = "0a8eed95-0869-45bf-83ec-5d71fcc5236c";
     const result = openInDesktop(dir, {
       ...LIVE,
@@ -173,6 +184,13 @@ describe("agent hand-off", () => {
       engine: "claude",
       sessionId: session,
     });
+    // `catch-up` shows only what the app does from here on.
+    const first = readSeen(dir).at;
+    expect(first).toBeGreaterThan(Date.now() - 60_000);
+    // Handing it over again keeps the turns recorded since the first hand-off for catch-up.
+    openInDesktop(dir, { ...LIVE, open: () => true, env: { CLAUDE_CODE_SESSION_ID: session } });
+    expect(readSeen(dir).at).toBe(first);
+    expect(readFileSync(join(dir, "CLAUDE.md"), "utf8")).toContain("npx hyperframes catch-up");
   });
 
   it("writes nothing when gated, when no app took the folder, or when no agent runs the command", () => {

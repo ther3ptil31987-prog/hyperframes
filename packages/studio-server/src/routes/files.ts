@@ -30,6 +30,7 @@ import { validateUploadedMediaBuffer } from "../helpers/mediaValidation.js";
 import {
   folderGone,
   isInHiddenOrVendorDir,
+  isPrivateProjectFile,
   isSafePath,
   mkdirWithinProject,
   pinWithinProject,
@@ -802,7 +803,7 @@ function updateReferences(
   const rewrite = referenceRewriter(oldPath, newPath, isDirectory, projectPaths(projectDir));
   let updatedCount = 0;
   for (const file of textFiles) {
-    if (!isSafePath(projectDir, file)) continue;
+    if (!isSafePath(projectDir, file) || isPrivateProjectFile(projectDir, file)) continue;
     const content = readableText(file);
     if (content === null) continue;
 
@@ -2481,7 +2482,7 @@ async function processUploadedFiles(
 
     // The collision suffix chooses a different path; validate that destination
     // too, including dangling symlinks that existsSync treats as absent.
-    if (!isSafePath(projectDir, finalPath)) continue;
+    if (!isSafePath(projectDir, finalPath) || isPrivateProjectFile(projectDir, finalPath)) continue;
 
     const buffer = Buffer.from(await value.arrayBuffer());
     const validation = validateUploadedMediaBuffer(finalName, buffer);

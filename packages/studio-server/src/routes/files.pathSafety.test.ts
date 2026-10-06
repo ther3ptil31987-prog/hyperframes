@@ -695,3 +695,124 @@ describe("rename reference updates", () => {
     },
   );
 });
+
+describe("the desktop app's private files", () => {
+  it("are never read, written or deleted through the file routes, however the path is spelled", async (context) => {
+    const { app, project } = fixture();
+    mkdirSync(join(project, ".hyperframes"));
+    writeFileSync(
+      join(project, ".hyperframes", "agent-handoff.json"),
+      '{"engine":"claude","sessionId":"secret"}',
+    );
+    writeFileSync(join(project, ".hyperframes", "app-history.jsonl"), '{"said":"secret"}');
+    writeFileSync(
+      join(project, ".hyperframes", "agent-handoff-read.json"),
+      '{"sessionId":"secret"}',
+    );
+    for (const path of [
+      ".hyperframes/agent-handoff.json",
+      ".hyperframes/app-history.jsonl",
+      ".HyperFrames/Agent-Handoff.JSON",
+      ".hyperframes/agent-handoff-read.json",
+    ]) {
+      const res = await app.request(`/projects/p/files/${path}`);
+      expect([403, 404]).toContain(res.status);
+      expect(await res.text()).not.toContain("secret");
+    }
+    const put = await app.request("/projects/p/files/.hyperframes/agent-handoff.json", {
+      method: "PUT",
+      body: "{}",
+    });
+    expect(put.status).toBe(403);
+    const del = await app.request("/projects/p/files/.hyperframes/app-history.jsonl", {
+      method: "DELETE",
+    });
+    expect(del.status).toBe(403);
+    linkOrSkip(
+      context,
+      join(project, ".hyperframes", "agent-handoff.json"),
+      join(project, "link.json"),
+      "file",
+    );
+    const viaLink = await app.request("/projects/p/files/link.json");
+    expect(await viaLink.text()).not.toContain("secret");
+  });
+
+  it("can't be reached by renaming their folder", async () => {
+    const { app, project } = fixture();
+    mkdirSync(join(project, ".hyperframes"));
+    writeFileSync(join(project, ".hyperframes", "app-history.jsonl"), '{"said":"secret"}');
+    const rename = await app.request("/projects/p/files/.hyperframes", {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ newPath: "x" }),
+    });
+    expect(rename.status).toBeGreaterThanOrEqual(400);
+    expect(existsSync(join(project, "x"))).toBe(false);
+  });
+
+  it("are neither read nor rewritten when a rename updates references", async () => {
+    const { app, project } = fixture();
+    mkdirSync(join(project, ".hyperframes"));
+    const share = join(project, ".hyperframes", "share.json");
+    writeFileSync(share, '{"ref":"inside.txt"}');
+    const response = await app.request("/projects/p/files/inside.txt", {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ newPath: "moved.txt" }),
+    });
+    expect(response.status).toBe(200);
+    expect(readFileSync(share, "utf8")).toBe('{"ref":"inside.txt"}');
+    expect((await response.json()).updatedReferences).toBe(0);
+  });
+
+  it("leave Studio's own files under .hyperframes/ reachable", async () => {
+    const { app, project } = fixture();
+    mkdirSync(join(project, ".hyperframes", "prepared-assets", "gif"), { recursive: true });
+    writeFileSync(
+      join(project, ".hyperframes", "studio-motion.json"),
+      '{"version":1,"motions":[]}',
+    );
+    writeFileSync(join(project, ".hyperframes", "prepared-assets", "gif", "a.mp4"), "mp4");
+    for (const path of ["studio-motion.json", "prepared-assets/gif/a.mp4"])
+      expect((await app.request(`/projects/p/files/.hyperframes/${path}`)).status).toBe(200);
+  });
+});
+
+describe("routes that write a path from the request", () => {
+  it("never plant or copy a file into .hyperframes/", async () => {
+    const { app, project } = fixture();
+    mkdirSync(join(project, ".hyperframes"));
+    writeFileSync(
+      join(project, ".hyperframes", "agent-handoff.json"),
+      '{"engine":"claude","sessionId":"secret"}',
+    );
+    const rename = await app.request("/projects/p/files/inside.txt", {
+      method: "PATCH",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ newPath: ".hyperframes/app-history.jsonl" }),
+    });
+    expect(rename.status).toBeGreaterThanOrEqual(400);
+    expect(existsSync(join(project, ".hyperframes", "app-history.jsonl"))).toBe(false);
+    const duplicate = await app.request("/projects/p/duplicate-file", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ path: ".hyperframes/agent-handoff.json" }),
+    });
+    expect(duplicate.status).toBeGreaterThanOrEqual(400);
+    expect(readdirSync(join(project, ".hyperframes"))).toEqual(["agent-handoff.json"]);
+    const form = new FormData();
+    // A file uploads accept anywhere else, so the folder is the only reason it is refused.
+    form.append("file", new File(["plain words"], "notes.txt"));
+    const upload = await app.request("/projects/p/upload?dir=.hyperframes", {
+      method: "POST",
+      body: form,
+    });
+    expect(upload.status).toBe(403);
+    expect(existsSync(join(project, ".hyperframes", "notes.txt"))).toBe(false);
+    const elsewhere = new FormData();
+    elsewhere.append("file", new File(["plain words"], "notes.txt"));
+    const fine = await app.request("/projects/p/upload", { method: "POST", body: elsewhere });
+    expect((await fine.json()).files).toEqual(["notes.txt"]);
+  });
+});

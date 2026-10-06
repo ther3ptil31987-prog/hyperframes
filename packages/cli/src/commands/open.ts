@@ -22,8 +22,13 @@ function printResult(project: ProjectDir, result: DesktopOpenResult): void {
   if (result.opened) {
     console.log(`${c.success("◇")}  Opening ${c.accent(project.name)} in ${result.app}`);
     if (result.handedOver) {
-      const agent = result.handedOver.engine === "claude" ? "Claude Code" : "Codex";
+      const agent = { claude: "Claude Code", codex: "Codex", grok: "Grok" }[
+        result.handedOver.engine
+      ];
       console.log(`   ${c.dim(`Its chat picks up this ${agent} conversation.`)}`);
+      console.log(
+        `   ${c.dim(`When the person is back here, run ${c.accent("npx hyperframes catch-up")} to see what they did in the app.`)}`,
+      );
     }
     return;
   }
@@ -60,7 +65,10 @@ export default defineCommand({
     if (!project) return;
     const result = openInDesktop(project.dir);
     if (!result.opened) setCommandExitCode(1);
-    if (args.json) console.log(JSON.stringify({ project: project.dir, ...result }, null, 2));
+    const catchUp =
+      result.opened && result.handedOver ? { catchUp: "npx hyperframes catch-up" } : {};
+    if (args.json)
+      console.log(JSON.stringify({ project: project.dir, ...result, ...catchUp }, null, 2));
     else printResult(project, result);
   },
 });
