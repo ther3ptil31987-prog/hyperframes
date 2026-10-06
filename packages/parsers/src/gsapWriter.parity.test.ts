@@ -62,6 +62,7 @@ import {
   retimeClipTweensInScript,
   type ClipTweenRetime,
   dedupePositionWritesInScript as dedupePosAcorn,
+  replaceTweenWithKeyframesInScript as replaceTweenWithKeyframesAcorn,
 } from "./gsapWriterAcorn.js";
 
 function acornId(script: string): string {
@@ -1452,6 +1453,94 @@ describe("parity: moveKeyframeInScript (recast vs acorn)", () => {
   it("sub-2% retime agrees between writers (regression for the swallow bug)", () => {
     expectParity(MOVE_KF_SCRIPT, 50, 51);
   });
+});
+
+describe("a keyframe percentage below 1e-6", () => {
+  const tiny = 1.2860082304526747e-7;
+  const readBack = (out: string) =>
+    parseGsapScriptAcorn(out).animations[0]!.keyframes?.keyframes.map((kf) => kf.percentage);
+
+  const steps = [
+    { percentage: 0, properties: { x: 0 } },
+    { percentage: tiny, properties: { x: 1 } },
+    { percentage: 100, properties: { x: 10 } },
+  ];
+
+  it.each([
+    ["recast", addWithKfRecast],
+    ["acorn", addWithKfAcorn],
+  ])("is written as a decimal key apart from 0% (%s)", (_name, add) => {
+    const base = `const tl = gsap.timeline({ paused: true });`;
+    const out = add(base, "#a", 0, 2, steps).script;
+    expect(out).not.toMatch(/\de-\d/);
+    expect(readBack(out)).toEqual([0, expect.closeTo(tiny, 12), 100]);
+  });
+
+  it("stays apart from 0% when replace-with-keyframes writes both", () => {
+    const script = `const tl = gsap.timeline({ paused: true });
+tl.to("#a", { duration: 2, x: 10, ease: "power4.in" }, 0);`;
+    const out = replaceTweenWithKeyframesAcorn(script, acornId(script), {
+      targetSelector: "#a",
+      position: 0,
+      duration: 2,
+      ease: "power4.in",
+      keyframes: steps,
+    })!;
+    expect(readBack(out)).toEqual([0, expect.closeTo(tiny, 12), 100]);
+  });
+});
+
+describe("a tween-level easeEach, which GSAP ignores", () => {
+  const script = `const tl = gsap.timeline({ paused: true });
+tl.to("#a", { duration: 1, keyframes: { "0%": { x: 0 }, "100%": { x: 10 } }, easeEach: "power4.in" }, 0);`;
+  it.each([
+    ["recast", parseGsapScript],
+    ["acorn", parseGsapScriptAcorn],
+  ])("is not reported as the keyframes' ease (%s)", (_name, parse) => {
+    expect(parse(script).animations[0]!.keyframes?.easeEach).toBeUndefined();
+  });
+});
+
+describe("a keyframe drag keeps the keyframes' eases", () => {
+  const writers = [
+    ["recast", updateAnimRecast, moveKeyframeRecast],
+    ["acorn", updateAnimAcorn, moveKeyframeAcorn],
+  ] as const;
+
+  for (const [writer, update, move] of writers) {
+    it(`${writer}: an ease set with Studio's ease control survives a diamond drag`, () => {
+      const script = `const tl = gsap.timeline({ paused: true });
+tl.to("#a", { duration: 2, keyframes: { "0%": { x: 0 }, "50%": { x: 5 }, "100%": { x: 10 } } }, 0);`;
+      const id = acornId(script);
+      const eased = update(script, id, { easeEach: "power2.out", resetKeyframeEases: true });
+      expect(parseGsapScriptAcorn(eased).animations[0]!.keyframes?.easeEach).toBe("power2.out");
+
+      const kf = parseGsapScriptAcorn(move(eased, id, 50, 60)).animations[0]!.keyframes!;
+      expect(kf.keyframes.map((k) => k.percentage)).toEqual([0, 60, 100]);
+      expect(kf.easeEach).toBe("power2.out");
+    });
+
+    it(`${writer}: splitting into property groups keeps the keyframes' eases`, () => {
+      const script = `const tl = gsap.timeline({ paused: true });
+tl.to("#a", { duration: 2, keyframes: { "0%": { x: 0, opacity: 0 }, "100%": { x: 10, opacity: 1 }, ease: "sine.inOut", easeEach: "power2.out" } }, 0);`;
+      const splitGroups = writer === "acorn" ? splitGroupsAcorn : splitGroupsRecast;
+      const groups = parseGsapScriptAcorn(splitGroups(script, acornId(script)).script).animations;
+      expect(groups).toHaveLength(2);
+      for (const group of groups) {
+        expect(group.keyframes?.easeEach).toBe("power2.out");
+        expect(group.keyframes?.ease ?? group.ease).toBe("sine.inOut");
+      }
+    });
+
+    it(`${writer}: an ease authored on the keyframes survives a diamond drag`, () => {
+      const script = `const tl = gsap.timeline({ paused: true });
+tl.to("#a", { duration: 2, keyframes: { "0%": { x: 0 }, "50%": { x: 5 }, "100%": { x: 10 }, ease: "sine.inOut" } }, 0);`;
+      const kf = parseGsapScriptAcorn(move(script, acornId(script), 50, 60)).animations[0]!
+        .keyframes!;
+      expect(kf.keyframes.map((k) => k.percentage)).toEqual([0, 60, 100]);
+      expect(kf.ease).toBe("sine.inOut");
+    });
+  }
 });
 
 // Regression: array-form `keyframes: [...]` has no explicit percentages, so

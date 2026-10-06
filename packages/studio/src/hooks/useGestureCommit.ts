@@ -16,8 +16,15 @@ import { trackPreviewEditResult } from "../utils/previewFeatureUsage";
 import { observeGsapGesture } from "./gsapGestureOutcome";
 import { roundTo3 } from "../utils/rounding";
 import { classifyPropertyGroup } from "@hyperframes/core/gsap-parser";
-import { isInstantHold, idSelector, writeTargetSelector, tweenTargetsElement } from "./gsapShared";
+import {
+  isInstantHold,
+  idSelector,
+  keyframeEases,
+  writeTargetSelector,
+  tweenTargetsElement,
+} from "./gsapShared";
 import { useStableHandlers } from "./useStableHandlers";
+import { progressAtTime, runEaseOf, timeAtProgress, warpsTime } from "../utils/gsapKeyframeEases";
 
 type RecordedKeyframe = {
   percentage: number;
@@ -269,25 +276,34 @@ export function useGestureCommit({
 
             if (overlaps) {
               const existingKfs = existingPositionTween.keyframes?.keyframes ?? [];
-              const rangeStartPct =
+              const startTimePct =
                 tweenDur > 0 ? Math.max(0, ((recStart - tweenStart) / tweenDur) * 100) : 0;
-              const rangeEndPct =
+              const endTimePct =
                 tweenDur > 0 ? Math.min(100, ((recEnd - tweenStart) / tweenDur) * 100) : 100;
+              const runEase = runEaseOf(existingPositionTween);
+              const roundPct = warpsTime(runEase) ? (pct: number) => pct : roundTo3;
 
               const preserved = existingKfs
-                .filter(
-                  (kf) => kf.percentage < rangeStartPct - 0.5 || kf.percentage > rangeEndPct + 0.5,
-                )
+                .filter((kf) => {
+                  const playsAt = timeAtProgress(runEase, kf.percentage);
+                  return playsAt < startTimePct - 0.5 || playsAt > endTimePct + 0.5;
+                })
                 .map((kf) => ({
                   percentage: kf.percentage,
                   properties: kf.properties,
                   ...(kf.ease ? { ease: kf.ease } : {}),
                 }));
 
-              const mapped = keyframes.map((kf) => ({
-                percentage: rangeStartPct + (kf.percentage / 100) * (rangeEndPct - rangeStartPct),
+              const constantSpeed = { ease: "none" };
+              const mapped = keyframes.map((kf, index) => ({
+                percentage: roundPct(
+                  progressAtTime(
+                    runEase,
+                    startTimePct + (kf.percentage / 100) * (endTimePct - startTimePct),
+                  ),
+                ),
                 properties: kf.properties,
-                ...(kf.ease ? { ease: kf.ease } : {}),
+                ...(kf.ease ? { ease: kf.ease } : index > 0 ? constantSpeed : {}),
               }));
 
               const merged = [...preserved, ...mapped].sort((a, b) => a.percentage - b.percentage);
@@ -303,6 +319,7 @@ export function useGestureCommit({
                       : tweenStart,
                   duration: tweenDur,
                   keyframes: merged,
+                  ...keyframeEases(existingPositionTween),
                 },
                 { label: "Gesture recording (merge)", softReload: true, keyframeAction: "add" },
               );

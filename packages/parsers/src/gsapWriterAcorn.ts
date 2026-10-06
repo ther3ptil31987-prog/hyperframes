@@ -19,6 +19,7 @@ import {
   extractArcWaypoints,
   buildMotionPathObjectCode,
   mergePercentageKeyframes,
+  plainPercentKey,
 } from "./gsapSerialize.js";
 import {
   parseGsapScriptAcornForWrite,
@@ -1225,7 +1226,7 @@ function convertArrayKeyframesToObject(script: string, target: Node): string {
   if (!timing) return script;
   const entries = els.map((el, i) => {
     const { duration: _duration, ...record } = records[i]!;
-    return `${JSON.stringify(`${timing.percentages[i]}%`)}: ${recordToCode(record)}`;
+    return `${JSON.stringify(plainPercentKey(timing.percentages[i]!))}: ${recordToCode(record)}`;
   });
   const ms = new MagicString(script);
   ms.overwrite(
@@ -1328,7 +1329,13 @@ export function addKeyframeToScript(
       ms.overwrite(existing.prop.value.start, existing.prop.value.end, recordToCode(targetRecord));
     }
   } else {
-    insertNewKeyframe(ms, kfNode, percentage, `${percentage}%`, recordToCode(targetRecord));
+    insertNewKeyframe(
+      ms,
+      kfNode,
+      percentage,
+      plainPercentKey(percentage),
+      recordToCode(targetRecord),
+    );
   }
   for (const [prop, rec] of [...endpointOverwrites, ...backfillOverwrites]) {
     ms.overwrite(prop.value.start, prop.value.end, recordToCode(rec));
@@ -1507,9 +1514,14 @@ export function moveKeyframeInScript(
   entries.push({ pct: toPercentage, record: valueNodeToRecord(match.prop.value, src) });
   entries.sort((a, b) => a.pct - b.pct);
 
-  const body = entries
-    .map((e) => `${JSON.stringify(`${e.pct}%`)}: ${recordToCode(e.record)}`)
-    .join(", ");
+  const pctProps = new Set(percentagePropsOf(kfNode));
+  const kept = (kfNode.properties ?? [])
+    .filter((p: Node) => !pctProps.has(p))
+    .map((p: Node) => src.slice(p.start, p.end));
+  const body = [
+    ...entries.map((e) => `${JSON.stringify(plainPercentKey(e.pct))}: ${recordToCode(e.record)}`),
+    ...kept,
+  ].join(", ");
   const ms = new MagicString(src);
   ms.overwrite(kfNode.start, kfNode.end, `{ ${body} }`);
   return ms.toString();
@@ -1554,7 +1566,7 @@ export function resizeKeyframedTweenInScript(
 
   const ms = new MagicString(src);
   for (const { keyNode, to } of edits) {
-    ms.overwrite(keyNode.start, keyNode.end, JSON.stringify(`${to}%`));
+    ms.overwrite(keyNode.start, keyNode.end, JSON.stringify(plainPercentKey(to)));
   }
   overwritePosition(ms, target.call, newPosition);
   // Resizing is an explicit duration-authoring gesture. Promote GSAP's implicit
@@ -1753,7 +1765,7 @@ function buildKeyframeObjectCode(
     const props = Object.entries(kf.properties).map(([k, v]) => `${safeKey(k)}: ${valueToCode(v)}`);
     if (kf.ease) props.push(`ease: ${valueToCode(kf.ease)}`);
     if (kf.auto) props.push(`_auto: 1`);
-    return `${JSON.stringify(`${kf.percentage}%`)}: { ${props.join(", ")} }`;
+    return `${JSON.stringify(plainPercentKey(kf.percentage))}: { ${props.join(", ")} }`;
   });
   if (easeEach) entries.push(`easeEach: ${valueToCode(easeEach)}`);
   return `{ ${entries.join(", ")} }`;
@@ -1995,7 +2007,8 @@ function addGroupAnimToScript(
       pos,
       anim.duration ?? 0.5,
       groupKeyframes,
-      anim.keyframes.easeEach ?? anim.ease,
+      anim.keyframes.ease ?? anim.ease,
+      anim.keyframes.easeEach,
     );
   }
   const groupProperties = filterGroupProperties(anim.properties, propSet);

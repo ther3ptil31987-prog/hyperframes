@@ -10,6 +10,7 @@ import { mountReactHarness } from "./domSelectionTestHarness";
 import type { CommitMutationOptions } from "./gsapScriptCommitTypes";
 import { useGsapAwareEditing } from "./useGsapAwareEditing";
 import { useGestureCommit } from "./useGestureCommit";
+import { xAtTime } from "./gsapPlaybackTestHarness";
 
 vi.mock("../utils/studioTelemetry", () => ({ trackStudioEvent: vi.fn() }));
 
@@ -242,6 +243,94 @@ it.each([
     }
   },
 );
+
+const FROM_0_TO_100 = [
+  { percentage: 0, properties: { x: 0 } },
+  { percentage: 100, properties: { x: 100 } },
+];
+
+function positionTween(
+  duration: number,
+  eases: { ease?: string; easeEach?: string } = {},
+  keyframes = FROM_0_TO_100,
+) {
+  return {
+    id: "card-position",
+    targetSelector: "#card",
+    propertyGroup: "position",
+    method: "to",
+    properties: { x: 0, y: 0 },
+    resolvedStart: 0,
+    position: 0,
+    duration,
+    ...(eases.ease ? { ease: eases.ease } : {}),
+    keyframes: {
+      ...(eases.easeEach ? { easeEach: eases.easeEach } : {}),
+      keyframes,
+    },
+  } as unknown as GsapAnimation;
+}
+
+/** Records the mocked 1 s gesture (x 0, 50, 100) from 0 s over `tween`; resolves to the merge mutation. */
+async function recordMergeInto(tween: GsapAnimation) {
+  const writer = vi.fn(
+    async (_mutation: Record<string, unknown>, options: CommitMutationOptions) => {
+      options.onResult?.({ ok: true, changed: true });
+    },
+  );
+  const hook = mountRecording(writer, [tween]);
+  act(() => hook().handleToggleRecording("button"));
+  await act(async () => {
+    hook().handleToggleRecording();
+    await vi.waitFor(() => expect(writer).toHaveBeenCalled());
+  });
+  expect(writer.mock.calls[0]![1]).toMatchObject({ label: "Gesture recording (merge)" });
+  return writer.mock.calls[0]![0] as unknown as Parameters<typeof xAtTime>[0] & {
+    type: string;
+    ease?: string;
+    easeEach?: string;
+  };
+}
+
+it("keeps the tween's eases when a recording merges into it", async () => {
+  const merge = await recordMergeInto(
+    positionTween(2, { ease: "back.out", easeEach: "power2.out" }),
+  );
+  expect(merge).toMatchObject({
+    type: "replace-with-keyframes",
+    ease: "back.out",
+    easeEach: "power2.out",
+  });
+  // Recorded segments the fitter left unset stay constant speed instead of taking easeEach.
+  expect(merge.keyframes.map((kf) => kf.ease)).toEqual([undefined, "none", "none", undefined]);
+});
+
+it("plays a recording merged into an eased tween at the times it was recorded", async () => {
+  const merge = await recordMergeInto(positionTween(3, { ease: "power2.out" }));
+  expect(xAtTime(merge, 0.5)).toBeCloseTo(50, 0);
+  expect(xAtTime(merge, 1)).toBeCloseTo(100, 0);
+});
+
+it("keeps recorded keyframes apart over the tail of a power4.out tween", async () => {
+  usePlayerStore.setState({ currentTime: 9 });
+  const merge = await recordMergeInto(positionTween(10, { ease: "power4.out" }));
+  expect(xAtTime(merge, 9.5)).toBeCloseTo(50, 0);
+});
+
+it("keeps a keyframe playing at 8.5 s when a recording covers 9-10 s of a power2.out tween", async () => {
+  usePlayerStore.setState({ currentTime: 9 });
+  const at8_5s = { percentage: 99.6625, properties: { x: 80 } };
+  const merge = await recordMergeInto(
+    positionTween(10, { ease: "power2.out" }, [FROM_0_TO_100[0]!, at8_5s, FROM_0_TO_100[1]!]),
+  );
+  expect(merge.keyframes).toContainEqual(at8_5s);
+  expect(xAtTime(merge, 8.5)).toBeCloseTo(80, 0);
+});
+
+it("writes merged keyframe percentages rounded, not as float noise", async () => {
+  const merge = await recordMergeInto(positionTween(3));
+  expect(merge.keyframes.map((kf) => kf.percentage)).toEqual([0, 16.667, 33.333, 100]);
+});
 
 it("keeps a pending recording isolated until its writer settles", async () => {
   let release!: () => void;

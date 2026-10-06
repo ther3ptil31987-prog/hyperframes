@@ -1326,10 +1326,6 @@ function tweenCallToAnimation(
     }
   }
 
-  if (keyframesData && typeof vars.easeEach === "string") {
-    keyframesData.easeEach = vars.easeEach as string;
-  }
-
   if (motionPathResult) {
     const { waypoints } = motionPathResult;
     if (!keyframesData) {

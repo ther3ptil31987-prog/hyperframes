@@ -10,6 +10,7 @@ import { mountReactHarness, withInlineLayoutBox } from "./domSelectionTestHarnes
 import { writeSizeWithCrop } from "../components/editor/cropResize";
 import { trackStudioEvent } from "../utils/studioTelemetry";
 import { trackKeyframeCommit } from "../utils/keyframeUsage";
+import { xAtTime } from "./gsapPlaybackTestHarness";
 import type { CommitMutationOptions, CommitMutation } from "./gsapScriptCommitTypes";
 
 vi.mock("../utils/studioTelemetry", () => ({ trackStudioEvent: vi.fn() }));
@@ -205,6 +206,38 @@ function renderCommitHook(
 // canvas nudge exercises (not the raw drag intercept) — with auto-keyframe
 // off, it must shift the whole tween instead of adding/updating a keyframe
 // at the playhead.
+describe("useAnimatedPropertyCommit — extending a keyframed tween to the playhead", () => {
+  it("keeps the tween's eases and each keyframe's own ease", async () => {
+    usePlayerStore.setState({ autoKeyframeEnabled: true, currentTime: 3, activeKeyframePct: null });
+    const eased = {
+      ...keyframedAnim,
+      ease: "power2.inOut",
+      keyframes: {
+        easeEach: "power2.out",
+        keyframes: [
+          { percentage: 0, properties: { x: 0, y: 0 }, ease: "expo.in" },
+          { percentage: 100, properties: { x: 100, y: 0 } },
+        ],
+      },
+    } as unknown as GsapAnimation;
+    const mutations: Array<Record<string, unknown>> = [];
+    let commit!: Commit;
+    const root = renderHookWith(
+      [eased],
+      (mutation) => mutations.push(mutation),
+      (ready) => (commit = ready),
+    );
+    await act(async () => commit(selection, { x: 50 }));
+    act(() => root.unmount());
+
+    const replace = mutations.find((m) => m.type === "replace-with-keyframes")!;
+    expect(replace).toMatchObject({ ease: "power2.inOut", easeEach: "power2.out" });
+    expect((replace.keyframes as Array<{ ease?: string }>)[0]!.ease).toBe("expo.in");
+    // The old end keyframe still plays at 2 s once the tween runs to the playhead at 3 s.
+    expect(xAtTime(replace as unknown as Parameters<typeof xAtTime>[0], 2)).toBeCloseTo(100, 0);
+  });
+});
+
 describe("useAnimatedPropertyCommit — autoKeyframeEnabled toggle (#1808)", () => {
   async function runCommitWithAutoKeyframe(enabled: boolean) {
     usePlayerStore.setState({ autoKeyframeEnabled: enabled, currentTime: 0 });
