@@ -12,8 +12,19 @@
 import { usePlayerStore, type TimelineElement } from "../store/playerStore";
 import type { ClipManifestClip, IframeWindow, PlaybackAdapter } from "../lib/playbackTypes";
 import { hasTimelinePerformanceFixtureLease } from "../lib/timelinePerformanceFixture";
-import { acceptStudioRuntimeMessage } from "../lib/runtimeProtocol";
+import { acceptStudioRuntimeMessage, postRuntimeControlMessage } from "../lib/runtimeProtocol";
+import {
+  parseMediaLoadFailure,
+  RUNTIME_MEDIA_LOAD_FAILED,
+} from "@hyperframes/core/runtime/protocol";
+import {
+  parsePlaybackHealth,
+  parsePreviewCopies,
+  parsePreviewFacts,
+} from "../store/previewQualitySlice";
 import { parseTimelineFromDOM } from "../lib/timelineDOM";
+import { previewClipManifest, previewFrameOpaque } from "../lib/previewChannel";
+import { frameOrigins } from "../lib/bridgePlayback";
 
 /** What `processTimelineMessage` accepts — the clip-manifest postMessage. */
 export interface ClipManifestMessage {
@@ -29,6 +40,12 @@ interface PreviewMessage {
   source?: string;
   type?: string;
   clips?: unknown;
+  isPlaying?: unknown;
+  copies?: unknown;
+  health?: unknown;
+  facts?: unknown;
+  code?: unknown;
+  details?: unknown;
 }
 
 export interface PreviewMessageRouterDeps {
@@ -41,9 +58,10 @@ export interface PreviewMessageRouterDeps {
   syncTimelineElements: (elements: TimelineElement[]) => void;
 }
 
-/** True when the message did not come from OUR preview iframe. */
-function isForeignSource(e: MessageEvent, iframe: HTMLIFrameElement | null): boolean {
-  return Boolean(e.source && iframe && e.source !== iframe.contentWindow);
+/** True only for a post by our preview iframe's window, from an origin that frame can have. */
+function fromOurPreview(e: MessageEvent, iframe: HTMLIFrameElement | null): boolean {
+  if (!iframe || !e.source || e.source !== iframe.contentWindow) return false;
+  return frameOrigins(iframe).includes(e.origin);
 }
 
 /** A preview message worth acting on, or null: the fixture lease, the sender
@@ -54,29 +72,68 @@ function acceptedPreviewMessage(
   iframe: HTMLIFrameElement | null,
 ): PreviewMessage | null {
   if (hasTimelinePerformanceFixtureLease()) return null;
-  if (isForeignSource(e, iframe)) return null;
+  if (!fromOurPreview(e, iframe)) return null;
   const data = e.data as PreviewMessage | null;
   if (data?.source !== "hf-preview") return null;
   return acceptStudioRuntimeMessage(data) ? data : null;
 }
 
+/** Whether enrichment is due: no timeline message and no enrichment of ours for 500 ms. Marks it run. */
+function enrichDue(lastTimelineMessage: number, enriched: { at: number }): boolean {
+  const now = Date.now();
+  if (now - lastTimelineMessage <= 500 || now - enriched.at <= 500) return false;
+  enriched.at = now;
+  return true;
+}
+
+/** Asks the runtime for its clip manifest, one request at a time, while the store has no elements. */
+function recoverClipManifest(
+  deps: PreviewMessageRouterDeps,
+  iframe: HTMLIFrameElement,
+  recovery: { asking: boolean },
+): void {
+  if (recovery.asking) return;
+  recovery.asking = true;
+  previewClipManifest(iframe)
+    .then((manifest) => {
+      const stillWanted =
+        usePlayerStore.getState().elements.length === 0 &&
+        deps.iframeRef.current === iframe &&
+        !hasTimelinePerformanceFixtureLease();
+      if (manifest && manifest.clips.length > 0 && stillWanted)
+        deps.processTimelineMessageRef.current(manifest);
+    })
+    .catch(() => {})
+    .finally(() => (recovery.asking = false));
+}
+
+function recoverEmptyTimeline(
+  deps: PreviewMessageRouterDeps,
+  iframe: HTMLIFrameElement | null,
+  recovery: { asking: boolean },
+): void {
+  if (iframe && previewFrameOpaque(iframe)) return recoverClipManifest(deps, iframe, recovery);
+  const manifest = (iframe?.contentWindow as IframeWindow | null)?.__clipManifest;
+  if (manifest && manifest.clips.length > 0) {
+    deps.processTimelineMessageRef.current(manifest);
+  }
+}
+
 /**
  * A `state` tick doubles as a recovery hook: if the store still has no
  * elements, read the manifest straight off the iframe, and if no `timeline`
- * message has arrived recently, re-run enrichment.
+ * message has arrived recently, re-run enrichment (at most every 500 ms: it queries the whole document).
  */
 function handleStateMessage(
   deps: PreviewMessageRouterDeps,
   iframe: HTMLIFrameElement | null,
+  playingHoldsClipListPosts: boolean,
+  enriched: { at: number; asking: boolean },
 ): void {
   try {
-    if (usePlayerStore.getState().elements.length === 0) {
-      const manifest = (iframe?.contentWindow as IframeWindow | null)?.__clipManifest;
-      if (manifest && manifest.clips.length > 0) {
-        deps.processTimelineMessageRef.current(manifest);
-      }
-    }
-    if (Date.now() - deps.lastTimelineMessageRef.current > 500) {
+    if (usePlayerStore.getState().elements.length === 0)
+      recoverEmptyTimeline(deps, iframe, enriched);
+    if (!playingHoldsClipListPosts && enrichDue(deps.lastTimelineMessageRef.current, enriched)) {
       deps.enrichMissingCompositionsRef.current();
     }
   } catch {}
@@ -105,14 +162,45 @@ function handleTimelineMessage(
   } catch {}
 }
 
+function applyStoreReport(data: PreviewMessage): boolean {
+  const store = usePlayerStore.getState();
+  switch (data.type) {
+    case "preview-copies":
+      store.setPreviewCopies(parsePreviewCopies(data.copies));
+      return true;
+    case "preview-health":
+      store.setPlaybackHealth(parsePlaybackHealth(data.health));
+      return true;
+    case "preview-facts":
+      store.setPreviewFacts(parsePreviewFacts(data.facts));
+      return true;
+    case "diagnostic": {
+      if (data.code !== RUNTIME_MEDIA_LOAD_FAILED) return false;
+      const failure = parseMediaLoadFailure(data.details);
+      if (failure) store.setMediaLoadFailure(failure);
+      return true;
+    }
+    default:
+      return false;
+  }
+}
+
 export function createPreviewMessageHandler(
   deps: PreviewMessageRouterDeps,
 ): (e: MessageEvent) => void {
+  const enriched = { at: 0, asking: false };
   return (e: MessageEvent) => {
     const iframe = deps.iframeRef.current;
     const data = acceptedPreviewMessage(e, iframe);
     if (!data) return;
-    if (data.type === "state") return handleStateMessage(deps, iframe);
+    if (data.type === "state")
+      return handleStateMessage(deps, iframe, data.isPlaying === true, enriched);
+    if (applyStoreReport(data)) return;
+    if (data.type === "ready") {
+      const level = usePlayerStore.getState().previewQuality;
+      postRuntimeControlMessage(iframe?.contentWindow, "set-preview-quality", { level });
+      return;
+    }
     if (data.type === "timeline" && Array.isArray(data.clips)) {
       handleTimelineMessage(deps, iframe, data as unknown as ClipManifestMessage);
     }

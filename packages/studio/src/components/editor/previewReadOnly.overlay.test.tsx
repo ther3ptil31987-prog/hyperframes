@@ -311,7 +311,7 @@ describe("DomEditOverlay with canvasInput host", () => {
     expect(fixture(HOST).overlay.className).toContain("pointer-events-none");
   });
 
-  it("draws no hover box", () => {
+  it("draws the hover box for the selection the host hovers, and none without one", () => {
     layout.hover = RECT;
     const hovered = (props = {}) => {
       const { overlay } = fixture(props);
@@ -321,14 +321,15 @@ describe("DomEditOverlay with canvasInput host", () => {
     };
     const selection = makeSelection("Hover", textElement("hover"));
     expect(hovered({ hoverSelection: selection })).not.toBeNull();
-    expect(hovered({ ...HOST, hoverSelection: selection })).toBeNull();
+    expect(hovered({ ...HOST, hoverSelection: selection })).not.toBeNull();
+    expect(hovered({ ...HOST, hoverSelection: null })).toBeNull();
   });
 
   it("starts no marquee and makes no selection from a press on empty canvas", () => {
     const off = fixture({ selection: null });
     fire(off.overlay, "pointerdown");
     fire(off.overlay, "pointerup");
-    expect(off.spies.onMarqueeSelect).toHaveBeenCalledWith([], false);
+    expect(off.spies.onMarqueeSelect).toHaveBeenCalledWith([], "replace");
     act(() => root.unmount());
     const { spies, overlay } = fixture({ ...HOST, selection: null });
     fire(overlay, "pointerdown");

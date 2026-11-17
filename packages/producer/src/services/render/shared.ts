@@ -24,24 +24,33 @@ import {
   CANVAS_DIMENSIONS,
   checkOutputResolutionCompatibility,
   type CanvasResolution,
+  terminalText,
 } from "@hyperframes/core";
-import type {
-  AudioElement,
-  ExtractedFrames,
-  ImageElement,
-  ParallelProgress,
-  VideoElement,
+import {
+  mediaIdPathSegment,
+  type AudioElement,
+  type ExtractedFrames,
+  type ImageElement,
+  type ParallelProgress,
+  type VideoElement,
 } from "@hyperframes/engine";
 import type { CompiledComposition } from "../htmlCompiler.js";
 import { defaultLogger, type ProducerLogger } from "../../logger.js";
 import { isPathInside } from "../../utils/paths.js";
-import type { ProgressCallback, RenderJob, RenderStatus } from "../renderOrchestrator.js";
+import type {
+  ProgressCallback,
+  RenderJob,
+  RenderStageProgress,
+  RenderStatus,
+} from "../renderOrchestrator.js";
 
 export interface CompositionMetadata {
   duration: number;
   videos: VideoElement[];
   audios: AudioElement[];
   images: ImageElement[];
+  gradedCanvas?: boolean;
+  masterFxChain?: string;
   width: number;
   height: number;
 }
@@ -52,6 +61,10 @@ export interface CompositionMetadata {
  * slightly different `end` / `mediaStart` / `volume` than the compiled
  * HTML and we want to ignore sub-millisecond float noise.
  */
+export function audioWorkDir(workDir: string): string {
+  return join(workDir, "audio-work");
+}
+
 export const BROWSER_MEDIA_EPSILON = 0.0001;
 
 /**
@@ -99,18 +112,16 @@ export function projectBrowserEndToCompositionTimeline(
  * `deviceScaleFactor`. The composition's intrinsic dimensions stay the
  * page-layout viewport; the screenshot lands at output dims via DPR.
  *
- * The scale must be a positive integer ≥ 1 — fractional DPRs introduce
+ * Upsampling must be by a whole number — fractional DPRs above 1 introduce
  * visible aliasing and we'd rather fail loudly than produce a blurry
- * 4K render. Downsampling (output < composition) is rejected because
- * the user is unlikely to have intended it; if the use case appears
- * we can plumb a separate flag.
+ * 4K render. A smaller preset (720p, 480p) takes a DPR under 1, so Chrome
+ * rasterizes straight at the smaller size.
  *
  * Throws on:
  *   - HDR + outputResolution (HDR compositor processes raw pixel buffers
  *     at composition dimensions and would need parallel scaling).
  *   - Aspect-ratio mismatch (e.g. landscape composition → portrait-4k).
- *   - Non-integer scale ratio.
- *   - Downsampling (output dimensions smaller than composition).
+ *   - Non-integer upsampling ratio.
  */
 export function resolveDeviceScaleFactor(input: {
   compositionWidth: number;
@@ -134,8 +145,9 @@ export function resolveDeviceScaleFactor(input: {
   if (!compat.ok) throw new Error(compat.message);
 
   const target = CANVAS_DIMENSIONS[input.outputResolution];
-  // Aspect ratios match → widthRatio === heightRatio. Compute once.
-  return target.width / input.compositionWidth;
+  // The two ratios match, except a smaller preset's long side rounded to an even pixel (854×480): the long side's, so
+  // Chrome draws all 854 and the short side's 480.375 rounds to 480.
+  return Math.max(target.width / input.compositionWidth, target.height / input.compositionHeight);
 }
 
 /**
@@ -156,6 +168,10 @@ export function writeCompiledArtifacts(
 
   for (const [srcPath, html] of compiled.subCompositions) {
     const outPath = join(compileDir, srcPath);
+    if (!isPathInside(outPath, compileDir)) {
+      console.warn(`[Render] Skipping sub-composition with unsafe path: ${terminalText(srcPath)}`);
+      continue;
+    }
     mkdirSync(dirname(outPath), { recursive: true });
     writeFileSync(outPath, html, "utf-8");
   }
@@ -168,7 +184,9 @@ export function writeCompiledArtifacts(
   for (const [relativePath, absolutePath] of compiled.externalAssets) {
     const outPath = resolve(join(compileDir, relativePath));
     if (!isPathInside(outPath, compileDir)) {
-      console.warn(`[Render] Skipping external asset with unsafe path: ${relativePath}`);
+      console.warn(
+        `[Render] Skipping external asset with unsafe path: ${terminalText(relativePath)}`,
+      );
       continue;
     }
     mkdirSync(dirname(outPath), { recursive: true });
@@ -246,10 +264,12 @@ export function updateJobStatus(
   stage: string,
   progress: number,
   onProgress?: ProgressCallback,
+  stageProgress?: RenderStageProgress,
 ): void {
   job.warnings ??= [];
   job.status = status;
   job.currentStage = stage;
+  job.stageProgress = stageProgress;
   const boundedProgress = Math.max(0, Math.min(100, Math.round(progress)));
   job.progress = Math.max(job.progress, boundedProgress);
   if (status === "failed" || status === "complete" || status === "cancelled") {
@@ -269,9 +289,10 @@ export function updateJobStatus(
 const PROGRESS_REPORT_INTERVAL_MS = 250;
 const lastFrameReportAt = new WeakMap<RenderJob, number>();
 const lastStartupReportAt = new WeakMap<RenderJob, number>();
+const lastReportSent = new WeakMap<RenderJob, string>();
 
-// The job updates on every call; the callback fires on the first call per job, when forced,
-// and at most once per interval in between.
+// The job updates on every call; the callback fires on the first call per job, when forced, and at
+// most once per interval in between, never twice in a row with the same stage and percent.
 function reportThrottled(
   lastReportAt: WeakMap<RenderJob, number>,
   job: RenderJob,
@@ -279,12 +300,20 @@ function reportThrottled(
   progress: number,
   onProgress: ProgressCallback | undefined,
   force: boolean,
+  stageProgress: RenderStageProgress,
+  status: RenderStatus = "rendering",
 ): void {
   const now = Date.now();
   const last = lastReportAt.get(job);
-  const due = force || last === undefined || now - last >= PROGRESS_REPORT_INTERVAL_MS;
-  if (due) lastReportAt.set(job, now);
-  updateJobStatus(job, "rendering", stage, progress, due ? onProgress : undefined);
+  const sent = `${stage}|${progress}`;
+  const due =
+    lastReportSent.get(job) !== sent &&
+    (force || last === undefined || now - last >= PROGRESS_REPORT_INTERVAL_MS);
+  if (due) {
+    lastReportAt.set(job, now);
+    lastReportSent.set(job, sent);
+  }
+  updateJobStatus(job, status, stage, progress, due ? onProgress : undefined, stageProgress);
 }
 
 /** Capture-loop progress: the first frame, the last frame, and at most four reports a second between. */
@@ -293,12 +322,136 @@ export function reportFrameProgress(
   stage: string,
   progress: number,
   onProgress: ProgressCallback | undefined,
-  isLastFrame: boolean,
+  done: number,
+  total: number,
 ): void {
-  reportThrottled(lastFrameReportAt, job, stage, progress, onProgress, isLastFrame);
+  reportThrottled(lastFrameReportAt, job, stage, progress, onProgress, done === total, {
+    code: "capture",
+    done,
+    total,
+  });
 }
 
-const workerPhasesByJob = new WeakMap<RenderJob, Map<number, string>>();
+const lastExtractReportAt = new WeakMap<RenderJob, number>();
+
+/** Frames ffmpeg has written for the source videos, 10% to 20%. */
+export function reportExtractProgress(
+  job: RenderJob,
+  done: number,
+  total: number,
+  onProgress: ProgressCallback | undefined,
+): void {
+  if (total <= 0) return;
+  const frames = Math.min(done, total);
+  reportThrottled(
+    lastExtractReportAt,
+    job,
+    "Extracting video frames",
+    10 + (10 * frames) / total,
+    onProgress,
+    frames === total,
+    { code: "extract_video", done: frames, total },
+    "preprocessing",
+  );
+}
+
+const lastEncodeReportAt = new WeakMap<RenderJob, number>();
+
+/** Frames ffmpeg has encoded, from where capture left the bar up to 90%; same cadence as capture. */
+export function reportEncodeProgress(
+  job: RenderJob,
+  done: number,
+  total: number,
+  onProgress: ProgressCallback | undefined,
+  from: number,
+): void {
+  if (total <= 0) return;
+  const frames = Math.min(done, total);
+  reportThrottled(
+    lastEncodeReportAt,
+    job,
+    `Encoding frame ${frames}/${total}`,
+    from + ((90 - from) * frames) / total,
+    onProgress,
+    frames === total,
+    { code: "encode", done: frames, total },
+    "encoding",
+  );
+}
+
+export const AUDIO_STAGE = "Processing audio tracks";
+const AUDIO_WAIT_REPORT_MS = 5_000;
+
+/** Once capture waits on the audio mix: a line at most every 5 s in which an FFmpeg of the mix wrote more, so whoever
+ * watches the render for silence hears it working, and a mix that writes nothing stays silent. */
+export function audioWaitReporter(job: RenderJob, onProgress: ProgressCallback | undefined) {
+  let waiting = false;
+  let reportedAt = -Infinity;
+  return {
+    progressed(): void {
+      const now = Date.now();
+      if (!waiting || now - reportedAt < AUDIO_WAIT_REPORT_MS) return;
+      reportedAt = now;
+      updateJobStatus(job, job.status, AUDIO_STAGE, job.progress, onProgress, {
+        code: "process_audio",
+      });
+    },
+    async wait<T>(audio: Promise<T>): Promise<T> {
+      waiting = true;
+      try {
+        return await audio;
+      } finally {
+        waiting = false;
+      }
+    },
+  };
+}
+
+const lastAssembleReportAt = new WeakMap<RenderJob, number>();
+
+/** Seconds of the final file written, 90% to 99%: only a complete file reaches 100. */
+export function reportAssembleProgress(
+  job: RenderJob,
+  done: number,
+  total: number,
+  onProgress: ProgressCallback | undefined,
+): void {
+  if (total <= 0) return;
+  const seconds = Math.min(done, total);
+  reportThrottled(
+    lastAssembleReportAt,
+    job,
+    "Assembling final video",
+    90 + (9 * seconds) / total,
+    onProgress,
+    seconds >= total,
+    { code: "assemble", done: seconds, total },
+    "assembling",
+  );
+}
+
+const workerPhasesByJob = new WeakMap<object, Map<number, string>>();
+
+export function forgetWorkerPhases(job: object): void {
+  workerPhasesByJob.delete(job);
+}
+
+const staticDedupActivityByJob = new WeakMap<object, number>();
+
+/** Counts a render's still-frame check screenshots; the capture stall watcher reads it as activity. */
+export function noteStaticDedupActivity(job: object): void {
+  staticDedupActivityByJob.set(job, (staticDedupActivityByJob.get(job) ?? 0) + 1);
+}
+
+export function staticDedupActivity(job: object): number {
+  return staticDedupActivityByJob.get(job) ?? 0;
+}
+
+export function describeWorkerPhases(job: object): string | undefined {
+  const phases = workerPhasesByJob.get(job);
+  if (!phases?.size) return undefined;
+  return `Last phase per worker: ${[...phases].map(([id, phase]) => `worker ${id} ${phase}`).join(", ")}.`;
+}
 
 /** Browser warm-up before the first frame, from the parallel workers' phase events. */
 export function reportWorkerStartup(
@@ -322,6 +475,7 @@ export function reportWorkerStartup(
     job.progress,
     onProgress,
     false,
+    { code: "start_browsers", done: ready, total: progress.activeWorkers },
   );
 }
 
@@ -478,6 +632,11 @@ export function createMemorySampler(intervalMs: number = 250): MemorySampler {
 // One-time guard for the symlink→copy fallback notice below.
 let warnedSymlinkFallback = false;
 
+const copyCannotFix = (error: unknown): boolean =>
+  ["ENOSPC", "EDQUOT", "EEXIST", "ENOENT"].includes(
+    (error as NodeJS.ErrnoException | undefined)?.code ?? "",
+  );
+
 // Junctions avoid Windows symlink privileges. POSIX keeps its copy fallback.
 function tryWindowsFrameJunction(
   fileSystem: MaterializeFileSystem,
@@ -489,30 +648,20 @@ function tryWindowsFrameJunction(
     fileSystem.symlinkSync(src, dest, "junction");
     return true;
   } catch (error) {
-    const code =
-      error instanceof Error && "code" in error && typeof error.code === "string"
-        ? error.code
-        : undefined;
-    if (
-      ["EPERM", "EACCES", "UNKNOWN", "EINVAL", "ENOSYS", "EOPNOTSUPP", "ENOTSUP"].includes(
-        code ?? "",
-      )
-    ) {
-      return false;
-    }
-    throw error;
+    if (copyCannotFix(error)) throw error;
+    return false;
   }
 }
 
-// Create the symlink, degrading to a copy on Windows' no-symlink-privilege
-// errors (EPERM/EACCES, plus UNKNOWN), trying a Windows junction first.
-// Other symlink errors and non-capability junction errors propagate.
+// Create the symlink; a drive that refuses it, with any code, gets a Windows junction, then a copy.
+// A full disk, a missing source or an entry already at dest (stageExtractedFrameDir clears a stale one)
+// propagate: copying would not fix them.
 function linkOrCopyFrameDir(fileSystem: MaterializeFileSystem, src: string, dest: string): void {
   try {
     fileSystem.symlinkSync(src, dest, "dir");
   } catch (err) {
+    if (copyCannotFix(err)) throw err;
     const code = (err as NodeJS.ErrnoException | undefined)?.code;
-    if (code !== "EPERM" && code !== "EACCES" && code !== "UNKNOWN") throw err;
     if (tryWindowsFrameJunction(fileSystem, src, dest)) return;
     // Copying is measurably slower than symlinking, so surface the degrade once
     // — it explains a render that suddenly got heavier and saves a support
@@ -579,7 +728,7 @@ export function materializeExtractedFramesForCompiledDir(
     const resolvedOut = pathModule.resolve(ext.outputDir);
     if (isPathInside(resolvedOut, resolvedCompiledDir, { pathModule })) continue;
 
-    const linkPath = pathModule.join(compiledFrameRoot, ext.videoId);
+    const linkPath = pathModule.join(compiledFrameRoot, mediaIdPathSegment(ext.videoId));
     if (!fileSystem.existsSync(linkPath)) {
       fileSystem.mkdirSync(pathModule.dirname(linkPath), { recursive: true });
       stageExtractedFrameDir(

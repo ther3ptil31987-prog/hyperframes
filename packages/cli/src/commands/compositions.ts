@@ -1,8 +1,11 @@
-import { defineCommand } from "citty";
+import { terminalText } from "@hyperframes/core";
+import { defineCommand } from "../utils/defineCommand.js";
 import type { Example } from "./_examples.js";
 import { readFileSync } from "node:fs";
-import { readProjectFile } from "@hyperframes/parsers/asset-resolution";
-import { resolve, dirname } from "node:path";
+import { readProjectFile, resolveCompositionSrc } from "@hyperframes/parsers/asset-resolution";
+import { resolveCompositionDuration } from "@hyperframes/parsers/composition-duration";
+import { readDataDurationSeconds } from "@hyperframes/parsers/media-duration";
+import { dirname } from "node:path";
 
 export const examples: Example[] = [
   ["List compositions in the current project", "hyperframes compositions"],
@@ -64,9 +67,9 @@ export function parseCompositions(html: string, baseDir: string): CompositionInf
 
     // If this references an external sub-composition, parse that file
     if (compositionSrc) {
-      const subPath = resolve(baseDir, compositionSrc);
-      const sub = readProjectFile(subPath);
-      if (sub.kind === "file") {
+      const subPath = resolveCompositionSrc(baseDir, compositionSrc);
+      const sub = subPath ? readProjectFile(subPath) : null;
+      if (sub?.kind === "file") {
         const subInfo = parseSubComposition(sub.text, id, width, height);
         compositions.push({ ...subInfo, source: compositionSrc });
         return;
@@ -74,7 +77,7 @@ export function parseCompositions(html: string, baseDir: string): CompositionInf
     }
 
     const timedChildren = div.querySelectorAll("[data-start]");
-    let maxEnd = 0;
+    const clipEndsSeconds: number[] = [];
     let elementCount = 0;
 
     timedChildren.forEach((el) => {
@@ -92,14 +95,18 @@ export function parseCompositions(html: string, baseDir: string): CompositionInf
         end = start + 5;
       }
 
-      if (end > maxEnd) {
-        maxEnd = end;
-      }
+      clipEndsSeconds.push(end);
     });
+
+    const duration =
+      resolveCompositionDuration({
+        authoredDurationSeconds: readDataDurationSeconds((name) => div.getAttribute(name)),
+        clipEndsSeconds,
+      }).seconds ?? 0;
 
     compositions.push({
       id,
-      duration: maxEnd,
+      duration,
       width,
       height,
       elementCount,
@@ -135,14 +142,7 @@ export function parseSubComposition(
     elementCount = countRenderableDescendants(compDiv);
   }
 
-  // Parse duration from the composition's own data-duration attribute
-  let duration = 0;
-  const durationAttr = compDiv?.getAttribute("data-duration");
-  if (durationAttr && !durationAttr.startsWith("__")) {
-    duration = parseFloat(durationAttr) || 0;
-  }
-
-  // Also check timed children for max end time
+  const clipEndsSeconds: number[] = [];
   if (compDiv) {
     const timedEls = compDiv.querySelectorAll("[data-start]");
     const startCache = new Map<Element, number>();
@@ -161,11 +161,14 @@ export function parseSubComposition(
       } else {
         end = start + 5;
       }
-      if (end > duration) {
-        duration = end;
-      }
+      clipEndsSeconds.push(end);
     });
   }
+  let duration =
+    resolveCompositionDuration({
+      authoredDurationSeconds: readDataDurationSeconds((name) => compDiv?.getAttribute(name)),
+      clipEndsSeconds,
+    }).seconds ?? 0;
   if (duration <= 0) {
     duration = estimateDurationFromScripts(searchRoot);
   }
@@ -206,16 +209,19 @@ export default defineCommand({
     console.log();
 
     // Calculate padding for alignment
-    const maxIdLen = compositions.reduce((max, comp) => Math.max(max, comp.id.length), 0);
+    const maxIdLen = compositions.reduce(
+      (max, comp) => Math.max(max, terminalText(comp.id).length),
+      0,
+    );
 
     for (const comp of compositions) {
-      const id = c.accent(comp.id.padEnd(maxIdLen));
+      const id = c.accent(terminalText(comp.id).padEnd(maxIdLen));
       const duration = c.bold(`${comp.duration.toFixed(1)}s`);
       const resolution = c.dim(`${comp.width}×${comp.height}`);
       const elements = c.dim(
         `${comp.elementCount} ${comp.elementCount === 1 ? "element" : "elements"}`,
       );
-      const source = comp.source ? c.dim(` ← ${comp.source}`) : "";
+      const source = comp.source ? c.dim(` ← ${terminalText(comp.source)}`) : "";
 
       console.log(`   ${id}   ${duration}   ${resolution}   ${elements}${source}`);
     }

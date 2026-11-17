@@ -1,6 +1,14 @@
 import assert from "node:assert/strict";
 import { execFileSync, spawnSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { test } from "node:test";
@@ -93,19 +101,10 @@ function publicationFixture(t, changed, apiEnv = {}) {
     mkdirSync(dirname(join(root, target)), { recursive: true });
     writeFileSync(join(root, target), "published");
   }
-  git("add", ".");
-  git(
-    "-c",
-    "user.name=Test",
-    "-c",
-    "user.email=test@example.invalid",
-    "-c",
-    "commit.gpgsign=false",
-    "commit",
-    "-qm",
-    "fixture",
-  );
-  const base = git("rev-parse", "HEAD");
+  const base = commitPaths(git, "fixture", ["."]);
+  git("init", "-q", "--bare", "origin.git");
+  git("remote", "add", "origin", join(root, "origin.git"));
+  git("push", "-q", "origin", "HEAD:refs/heads/bot/catalog-publish");
   if (changed) writeFileSync(join(root, "registry/registry.json"), "new publication");
   const executable = join(root, "gh");
   writeFileSync(
@@ -117,6 +116,9 @@ const endpoint = args[1];
 const method = args[args.indexOf("--method") + 1];
 const body = args.includes("--input") ? JSON.parse(fs.readFileSync(0, "utf8")) : undefined;
 fs.appendFileSync(process.env.API_CALLS, JSON.stringify({ endpoint, method, body }) + "\\n");
+const mainAdvanced = () =>
+  process.env.MAIN_ADVANCES === "before" ||
+  (process.env.MAIN_ADVANCES === "after-commit" && fs.readFileSync(process.env.API_CALLS, "utf8").includes('"graphql"'));
 if (!process.env.PUBLISH_SUCCESS && (endpoint === "graphql" || method === "DELETE")) {
   console.error(endpoint === "graphql" ? "commit rejected" : "cleanup rejected");
   process.exit(1);
@@ -124,11 +126,10 @@ if (!process.env.PUBLISH_SUCCESS && (endpoint === "graphql" || method === "DELET
 if (endpoint === "graphql") console.log("c".repeat(40));
 else if (endpoint.includes("/runs?")) console.log(JSON.stringify({ workflow_runs: JSON.parse(process.env.WORKFLOW_RUNS || "[]") }));
 else if (endpoint.endsWith("/dispatches") && process.env.DISPATCH_FAIL) process.exit(1);
-else if (endpoint.endsWith("/ref/heads/main")) console.log(process.env.BASE);
-else if (endpoint.includes("/matching-refs/")) console.log("refs/heads/bot/catalog-publish");
+else if (endpoint.endsWith("/ref/heads/main")) console.log(mainAdvanced() ? "b".repeat(40) : process.env.BASE);
+else if (endpoint.includes("/matching-refs/")) console.log(process.env.NO_BRANCH ? "" : "refs/heads/bot/catalog-publish");
 else if (endpoint.includes("/ref/heads/bot/catalog-publish")) console.log("a".repeat(40));
-else if (endpoint.includes("/commits/")) console.log("b".repeat(40));
-else if (endpoint.includes("/pulls?")) console.log("42");
+else if (endpoint.includes("/pulls?")) console.log(process.env.NO_OPEN_PR ? "" : "42");
 `,
     { mode: 0o755 },
   );
@@ -153,7 +154,7 @@ catch (error) {
         env: {
           ...process.env,
           PATH: `${root}:${process.env.PATH}`,
-          BASE: base,
+          BASE: git("rev-parse", "HEAD"),
           API_CALLS: calls,
           FIXTURE_ROOT: root,
           GITHUB_REPOSITORY: "test/catalog",
@@ -167,6 +168,7 @@ catch (error) {
   return {
     root,
     base,
+    git,
     run,
     calls: () =>
       readFileSync(calls, "utf8")
@@ -189,6 +191,29 @@ test("reverting unpublished sources closes the obsolete PR and resets its branch
         body: { sha: fixture.base, force: true },
       },
     ],
+  );
+});
+
+test("a run that main overtook before it started ends clean and writes nothing", (t) => {
+  const fixture = publicationFixture(t, true, { MAIN_ADVANCES: "before" });
+  assert.match(fixture.run(), /^::notice::Main advanced during publication/m);
+  assert.deepEqual(
+    fixture.calls().filter((call) => call.method !== "GET"),
+    [],
+  );
+});
+
+test("a run that main overtook after its commits ends clean and leaves the publication alone", (t) => {
+  const fixture = publicationFixture(t, true, {
+    MAIN_ADVANCES: "after-commit",
+    PUBLISH_SUCCESS: "1",
+  });
+  assert.match(fixture.run(), /^::notice::Main advanced during publication/m);
+  const writes = fixture.calls().filter((call) => call.method !== "GET");
+  assert.equal(writes.at(-1).method, "DELETE");
+  assert.equal(
+    writes.some((call) => call.method === "PATCH" || call.endpoint.endsWith("/dispatches")),
+    false,
   );
 });
 
@@ -327,4 +352,136 @@ test("regression code changes require every shard to succeed", () => {
 test("regression accepts completed shards after successful change detection", () => {
   const result = runSummary("success", "true", "success");
   assert.equal(result.status, 0, result.stdout + result.stderr);
+});
+
+function commitPaths(git, message, paths) {
+  git("add", "-A", "--", ...paths);
+  git(
+    "-c",
+    "user.name=Test",
+    "-c",
+    "user.email=test@example.invalid",
+    "-c",
+    "commit.gpgsign=false",
+    "commit",
+    "-qm",
+    message,
+  );
+  return git("rev-parse", "HEAD");
+}
+
+const VECTOR_META = "registry/catalog-artifact/local-vectors.json";
+const VECTOR_BIN = "registry/catalog-artifact/local-vectors.bin";
+// Two rows of two dimensions.
+const vectors = (...values) => Buffer.from(new Float32Array(values).buffer);
+
+// Publishes the working tree's files at `paths` and leaves them in place, as the next run would regenerate them.
+function publish(fixture, paths = GENERATED_CATALOG_PATHS) {
+  commitPaths(fixture.git, "publication", paths);
+  fixture.git("push", "-q", "-f", "origin", "HEAD:bot/catalog-publish");
+  fixture.git("reset", "-q", "HEAD~");
+}
+
+function commitToMain(fixture, path, contents) {
+  const kept = existsSync(join(fixture.root, path))
+    ? readFileSync(join(fixture.root, path))
+    : undefined;
+  writeFileSync(join(fixture.root, path), contents);
+  commitPaths(fixture.git, "main push", [path]);
+  if (kept !== undefined) writeFileSync(join(fixture.root, path), kept);
+}
+
+const rewrites = (fixture) =>
+  fixture
+    .calls()
+    .some((call) => call.endpoint === "graphql" || call.endpoint.includes("/refs/heads/bot/"));
+
+function vectorFixture(t, changed = true, apiEnv = {}) {
+  const fixture = publicationFixture(t, changed, { PUBLISH_SUCCESS: "1", ...apiEnv });
+  writeFileSync(join(fixture.root, VECTOR_META), JSON.stringify({ dimensions: 2 }));
+  writeFileSync(join(fixture.root, VECTOR_BIN), vectors(1, 0, 0, 1));
+  return fixture;
+}
+
+test("an unrelated main push leaves the approved publication alone", (t) => {
+  const fixture = publicationFixture(t, true, { PUBLISH_SUCCESS: "1" });
+  publish(fixture);
+  commitToMain(fixture, "notes.txt", "unrelated");
+  fixture.run();
+  assert.equal(rewrites(fixture), false);
+});
+
+test("regenerated vectors replace the publication only when they point elsewhere", (t) => {
+  for (const [regenerated, rewritten] of [
+    [vectors(1, 0.001, 0.001, 1), false],
+    [vectors(1, 0, 1, 0), true],
+  ]) {
+    const fixture = vectorFixture(t);
+    publish(fixture);
+    commitToMain(fixture, "notes.txt", "unrelated");
+    writeFileSync(join(fixture.root, VECTOR_BIN), regenerated);
+    fixture.run();
+    assert.equal(rewrites(fixture), rewritten);
+  }
+});
+
+function regenerateOverMain(t, regenerated, apiEnv, onMain) {
+  const fixture = vectorFixture(t, false, { NO_OPEN_PR: "1", ...apiEnv });
+  commitPaths(fixture.git, "main carries the catalog", [VECTOR_META, VECTOR_BIN]);
+  onMain(fixture);
+  writeFileSync(join(fixture.root, VECTOR_BIN), regenerated);
+  fixture.run();
+  return { fixture, writes: fixture.calls().filter((call) => call.method !== "GET") };
+}
+
+const noise = vectors(1, 0.001, 0.001, 1);
+
+test("vector noise over a standing branch already in main opens no empty PR", (t) => {
+  const { fixture, writes } = regenerateOverMain(t, noise, {}, (main) => {
+    main.git("push", "-q", "-f", "origin", "HEAD:bot/catalog-publish");
+    commitToMain(main, "notes.txt", "unrelated");
+  });
+  assert.deepEqual(writes, [
+    {
+      endpoint: "repos/test/catalog/git/refs/heads/bot/catalog-publish",
+      method: "PATCH",
+      body: { sha: fixture.git("rev-parse", "HEAD"), force: true },
+    },
+  ]);
+});
+
+test("vector noise after the publish branch was deleted opens no PR", (t) => {
+  assert.deepEqual(regenerateOverMain(t, noise, { NO_BRANCH: "1" }, () => {}).writes, []);
+});
+
+test("vectors that point elsewhere than main's still publish", (t) => {
+  const { writes } = regenerateOverMain(t, vectors(1, 0, 1, 0), { NO_BRANCH: "1" }, () => {});
+  assert.ok(writes.some((call) => call.endpoint === "graphql"));
+});
+
+test("vectors the publication lacks replace it", (t) => {
+  const fixture = vectorFixture(t);
+  rmSync(join(fixture.root, VECTOR_BIN));
+  publish(fixture);
+  commitToMain(fixture, "notes.txt", "unrelated");
+  writeFileSync(join(fixture.root, VECTOR_BIN), vectors(1, 0, 0, 1));
+  fixture.run();
+  assert.equal(rewrites(fixture), true);
+});
+
+test("a main commit to a generated file replaces the publication", (t) => {
+  const fixture = publicationFixture(t, true, { PUBLISH_SUCCESS: "1" });
+  publish(fixture);
+  commitToMain(fixture, "registry/registry.json", "edited on main");
+  fixture.run();
+  assert.equal(rewrites(fixture), true);
+});
+
+test("a publication carrying anything but generated files is replaced", (t) => {
+  const fixture = publicationFixture(t, true, { PUBLISH_SUCCESS: "1" });
+  writeFileSync(join(fixture.root, "extra.sh"), "not generated");
+  publish(fixture, [...GENERATED_CATALOG_PATHS, "extra.sh"]);
+  commitToMain(fixture, "notes.txt", "unrelated");
+  fixture.run();
+  assert.equal(rewrites(fixture), true);
 });

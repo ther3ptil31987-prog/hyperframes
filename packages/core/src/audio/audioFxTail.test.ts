@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { chainTailSeconds, MAX_FX_TAIL_SECONDS } from "./audioFxTail.js";
+import {
+  chainLatencySamples,
+  chainTailSeconds,
+  delayTailSeconds,
+  MAX_FX_TAIL_SECONDS,
+  reverbRoomSeconds,
+} from "./audioFxTail.js";
+import { truePeakLatencySamples } from "./audioFxTruePeak.js";
 import { synthesizeReverbImpulse } from "./audioFxGraph.js";
 import type { HfAudioFxChain } from "../audioFx.js";
 import type { HfAutomation } from "../audioAutomation.js";
@@ -99,5 +106,45 @@ describe("chainTailSeconds", () => {
     ]);
     expect(chainTailSeconds(withLane)).toBe(0);
     expect(chainTailSeconds(withLane, automation)).toBeCloseTo(0.6 + 0.5 * 2.6, 5);
+  });
+});
+
+describe("chainLatencySamples", () => {
+  it("is zero for a chain with no lookahead", () => {
+    expect(
+      chainLatencySamples(
+        chain([{ type: "limiter", id: "l", params: { limit: -1, attack: 5, release: 50 } }]),
+        48000,
+      ),
+    ).toBe(0);
+  });
+
+  it("sums each enabled true-peak limiter's lookahead plus detector delay", () => {
+    const nodes: HfAudioFxChain["nodes"] = [
+      { type: "truepeak", id: "a", params: { ceiling: -1, lookahead: 3, release: 80 } },
+      { type: "truepeak", id: "b", params: { ceiling: -1, lookahead: 1.5, release: 80 } },
+      { type: "truepeak", id: "c", enabled: false, params: { ceiling: -1, lookahead: 9 } },
+    ];
+    expect(chainLatencySamples(chain(nodes), 48000)).toBe(
+      truePeakLatencySamples(3, 48000) + truePeakLatencySamples(1.5, 48000),
+    );
+  });
+
+  it("reads the registry default when the attribute omits the lookahead", () => {
+    expect(chainLatencySamples(chain([{ type: "truepeak", id: "a", params: {} }]), 48000)).toBe(
+      truePeakLatencySamples(3, 48000),
+    );
+  });
+});
+
+describe("tail helpers shared with the engine's window warm-up", () => {
+  it("counts a delay's repeats to -60 dB, uncapped", () => {
+    expect(delayTailSeconds(5000, 0.95)).toBeCloseTo(135 * 5, 5);
+    expect(delayTailSeconds(400, 0.5)).toBeCloseTo(10 * 0.4, 5);
+  });
+
+  it("is the reverb impulse's length", () => {
+    expect(reverbRoomSeconds(0.5)).toBeCloseTo(1.9, 5);
+    expect(reverbRoomSeconds(4)).toBeCloseTo(3.2, 5);
   });
 });

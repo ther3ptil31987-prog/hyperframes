@@ -1,4 +1,5 @@
 import { isHtmlElement } from "@hyperframes/core/runtime/dom-realm";
+import { applyAuthoredTiming } from "@hyperframes/core/studio-preview-mark";
 import { type TimelineElement, usePlayerStore } from "../player/store/playerStore";
 import { toAuthoredStart } from "../player/store/timelineElement";
 import {
@@ -6,6 +7,7 @@ import {
   findTagByTarget,
   readAttributeByTarget,
   readTagSnippetByTarget,
+  servedSource,
   type PatchOperation,
 } from "../utils/sourcePatcher";
 import {
@@ -15,20 +17,23 @@ import {
 } from "../player/components/timelineEditing";
 import { getElementZIndex } from "../player/lib/layerOrdering";
 import {
-  furthestClipEndFromSource,
+  furthestClipEndFromDocument,
   getTimelineElementIdentity,
   playbackStartAttributeForElement,
   readPlaybackStartAttributes,
 } from "../player/lib/timelineElementHelpers";
 import { resolveTimelinePlaybackRate } from "../player/components/timelineGroupEditing";
 import {
+  editContextTarget,
   saveProjectFilesWithHistory,
   writeProjectFilesWithHistoryInQueue,
+  type EditContextTarget,
   type RecordEditInput,
 } from "../utils/studioFileHistory";
 import { serializeStudioFileMutations } from "../utils/studioFileMutationCoordinator";
 import type { TimelineZIndexReorderCommit } from "./useTimelineEditingTypes";
 import { setCompositionDurationToContent } from "../utils/timelineAssetDrop";
+import { rootCompositionDurationOf } from "../utils/rootDuration";
 import { readFileContent } from "./timelineTimingSync";
 import {
   findElementForSelection,
@@ -138,6 +143,12 @@ export function buildPatchTarget(element: {
   return null;
 }
 export type PatchTarget = NonNullable<ReturnType<typeof buildPatchTarget>>;
+
+/** A clip's entry in the history: how to find the element again, and the name the clip wears on the timeline. */
+function timelineEditTarget(path: string, element: TimelineElement): EditContextTarget | null {
+  const patchTarget = buildPatchTarget(element);
+  return patchTarget && editContextTarget(path, { ...patchTarget, label: element.label });
+}
 // The runtime re-reads data-start/data-duration from the DOM on each sync tick
 // (packages/core/src/runtime/init.ts:1324-1368), so attribute mutations here are
 // picked up automatically on the next frame without a rebind call.
@@ -179,7 +190,7 @@ export function patchIframeDomTiming(
   try {
     const el = findTimelineElementInIframe(iframe, element, activeCompositionPath);
     if (!el) return;
-    for (const [name, value] of attrs) el.setAttribute(name, value);
+    applyAuthoredTiming(el, attrs);
   } catch {
     // Cross-origin or mid-navigation — file save is enqueued; iframe patch is best-effort.
   }
@@ -235,7 +246,7 @@ export function applyTimelineMoveAttributes(
 ): string {
   if (!Number.isFinite(start) || !Number.isFinite(duration)) {
     console.warn(
-      `[Timeline] applyTimelineMoveAttributes: non-finite timing (start=${start}, duration=${duration}) — patch skipped`,
+      `[Timeline] applyTimelineMoveAttributes: non-finite timing (start=${start}, duration=${duration}). Patch skipped`,
     );
     return original;
   }
@@ -263,7 +274,22 @@ export function applyTimelineMoveAttributes(
 // Root data-duration follows the furthest clip end in the source; the store's durations are
 // truncated to the current length, so reading them would ratchet the duration down every edit.
 export function syncCompositionDurationToContent(source: string): string {
-  return setCompositionDurationToContent(source, furthestClipEndFromSource(source));
+  return syncCompositionDurationWithEnd(source).source;
+}
+
+/** The synced source and the clip end it was synced to, from one parse of the source. */
+export function syncCompositionDurationWithEnd(source: string): {
+  source: string;
+  contentEnd: number;
+} {
+  const doc = new DOMParser().parseFromString(source, "text/html");
+  const contentEnd = furthestClipEndFromDocument(doc);
+  const synced = setCompositionDurationToContent(
+    source,
+    contentEnd,
+    rootCompositionDurationOf(doc),
+  );
+  return { source: synced, contentEnd };
 }
 
 export function buildTimelineMoveTimingPatch(
@@ -334,18 +360,18 @@ export async function persistTimelineEdit(input: PersistTimelineEditInput): Prom
     throw new Error(`Timeline element ${input.element.id} is missing a patchable target`);
   }
 
-  input.pendingTimelineEditPathRef.current.add(targetPath);
   await saveProjectFilesWithHistory({
     projectId: input.projectId,
     label: input.label,
+    targets: [editContextTarget(targetPath, { ...patchTarget, label: input.element.label })],
     coalesceKey: input.coalesceKey,
     coalesceMs: input.coalesceMs,
     files: {
       [targetPath]: (current) => {
-        const patched = input.buildPatches(current, patchTarget);
-        if (patched === current) {
-          throw new Error(`Unable to patch timeline element ${input.element.id} in ${targetPath}`);
-        }
+        const patched = patchTimelineChangesInSource(current, targetPath, [
+          { element: input.element, buildPatches: input.buildPatches },
+        ]);
+        if (patched !== current) input.pendingTimelineEditPathRef.current.add(targetPath);
         return patched;
       },
     },
@@ -371,6 +397,20 @@ export function operationChanges(
   }));
 }
 
+const RENAMED_MOUNT = /__hf\d+"?\]?$/;
+const lookup = (value: string, kind: string) =>
+  RENAMED_MOUNT.test(value) ? `runtime-renamed ${kind}` : kind;
+const selectorLookup = (selector: string) =>
+  selector.startsWith("[data-composition-id=")
+    ? lookup(selector, "composition id")
+    : /^\.[\w-]+$/.test(selector) && "class";
+
+function missedLookups(element: Pick<TimelineElement, "sourceFile">, target: PatchTarget): string {
+  const kinds = [target.hfId && "hf-id", target.id && lookup(target.id, "id")];
+  const by = [...kinds, target.selector && selectorLookup(target.selector)].filter(Boolean);
+  return `by ${by.join(", ") || "nothing"}; ${element.sourceFile ? "file from the clip" : "no file on the clip"}`;
+}
+
 /** Patches each change into `source`, failing loudly on a target the file does not hold. */
 export function patchTimelineChangesInSource(
   source: string,
@@ -381,9 +421,12 @@ export function patchTimelineChangesInSource(
   for (const { element, buildPatches } of changes) {
     const target = buildPatchTarget(element);
     if (!target) throw new Error(`Timeline element ${element.id} is missing a patchable target`);
+    current = servedSource(current, target);
     // Resolve first: a member already at its target values patches to the same string, a missing one must throw.
     if (!findTagByTarget(current, target)) {
-      throw new Error(`Unable to patch timeline element ${element.id} in ${targetPath}`);
+      throw new Error(
+        `Unable to patch timeline element ${element.id} in ${targetPath} (${missedLookups(element, target)})`,
+      );
     }
     current = buildPatches(current, target);
   }
@@ -425,6 +468,10 @@ export async function persistTimelineBatchEdit(
   await saveProjectFilesWithHistory({
     projectId: input.projectId,
     label: input.label,
+    targets: input.changes.flatMap((change) => {
+      const path = change.element.sourceFile || input.activeCompPath || "index.html";
+      return timelineEditTarget(path, change.element) ?? [];
+    }),
     coalesceKey: input.coalesceKey,
     coalesceMs: input.coalesceMs,
     files: Object.fromEntries([...changesByPath.keys()].map((path) => [path, buildFile(path)])),

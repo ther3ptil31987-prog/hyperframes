@@ -1,8 +1,13 @@
 // fallow-ignore-file code-duplication
+import { spawnSync } from "node:child_process";
+import { readdirSync, readFileSync } from "node:fs";
+import { cpus } from "node:os";
+import { join, sep } from "node:path";
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import {
   _resetCgroupLimitCacheForTests,
   isLowMemorySystem,
+  parseCgroupCpus,
   LOW_MEMORY_TOTAL_MB_THRESHOLD,
   parseCgroupLimitMb,
 } from "./systemMemory.js";
@@ -152,6 +157,40 @@ describe("parseCgroupLimitMb", () => {
 
   it("uses cgroup v2 when both v2 and v1 contents are present", () => {
     expect(parseCgroupLimitMb(`${4096 * BYTES_PER_MIB}`, `${2048 * BYTES_PER_MIB}`)).toBe(4096);
+  });
+});
+
+describe("parseCgroupCpus", () => {
+  it("reads a v2 cpu.max quota as CPUs", () => {
+    expect(parseCgroupCpus("350000 100000\n", null, null)).toBe(3.5);
+    expect(parseCgroupCpus("max 100000", null, null)).toBeNull();
+  });
+
+  it("reads a v1 quota over its period, and -1 as no quota", () => {
+    expect(parseCgroupCpus(null, "400000\n", "100000\n")).toBe(4);
+    expect(parseCgroupCpus(null, "-1", "100000")).toBeNull();
+  });
+
+  it("ignores absent and malformed quotas", () => {
+    expect(parseCgroupCpus(null, null, null)).toBeNull();
+    for (const content of ["", "garbage", "0 100000", "100000 0"])
+      expect(parseCgroupCpus(content, null, null)).toBeNull();
+  });
+});
+
+describe("getCgroupCpuLimit", () => {
+  it("reads the quota from cpu.max, and none from a host without one", async () => {
+    await withSystemMemoryMocks(
+      { files: { "/sys/fs/cgroup/cpu.max": "350000 100000" } },
+      ({ getCgroupCpuLimit }) => expect(getCgroupCpuLimit()).toBe(3.5),
+    );
+    await withSystemMemoryMocks(
+      { files: { "/sys/fs/cgroup/cpu.max": "max 100000" } },
+      ({ getCgroupCpuLimit }) => expect(getCgroupCpuLimit()).toBeNull(),
+    );
+    await withSystemMemoryMocks({ platform: "darwin" }, ({ getCgroupCpuLimit }) =>
+      expect(getCgroupCpuLimit()).toBeNull(),
+    );
   });
 });
 
@@ -366,5 +405,48 @@ describe("getSystemTotalMb", () => {
         expect(isLowMemorySystem()).toBe(false);
       },
     );
+  });
+});
+
+const hasTaskset = process.platform === "linux" && spawnSync("taskset", ["-V"]).status === 0;
+
+describe.skipIf(!hasTaskset)("usableCpuCount under a cpuset", () => {
+  it("is the CPUs the process may run on, while hostCpuCount stays the machine's", () => {
+    const run = spawnSync(
+      "taskset",
+      [
+        ...["-c", "0", process.execPath, "--experimental-strip-types", "--no-warnings", "-e"],
+        `import(${JSON.stringify(join(import.meta.dirname, "systemMemory.ts"))})` +
+          ".then((m) => console.log(m.usableCpuCount(), m.hostCpuCount()))",
+      ],
+      { encoding: "utf8" },
+    );
+    expect(run.stderr).toBe("");
+    expect(run.stdout.trim()).toBe(`1 ${cpus().length}`);
+  });
+});
+
+describe("work is sized by usableCpuCount", () => {
+  it("leaves os.cpus() to systemMemory.ts in engine and producer sources", () => {
+    const packages = join(import.meta.dirname, "../../..");
+    const callers: string[] = [];
+    const walk = (dir: string): void => {
+      for (const entry of readdirSync(dir, { withFileTypes: true })) {
+        const path = join(dir, entry.name);
+        if (entry.isDirectory()) walk(path);
+        else if (/\.ts$/.test(entry.name) && !/\.test\.ts$/.test(entry.name)) {
+          if (/\bcpus\(\)/.test(readFileSync(path, "utf8")))
+            callers.push(
+              path
+                .slice(packages.length + 1)
+                .split(sep)
+                .join("/"),
+            );
+        }
+      }
+    };
+    walk(join(packages, "engine/src"));
+    walk(join(packages, "producer/src"));
+    expect(callers).toEqual(["engine/src/services/systemMemory.ts"]);
   });
 });

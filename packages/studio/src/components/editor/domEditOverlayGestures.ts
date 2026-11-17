@@ -1,3 +1,4 @@
+import type { GestureReadoutState } from "./domEditGestureReadoutState";
 import type { RefObject } from "react";
 import type { DomEditSelection } from "./domEditing";
 import type {
@@ -47,6 +48,7 @@ const ROTATION_SNAP_DEGREES = 15;
 export const ROTATED_SNAP_BYPASS_DEGREES = 0.5;
 
 export interface GestureState {
+  readout?: GestureReadoutState;
   kind: GestureKind;
   mode: "path-offset" | "box-size" | "rotation";
   selection: DomEditSelection;
@@ -93,6 +95,7 @@ export interface GestureState {
    * when the corner geometry can't be measured (member creation still succeeded).
    */
   resizeFixedCenterStart?: { x: number; y: number };
+  resizePressFromCorner?: { x: number; y: number };
 }
 
 export interface GroupGestureState {
@@ -119,6 +122,22 @@ export interface BlockedMoveState {
   pointerId: number;
   startX: number;
   startY: number;
+}
+
+/** Marks the selection box while its press waits for a reload: it is drawn at the pointer, not at the element. */
+export const PRESS_WAITING_ATTR = "data-dom-edit-press-waiting";
+
+/** A press that landed while the preview reloads: it starts once the new preview shows what it pressed. */
+export interface WaitingPressState {
+  pointerId: number;
+  startX: number;
+  startY: number;
+  draw: ((dx: number, dy: number) => void) | null;
+  frame: number;
+  moved: React.PointerEvent<HTMLDivElement> | null;
+  released: React.PointerEvent<HTMLDivElement> | null;
+  after: WaitingPressState | null;
+  ended: boolean;
 }
 
 export type FocusableDomEditOverlay = {
@@ -245,6 +264,7 @@ export interface DomEditGroupPathOffsetCommit {
 
 // Refs are stable across renders; values are read via .current.
 export type UseDomEditOverlayGesturesOptions = {
+  activeCompositionPathRef: RefObject<string | null>;
   overlayRef: RefObject<HTMLDivElement | null>;
   iframeRef: RefObject<HTMLIFrameElement | null>;
   boxRef: RefObject<HTMLDivElement | null>;
@@ -255,6 +275,7 @@ export type UseDomEditOverlayGesturesOptions = {
   gestureRef: RefObject<GestureState | null>;
   groupGestureRef: RefObject<GroupGestureState | null>;
   blockedMoveRef: RefObject<BlockedMoveState | null>;
+  waitingPressRef: RefObject<WaitingPressState | null>;
   rafPausedRef: RefObject<boolean>;
   suppressNextBoxClickRef: RefObject<boolean>;
   setOverlayRect: (next: OverlayRect | null) => void;
@@ -292,3 +313,13 @@ export type UseDomEditOverlayGesturesOptions = {
   onCanvasMouseDown: (e: React.MouseEvent<HTMLDivElement>, o?: PreviewMouseDownOptions) => void;
   snapGuidesRef: RefObject<SnapGuidesState | null>;
 };
+
+export function isDomEditGestureTap(
+  g: { startX: number; startY: number; travelled?: boolean },
+  e: React.PointerEvent,
+) {
+  return (
+    !g.travelled &&
+    Math.hypot(e.clientX - g.startX, e.clientY - g.startY) < BLOCKED_MOVE_THRESHOLD_PX
+  );
+}

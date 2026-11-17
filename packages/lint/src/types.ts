@@ -40,7 +40,21 @@ export type HyperframeLintResult = {
 export type HyperframeLinterOptions = {
   filePath?: string;
   isSubComposition?: boolean;
-  externalStyles?: Array<{ href: string; content: string; file?: string }>;
+  compSrcPath?: string;
+  externalStyles?: Array<{
+    href: string;
+    content: string;
+    file?: string;
+    rootRelativePath?: string;
+  }>;
+  externalScripts?: Array<{
+    src: string;
+    attrs: string;
+    content: string;
+    file: string;
+    rootRelativePath: string;
+  }>;
+  scriptsOutsideProjectUnread?: string[];
   /**
    * Set to `true` when linting compositions destined for distributed / Lambda
    * rendering, where system-font capture (`allowSystemFontCapture`) is
@@ -49,6 +63,7 @@ export type HyperframeLinterOptions = {
    * render time — the font will silently fall back to whatever the OS provides.
    */
   distributed?: boolean;
+  projectFontFamilies?: string[];
   /** Who is running the lint: Studio raises the structure rules to errors, the CLI keeps them warnings. */
   host?: "studio" | "cli";
 };

@@ -9,6 +9,12 @@ Thanks for your interest in contributing to Hyperframes! This guide will help yo
 3. Install dependencies: `bun install`
 4. Create a branch: `git checkout -b my-feature`
 
+The published skill source lives in `skills/`. To install skills while working in
+this checkout, use `npx hyperframes skills update`, which installs globally. Run
+project-local `npx skills add ...` from a separate video project: its destination
+can overlap `skills/` and overwrite uncommitted changes. The repo-native skills in
+`.claude/skills/` and `.agents/skills/` are already included in the checkout.
+
 ## Choosing work
 
 Start with [available newcomer issues](https://github.com/heygen-com/hyperframes/issues?q=is%3Aissue+is%3Aopen+label%3A%22good+first+issue%22+no%3Aassignee) or [help-wanted issues](https://github.com/heygen-com/hyperframes/issues?q=is%3Aissue+is%3Aopen+label%3A%22help+wanted%22+no%3Aassignee). Read the discussion and check existing PRs before starting; an unassigned issue may already have work in progress. Comment with your intended approach and coordinate a claim with a maintainer.
@@ -136,7 +142,7 @@ before merge, listed at the end.
 1. Create `registry/<blocks|components>/<name>/registry-item.json` following the [schema](packages/core/schemas/registry-item.json)
 2. For components: include a `demo.html`
 3. Run `npx hyperframes lint` and `npx hyperframes validate` on your HTML
-4. Test the install flow: `hyperframes add <name> --dir /tmp/test-project`
+4. Test the install flow: `hyperframes init /tmp/test-project`, then `hyperframes add <name> --dir /tmp/test-project`
 5. Generate and validate the catalog: `bun run check:catalog-drift`
 
 ### Generated catalog files
@@ -180,8 +186,13 @@ the item PR if you cannot upload its hosted image.
 ## Pull Requests
 
 - Use [conventional commit](https://www.conventionalcommits.org/) format for **all commits** (e.g., `feat: add timeline export`, `fix: resolve seek overflow`). Enforced by a git hook.
+- Every commit must have a verified signature. Configure GPG or SSH signing with [GitHub's commit-signing guide](https://docs.github.com/en/authentication/managing-commit-signature-verification/signing-commits), use `git commit -S`, and check that GitHub marks the commit **Verified**.
 - CI must pass before merge (build, typecheck, tests, semantic PR title)
-- PRs require at least 1 approval
+- PRs require at least one approving review from a maintainer with write access.
+
+For a single unsigned commit on your own PR branch, sign it with `git commit --amend --no-edit -S`, then update the branch with `git push --force-with-lease`. If the branch has multiple unsigned commits, each needs signing; amending only the last one leaves the others unsigned.
+
+Fork PRs may show **Workflows awaiting approval** before CI runs. A repository maintainer must [approve those workflow runs](https://docs.github.com/en/actions/how-tos/manage-workflow-runs/approve-runs-from-forks); pending checks at this stage do not indicate a test failure. An approving PR review is a separate requirement.
 
 ## Packages
 

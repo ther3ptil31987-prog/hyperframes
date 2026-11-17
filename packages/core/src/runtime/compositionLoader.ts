@@ -1,11 +1,15 @@
+import { rawCssUrlMatches, replaceMatches } from "@hyperframes/parsers/css-url-scans";
+import { findSceneTemplate } from "@hyperframes/parsers/sub-composition-validity";
+import { wallClearTimeout, wallSetTimeout } from "./wallClock";
 import {
   SVG_REFERENCE_ALIASES_ATTR,
   readSvgReferenceAliases,
   refreshSvgSelectorAliases,
 } from "../compiler/svgSelectorAliases";
 import {
+  countPageRoot,
   planCompositionAssembly,
-  EXTRACTED_COMPOSITION_ASSET_SELECTOR,
+  extractedCompositionAssets,
 } from "../compiler/compositionAssembly";
 import {
   scopeCssToComposition,
@@ -16,9 +20,11 @@ import { parseImportMap } from "../compiler/importMaps";
 import { hasSameLink } from "../compiler/scriptRuns";
 import {
   namespaceCollidingSvgIds,
+  sceneClipRoots,
   rewriteSvgIdReferencesInCss,
 } from "../compiler/svgIdNamespacing";
 import { waitForFonts } from "./afterFonts";
+import { applyTextBindings } from "./applyVariableBindings";
 import { parseLayoutDimension } from "./compositionDimension";
 import { markFlattenedInnerRoot } from "./flattenedRoot";
 import {
@@ -70,7 +76,6 @@ type PendingScript =
 
 const EXTERNAL_SCRIPT_LOAD_TIMEOUT_MS = 8000;
 const BARE_RELATIVE_PATH_RE = /^(?![a-zA-Z][a-zA-Z\d+\-.]*:)(?!\/\/)(?!\/)(?!\.\.?\/).+/;
-const CSS_URL_RE = /\burl\(\s*(["']?)([^)"']+)\1\s*\)/g;
 const PATH_ATTRS = ["src", "href"] as const;
 
 /**
@@ -124,7 +129,7 @@ function rewriteRuntimeAssetPath(value: string, compositionUrl: URL | null): str
 
 function rewriteRuntimeCssAssetUrls(cssText: string, compositionUrl: URL | null): string {
   if (!compositionUrl || !cssText) return cssText;
-  return cssText.replace(CSS_URL_RE, (full, quote: string, rawUrl: string) => {
+  return replaceMatches(cssText, rawCssUrlMatches(cssText), (full, quote, rawUrl) => {
     const rewritten = rewriteRuntimeAssetPath(rawUrl || "", compositionUrl);
     if (rewritten === rawUrl) return full;
     return `url(${quote || ""}${rewritten}${quote || ""})`;
@@ -182,6 +187,11 @@ function rewriteSubCompositionAssetPaths(root: ParentNode, compositionUrl: URL |
   }
 }
 
+function sceneOrFirstTemplate(doc: Document): HTMLTemplateElement | null {
+  const templates = Array.from(doc.querySelectorAll<HTMLTemplateElement>("template"));
+  return findSceneTemplate(templates) ?? templates[0] ?? null;
+}
+
 function uniqueCompositionId(baseId: string, index: number): string {
   return `${baseId}__hf${index}`;
 }
@@ -192,12 +202,12 @@ const waitForExternalScriptLoad = (
   new Promise((resolve) => {
     let settled = false;
     const startedAt = Date.now();
-    let timeoutId: number | null = null;
+    let timeoutId: ReturnType<typeof wallSetTimeout> | null = null;
     const settle = (status: "load" | "error" | "timeout") => {
       if (settled) return;
       settled = true;
       if (timeoutId != null) {
-        window.clearTimeout(timeoutId);
+        wallClearTimeout(timeoutId);
       }
       resolve({
         status,
@@ -206,7 +216,7 @@ const waitForExternalScriptLoad = (
     };
     scriptEl.addEventListener("load", () => settle("load"), { once: true });
     scriptEl.addEventListener("error", () => settle("error"), { once: true });
-    timeoutId = window.setTimeout(() => settle("timeout"), EXTERNAL_SCRIPT_LOAD_TIMEOUT_MS);
+    timeoutId = wallSetTimeout(() => settle("timeout"), EXTERNAL_SCRIPT_LOAD_TIMEOUT_MS);
   });
 
 function resetCompositionHost(host: Element) {
@@ -225,7 +235,7 @@ function resetCompositionHost(host: Element) {
  * inline-template path, and mutating it would leave a remount with no styles.
  */
 function stripExtractedCompositionAssets(node: ParentNode): void {
-  for (const el of Array.from(node.querySelectorAll(EXTRACTED_COMPOSITION_ASSET_SELECTOR))) {
+  for (const el of extractedCompositionAssets(node)) {
     el.remove();
   }
 }
@@ -300,6 +310,7 @@ function countAuthoredCompositionIds(hosts: Element[]): Map<string, number> {
     if (!compId) continue;
     hostCountsByCompositionId.set(compId, (hostCountsByCompositionId.get(compId) || 0) + 1);
   }
+  countPageRoot(hostCountsByCompositionId, hosts);
   return hostCountsByCompositionId;
 }
 
@@ -477,7 +488,9 @@ async function mountCompositionContent(params: {
   // `querySelector('[data-composition-id="..."]')`.
   const scriptScopeCompositionId = plan.scriptCompositionId;
   // No fallback to the authored id: an anonymous host has no runtime id, and
-  // the compiler emits no runtime scope selector and no variable table for one.
+  // the compiler emits no runtime scope selector for one. (Its declared
+  // defaults are keyed by the authored id its restored wrapper carries — see
+  // inlineSubCompositions — which is also the scope variableScope.ts resolves.)
   const runtimeScopeCompositionId = params.runtimeCompositionId || null;
   const authoredRootId = plan.authoredRootId;
   const runtimeScopeSelector = runtimeScopeCompositionId
@@ -579,6 +592,8 @@ async function mountCompositionContent(params: {
     params.host.innerHTML = params.fallbackBodyInnerHtml;
     stripExtractedCompositionAssets(params.host);
   }
+  for (const el of plan.inertScriptsOutsideRoot)
+    params.host.appendChild(document.importNode(el, true));
 
   // Stash the per-instance variables BEFORE running scripts. The scoped
   // `getVariables()` injected by `compositionScoping.ts` reads from
@@ -601,6 +616,7 @@ async function mountCompositionContent(params: {
     runScripts: async () => {
       if (scriptPayloads.length > 0) await waitForFonts();
       if (!isCurrent()) return;
+      applyTextBindings(document, params.host);
       for (const scriptPayload of scriptPayloads) {
         const injectedScript = document.createElement("script");
         if (scriptPayload.type) {
@@ -779,6 +795,9 @@ async function mountExternalCompositions(
             onDiagnostic: params.onDiagnostic,
           });
         }
+        if (!compositionUrl || !/\.html?$/i.test(compositionUrl.pathname)) {
+          throw new Error("data-composition-src must name an .html file");
+        }
         const response = await fetch(src);
         if (!response.ok) {
           throw new Error(`HTTP ${response.status}`);
@@ -793,7 +812,7 @@ async function mountExternalCompositions(
             ? doc.querySelector<HTMLTemplateElement>(
                 `template#${CSS.escape(authoredCompositionId)}-template`,
               )
-            : null) ?? doc.querySelector<HTMLTemplateElement>("template");
+            : null) ?? sceneOrFirstTemplate(doc);
         const sourceNode = template ? template.content : doc.body;
         return await mount({
           host,
@@ -882,9 +901,20 @@ export async function loadCompositions(params: LoadCompositionsParams): Promise<
 
 /** Reuse one finalization set across authored mounting and initial-script discovery. */
 function namespaceMountedSvgIds(
-  mounted: readonly MountedSvgScope[],
+  composed: readonly MountedSvgScope[],
   finalizedIds: Set<Element>,
 ): void {
+  const hosts = composed
+    .filter((scope) => scope.referenceTarget !== "document")
+    .map(({ host }) => host);
+  const mounted: MountedSvgScope[] = [
+    ...composed,
+    ...sceneClipRoots(document, hosts).map((host, index) => ({
+      host,
+      namespace: `clip-${index}`,
+      styles: [],
+    })),
+  ];
   for (const { styles } of mounted) {
     for (const style of styles) {
       const current = style.element.textContent ?? "";

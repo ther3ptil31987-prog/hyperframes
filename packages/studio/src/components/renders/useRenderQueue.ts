@@ -29,9 +29,11 @@ export type ResolutionPreset = CanvasResolution;
 export interface StartRenderOptions {
   fps?: number;
   quality?: "draft" | "standard" | "high";
-  format?: "mp4" | "webm" | "mov";
+  format?: "mp4" | "webm" | "mov" | "gif";
   /** `"auto"` (default) renders at the composition's authored dimensions. */
   resolution?: ResolutionPreset | "auto";
+  gpu?: boolean;
+  gifLoop?: number;
   /**
    * Render a specific composition file. Omit it to render the composition the
    * user currently has open — only the sidebar's per-composition Render button
@@ -234,6 +236,8 @@ export function useRenderQueue(
         resolution?: string;
         composition?: string;
         variables?: Record<string, unknown>;
+        gpu?: boolean;
+        gifLoop?: number;
         telemetryDistinctId?: string;
         telemetryOptOut?: boolean;
       } = {
@@ -258,6 +262,8 @@ export function useRenderQueue(
       }
       if (resolution && resolution !== "auto") body.resolution = resolution;
       if (composition) body.composition = composition;
+      if (opts.gpu) body.gpu = true;
+      if (format === "gif" && opts.gifLoop !== undefined) body.gifLoop = opts.gifLoop;
       if (opts.variables && Object.keys(opts.variables).length > 0) {
         body.variables = opts.variables;
       }
@@ -301,7 +307,12 @@ export function useRenderQueue(
       }
       const { jobId } = await res.json();
 
-      const FORMAT_EXT: Record<string, string> = { mp4: ".mp4", webm: ".webm", mov: ".mov" };
+      const FORMAT_EXT: Record<string, string> = {
+        mp4: ".mp4",
+        webm: ".webm",
+        mov: ".mov",
+        gif: ".gif",
+      };
       const ext = FORMAT_EXT[format] ?? ".mp4";
       const job: RenderJob = {
         id: jobId,
@@ -379,7 +390,7 @@ export function useRenderQueue(
       try {
         const res = await studioApiFetch(`/api/render/${jobId}/cancel`, { method: "POST" });
         if (!res.ok && res.status !== 404) {
-          setActionError("Couldn't cancel on the server — the render may still be running.");
+          setActionError("Couldn't cancel on the server. The render may still be running.");
           return;
         }
         // Reconcile with the status the route reports: if the render actually
@@ -393,7 +404,7 @@ export function useRenderQueue(
           }
         }
       } catch {
-        setActionError("Couldn't reach the server to cancel — the render may still be running.");
+        setActionError("Couldn't reach the server to cancel. The render may still be running.");
       }
     },
     [closeActiveEventSource, loadRenders],
@@ -406,7 +417,7 @@ export function useRenderQueue(
       try {
         const res = await studioApiFetch(`/api/render/${jobId}`, { method: "DELETE" });
         if (!res.ok) {
-          setActionError("Couldn't delete the render — it's still on disk.");
+          setActionError("Couldn't delete the render. It's still on disk.");
           return;
         }
       } catch {

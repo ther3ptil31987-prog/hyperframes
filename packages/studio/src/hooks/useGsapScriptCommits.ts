@@ -1,6 +1,9 @@
 import { useCallback, useMemo, useRef } from "react";
 import { findUnsafeMutationValues } from "@hyperframes/core/studio-api/finite-mutation";
-import { readProjectFileContent as readSharedProjectFileContent } from "../utils/studioFileHistory";
+import {
+  editContextTarget,
+  readProjectFileContent as readSharedProjectFileContent,
+} from "../utils/studioFileHistory";
 import type { DomEditSelection } from "../components/editor/domEditingTypes";
 import { usePlayerStore } from "../player/store/playerStore";
 import {
@@ -45,6 +48,7 @@ import {
   useSafeGsapCommitMutation,
 } from "./useSafeGsapCommitMutation";
 import { requestGsapMutation } from "./gsapMutationClient";
+import { whileScriptWrites } from "../player/previewReloading";
 
 async function mutateGsapScript(
   projectId: string,
@@ -80,7 +84,7 @@ async function runMutationRequest(
 ): Promise<MutationResult | undefined> {
   const unsafeFields = mutations.flatMap((mutation) => findUnsafeMutationValues(mutation));
   if (unsafeFields.length > 0) {
-    showToast?.("Couldn't read element layout — try again at a different playhead time", "error");
+    showToast?.("Couldn't read element layout. Try again at a different playhead time", "error");
     if (options.skipReload) return;
     throw markStudioSaveErrorAlreadyToasted(
       new Error(
@@ -322,12 +326,13 @@ export function useGsapScriptCommits({ projectIdRef, activeCompPath, previewIfra
   // the same animationId so their POSTs can't interleave. Held in a ref so the
   // chain survives re-renders.
   const serializerRef = useRef(createKeyedSerializer());
-  const recordMutationEdit = useCallback(async (targetPath: string, result: MutationResult, options: CommitMutationOptions) => {
+  const recordMutationEdit = useCallback(async (targetPath: string, selection: DomEditSelection, result: MutationResult, options: CommitMutationOptions) => {
     if (result.before == null || result.after == null) return;
     await editHistory.recordEdit({
       label: options.label,
       coalesceKey: options.coalesceKey,
       coalesceMs: options.coalesceMs,
+      targets: [editContextTarget(targetPath, selection)],
       files: { [targetPath]: { before: result.before, after: result.after } },
     });
   }, [editHistory]);
@@ -347,7 +352,7 @@ export function useGsapScriptCommits({ projectIdRef, activeCompPath, previewIfra
       }
       return;
     }
-    await recordMutationEdit(targetPath, result, options);
+    await recordMutationEdit(targetPath, selection, result, options);
     const nestedFiles = await settleNestedReads(
       result.scriptText
         ? readNestedFiles(previewIframeRef.current, result.scriptText, (path) =>
@@ -373,7 +378,7 @@ export function useGsapScriptCommits({ projectIdRef, activeCompPath, previewIfra
     });
   }, [projectIdRef, previewIframeRef, reloadPreview, onCacheInvalidate, onFileContentChanged, forceReloadSdkSession, recordMutationEdit]);
 
-  const runCommit = useCallback(async (pid: string, compositionPath: string | null, targetPath: string, selection: DomEditSelection, mutation: Record<string, unknown>, options: CommitMutationOptions) => {
+  const runCommit = useCallback((pid: string, compositionPath: string | null, targetPath: string, selection: DomEditSelection, mutation: Record<string, unknown>, options: CommitMutationOptions) => whileScriptWrites(async () => {
     const result = await runMutationRequest([mutation], options, showToast, () =>
       mutateGsapScript(pid, "gsap-mutations", targetPath, mutation),
     );
@@ -381,9 +386,9 @@ export function useGsapScriptCommits({ projectIdRef, activeCompPath, previewIfra
     trackKeyframeCommit([mutation], result, options);
     options.onResult?.(result);
     await finalizeSuccessfulMutation(pid, compositionPath, selection, mutation, targetPath, result, options);
-  }, [showToast, finalizeSuccessfulMutation]);
+  }), [showToast, finalizeSuccessfulMutation]);
 
-  const runBatchCommit = useCallback(async (pid: string, compositionPath: string | null, targetPath: string, calls: CommitMutationCall[], options: CommitMutationOptions) => {
+  const runBatchCommit = useCallback((pid: string, compositionPath: string | null, targetPath: string, calls: CommitMutationCall[], options: CommitMutationOptions) => whileScriptWrites(async () => {
     const first = calls[0];
     const last = calls.at(-1);
     if (!first || !last) return;
@@ -402,7 +407,7 @@ export function useGsapScriptCommits({ projectIdRef, activeCompPath, previewIfra
     const { instantPatch: _instantPatch, ...batchOptions } = options;
     const allPatched = instantPatches.length === calls.length;
     await finalizeSuccessfulMutation(pid, compositionPath, last.selection, last.mutation, targetPath, result, allPatched ? { ...batchOptions, instantPatches } : batchOptions);
-  }, [showToast, finalizeSuccessfulMutation]);
+  }), [showToast, finalizeSuccessfulMutation]);
 
   // Every GSAP-script commit is a read-modify-write of one file. Overlapping
   // commits to the SAME file (any op type, any animation) interleave server-side,

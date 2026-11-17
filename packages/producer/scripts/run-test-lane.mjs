@@ -1,4 +1,5 @@
 import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import { discoverProducerTests, PRODUCER_ROOT } from "./test-classification.mjs";
 
 const lane = process.argv[2];
@@ -14,10 +15,13 @@ const tests = discoverProducerTests().filter(
   (test) => test.lane === lane && (!requestedRunner || test.runner === requestedRunner),
 );
 
-function run(args) {
+const noNetwork = new URL("./no-network.mjs", import.meta.url);
+const unit = lane === "unit";
+
+function run(args, env = {}) {
   const result = spawnSync("bun", args, {
     cwd: PRODUCER_ROOT,
-    env: { ...process.env, HYPERFRAMES_TEST_LANE: lane },
+    env: { ...process.env, HYPERFRAMES_TEST_LANE: lane, ...env },
     stdio: "inherit",
   });
   if (result.error) throw result.error;
@@ -25,10 +29,21 @@ function run(args) {
 }
 
 const vitestFiles = tests.filter((test) => test.runner === "vitest").map((test) => test.file);
-if (vitestFiles.length > 0) run(["x", "vitest", "run", ...vitestFiles]);
+const vitestEnv = unit
+  ? { NODE_OPTIONS: `${process.env.NODE_OPTIONS ?? ""} --import ${noNetwork.href}`.trim() }
+  : {};
+// Files that start many Chromes at once run alone, after the rest and one file at a time: next to
+// them, the Chrome node-count assertions in coreRuntimeBrowser.test.ts see a different
+// garbage-collection schedule.
+const runsAlone = (file) =>
+  /(^|\/)blur(Differential|Chunks)[^/]*\.integration\.test\.ts$/.test(file);
+const shared = vitestFiles.filter((file) => !runsAlone(file));
+const alone = vitestFiles.filter(runsAlone);
+if (shared.length > 0) run(["x", "vitest", "run", ...shared], vitestEnv);
+if (alone.length > 0) run(["x", "vitest", "run", "--no-file-parallelism", ...alone], vitestEnv);
 
 // Bun's mock.module registry is process-global. Run each file in a fresh
 // process so mocks from one source test cannot mutate another test's imports.
 for (const test of tests.filter((entry) => entry.runner === "bun")) {
-  run(["test", test.file]);
+  run(["test", ...(unit ? ["--preload", fileURLToPath(noNetwork)] : []), test.file]);
 }

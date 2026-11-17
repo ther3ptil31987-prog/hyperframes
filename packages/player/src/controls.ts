@@ -4,6 +4,8 @@ import {
   VOLUME_HIGH_ICON,
   VOLUME_LOW_ICON,
   VOLUME_MUTED_ICON,
+  FULLSCREEN_ENTER_ICON,
+  FULLSCREEN_EXIT_ICON,
 } from "./styles.js";
 
 export interface ControlsCallbacks {
@@ -48,6 +50,31 @@ export function formatTime(seconds: number): string {
   const m = Math.floor(s / 60);
   const sec = s % 60;
   return `${m}:${sec.toString().padStart(2, "0")}`;
+}
+
+function createFullscreenButton(
+  host: HTMLElement,
+): { button: HTMLButtonElement; destroy: () => void } | null {
+  if (!document.fullscreenEnabled) return null;
+  const button = document.createElement("button");
+  button.className = "hfp-fullscreen-btn";
+  button.type = "button";
+  const render = () => {
+    const active = host.matches(":fullscreen");
+    button.innerHTML = active ? FULLSCREEN_EXIT_ICON : FULLSCREEN_ENTER_ICON;
+    button.setAttribute("aria-label", active ? "Exit full screen" : "Full screen");
+  };
+  button.addEventListener("click", (e) => {
+    e.stopPropagation();
+    const change = host.matches(":fullscreen")
+      ? document.exitFullscreen()
+      : host.requestFullscreen();
+    // A refusal also fires fullscreenerror at the player, where the page can observe it.
+    change.catch(() => {});
+  });
+  document.addEventListener("fullscreenchange", render);
+  render();
+  return { button, destroy: () => document.removeEventListener("fullscreenchange", render) };
 }
 
 export function createControls(
@@ -101,7 +128,7 @@ export function createControls(
   speedBtn.className = "hfp-speed-btn";
   speedBtn.type = "button";
   speedBtn.textContent = "1x";
-  speedBtn.setAttribute("aria-label", "Playback speed");
+  speedBtn.setAttribute("aria-label", "Playback speed: 1x");
 
   const speedMenu = document.createElement("div");
   speedMenu.className = "hfp-speed-menu";
@@ -273,6 +300,7 @@ export function createControls(
     const newSpeed = parseFloat(target.dataset.speed!);
     speedIndex = presets.indexOf(newSpeed);
     speedBtn.textContent = formatSpeed(newSpeed);
+    speedBtn.setAttribute("aria-label", `Playback speed: ${formatSpeed(newSpeed)}`);
     setActiveOption(newSpeed);
     speedMenu.classList.remove("hfp-open");
     speedBtn.setAttribute("aria-expanded", "false");
@@ -337,22 +365,27 @@ export function createControls(
   document.addEventListener("touchmove", onTouchMove, { passive: true });
   document.addEventListener("touchend", onTouchEnd);
 
-  const startHideTimer = () => {
+  const canHide = () =>
+    isPlaying && !scrubbing && !volumeScrubbing && !controls.querySelector(":focus-visible");
+
+  const reveal = () => {
+    controls.classList.remove("hfp-hidden");
     if (hideTimeout) clearTimeout(hideTimeout);
     hideTimeout = setTimeout(() => {
-      if (isPlaying) controls.classList.add("hfp-hidden");
+      if (canHide()) controls.classList.add("hfp-hidden");
     }, 3000);
   };
 
   const host = parent instanceof ShadowRoot ? (parent.host as HTMLElement) : parent;
-  const onHostMouseMove = () => {
-    controls.classList.remove("hfp-hidden");
-    startHideTimer();
-  };
+  const fullscreen = createFullscreenButton(host);
+  if (fullscreen) controls.appendChild(fullscreen.button);
+  const onHostActivity = () => reveal();
   const onHostMouseLeave = () => {
-    if (isPlaying) controls.classList.add("hfp-hidden");
+    if (canHide()) controls.classList.add("hfp-hidden");
   };
-  host.addEventListener("mousemove", onHostMouseMove);
+  host.addEventListener("mousemove", onHostActivity);
+  host.addEventListener("keydown", onHostActivity);
+  host.addEventListener("focusin", onHostActivity);
   host.addEventListener("mouseleave", onHostMouseLeave);
 
   return {
@@ -364,16 +397,20 @@ export function createControls(
       time.textContent = `${formatTime(clampedCurrent)} / ${formatTime(duration)}`;
     },
     updatePlaying(playing: boolean) {
+      const changed = playing !== isPlaying;
       isPlaying = playing;
       playBtn.classList.toggle("hfp-playing", playing);
       playBtn.setAttribute("aria-label", playing ? "Pause" : "Play");
-      if (playing) startHideTimer();
-      else controls.classList.remove("hfp-hidden");
+      if (!playing) {
+        if (hideTimeout) clearTimeout(hideTimeout);
+        controls.classList.remove("hfp-hidden");
+      } else if (changed) reveal();
     },
     updateSpeed(speed: number) {
       const idx = presets.indexOf(speed);
       if (idx !== -1) speedIndex = idx;
       speedBtn.textContent = formatSpeed(speed);
+      speedBtn.setAttribute("aria-label", `Playback speed: ${formatSpeed(speed)}`);
       setActiveOption(speed);
     },
     updateMuted(muted: boolean) {
@@ -406,9 +443,12 @@ export function createControls(
       document.removeEventListener("touchmove", onVolumeTouchMove);
       document.removeEventListener("touchend", onVolumeTouchEnd);
       document.removeEventListener("click", onDocClick);
-      host.removeEventListener("mousemove", onHostMouseMove);
+      host.removeEventListener("mousemove", onHostActivity);
+      host.removeEventListener("keydown", onHostActivity);
+      host.removeEventListener("focusin", onHostActivity);
       host.removeEventListener("mouseleave", onHostMouseLeave);
       if (hideTimeout) clearTimeout(hideTimeout);
+      fullscreen?.destroy();
       controls.remove();
     },
   };

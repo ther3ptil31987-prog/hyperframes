@@ -6,6 +6,8 @@ import {
   STUDIO_ROTATION_PROP,
   STUDIO_PATH_OFFSET_ATTR,
   STUDIO_MANUAL_EDIT_GESTURE_ATTR,
+  STUDIO_EDIT_MOMENT_ATTR,
+  type EditMoment,
   STUDIO_BOX_SIZE_ATTR,
   STUDIO_ROTATION_ATTR,
   STUDIO_ORIGINAL_TRANSLATE_ATTR,
@@ -34,7 +36,7 @@ import {
 } from "./manualEditsTypes";
 import { gsapWritesChannels } from "../../hooks/gsapRuntimeKeyframes";
 import { splitTopLevelWhitespace } from "./manualEditsStyleHelpers";
-import { roundTo3, roundToLayoutPx } from "../../utils/rounding";
+import { roundTo3, roundToLayoutSize } from "../../utils/rounding";
 import { BOX_SIZE_STYLE_PROPS } from "./manualEditsDomPatches";
 
 /* ── Gesture tracking ─────────────────────────────────────────────── */
@@ -52,10 +54,13 @@ const GESTURE_DRAWS: Record<StudioGestureDraws, readonly string[]> = {
 export function beginStudioManualEditGesture(
   element: HTMLElement,
   draws: StudioGestureDraws,
+  at?: EditMoment,
 ): string {
   studioManualEditGestureId += 1;
   const token = `gesture-${studioManualEditGestureId}:${draws}`;
   element.setAttribute(STUDIO_MANUAL_EDIT_GESTURE_ATTR, token);
+  if (at) element.setAttribute(STUDIO_EDIT_MOMENT_ATTR, JSON.stringify(at));
+  else element.removeAttribute(STUDIO_EDIT_MOMENT_ATTR);
   return token;
 }
 
@@ -65,6 +70,7 @@ export function endStudioManualEditGesture(element: HTMLElement, token?: string)
   if (token && element.getAttribute(STUDIO_MANUAL_EDIT_GESTURE_ATTR) !== token) return;
   if (!element.hasAttribute(STUDIO_MANUAL_EDIT_GESTURE_ATTR)) return;
   element.removeAttribute(STUDIO_MANUAL_EDIT_GESTURE_ATTR);
+  element.removeAttribute(STUDIO_EDIT_MOMENT_ATTR);
   const doc = element.ownerDocument;
   doc.dispatchEvent(new (doc.defaultView?.Event ?? Event)(GESTURE_ENDED));
 }
@@ -132,13 +138,7 @@ export function readStudioPathOffset(element: HTMLElement): { x: number; y: numb
   };
 }
 
-/**
- * The path offset ACTUALLY applied right now. The `--hf-studio-offset` vars can
- * linger after GSAP re-bakes the element's transform (`translate:"none"`), so the
- * raw var isn't a safe drag base — using it re-commits a phantom offset and flings
- * the element off-screen. The offset only counts when the inline `translate` is the
- * studio var-translate; otherwise it's dormant and the applied offset is zero.
- */
+// GSAP can leave dormant offset vars behind; only the live var-translate counts.
 export function readAppliedStudioPathOffset(element: HTMLElement): { x: number; y: number } {
   return (element.style.translate || "").includes(STUDIO_OFFSET_X_PROP)
     ? readStudioPathOffset(element)
@@ -402,7 +402,7 @@ function readParentFlexBasisPixels(
   if (display !== "flex" && display !== "inline-flex") return null;
 
   const direction = readStyleOrComputed(parent, "flex-direction").trim();
-  return roundToLayoutPx(Math.max(1, direction.startsWith("column") ? size.height : size.width));
+  return direction.startsWith("column") ? size.height : size.width;
 }
 
 function restoreStaleStudioScaleResize(element: HTMLElement): void {
@@ -477,22 +477,21 @@ function writeStudioBoxSizeVars(
   }
 
   element.setAttribute(STUDIO_BOX_SIZE_ATTR, "true");
-  element.style.setProperty(STUDIO_WIDTH_PROP, `${roundToLayoutPx(Math.max(1, size.width))}px`);
-  element.style.setProperty(STUDIO_HEIGHT_PROP, `${roundToLayoutPx(Math.max(1, size.height))}px`);
+  element.style.setProperty(STUDIO_WIDTH_PROP, `${size.width}px`);
+  element.style.setProperty(STUDIO_HEIGHT_PROP, `${size.height}px`);
 }
 
 function applyStudioBoxSizeDimensions(
   element: HTMLElement,
-  size: { width: number; height: number },
-): void {
+  wantedSize: { width: number; height: number },
+): { width: number; height: number } {
+  const size = roundToLayoutSize(wantedSize);
   writeStudioBoxSizeVars(element, size);
   restoreStaleStudioScaleResize(element);
 
-  const width = roundToLayoutPx(Math.max(1, size.width));
-  const height = roundToLayoutPx(Math.max(1, size.height));
   element.style.setProperty("box-sizing", "border-box");
-  element.style.setProperty("width", `${width}px`);
-  element.style.setProperty("height", `${height}px`);
+  element.style.setProperty("width", `${size.width}px`);
+  element.style.setProperty("height", `${size.height}px`);
   element.style.setProperty("min-width", "0px");
   element.style.setProperty("min-height", "0px");
   element.style.setProperty("max-width", "none");
@@ -507,6 +506,7 @@ function applyStudioBoxSizeDimensions(
   if (computedDisplay === "inline") {
     element.style.setProperty("display", "inline-block");
   }
+  return size;
 }
 
 export function applyStudioBoxSize(
@@ -533,12 +533,12 @@ export function forgetStudioBoxSizeDraftBase(element: HTMLElement): void {
 export function applyStudioBoxSizeDraft(
   element: HTMLElement,
   size: { width: number; height: number },
-): void {
+): { width: number; height: number } {
   if (!boxSizeDraftBases.has(element)) {
     boxSizeDraftBases.set(element, { width: element.offsetWidth, height: element.offsetHeight });
   }
   promoteInlineForTransform(element);
-  applyStudioBoxSizeDimensions(element, size);
+  return applyStudioBoxSizeDimensions(element, size);
 }
 
 /* ── Rotation apply ───────────────────────────────────────────────── */

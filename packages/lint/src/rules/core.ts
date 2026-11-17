@@ -1,10 +1,19 @@
+import {
+  blockComments,
+  hasInvalidScriptClose,
+  htmlTagTracker,
+  protectedBlockRanges,
+  styleTagTokens,
+} from "../linearScans";
 import type { LintContext, HyperframeLintFinding } from "../context";
 import postcss from "postcss";
+import { styleRoot } from "../styleRoots";
 import selectorParser from "postcss-selector-parser";
+import { GLSL_SCRIPT_TYPES } from "../shaderDomains";
 import {
-  HTML_BODY_CSS_WIDTH_FIRST_RE,
-  HTML_BODY_CSS_HEIGHT_FIRST_RE,
-  VIEWPORT_META_SIZE_RE,
+  matchHtmlBodyCssWidthFirst,
+  matchHtmlBodyCssHeightFirst,
+  matchViewportMetaSize,
 } from "@hyperframes/parsers/composition";
 import {
   readAttr,
@@ -12,6 +21,7 @@ import {
   truncateSnippet,
   stripJsComments,
   stripStringLiterals,
+  blankInlinedGsapLibrary,
   extractCompositionIdsFromCss,
   extractTimelineRegistryKeys,
   getInlineScriptSyntaxError,
@@ -19,8 +29,15 @@ import {
   TIMELINE_REGISTRY_INIT_PATTERN,
   TIMELINE_REGISTRY_ASSIGN_PATTERN,
   TIMELINE_REGISTRY_OBJECT_LITERAL_PATTERN,
-  INVALID_SCRIPT_CLOSE_PATTERN,
 } from "../utils";
+
+const SCRIPT_SYNTAX_EXEMPT_TYPES = new Set([
+  "application/json",
+  "application/hyperframes-slideshow+json",
+  "importmap",
+  "module",
+  ...GLSL_SCRIPT_TYPES,
+]);
 
 function repeatedDescendantId(selector: string): string | null {
   let repeated: string | null = null;
@@ -106,7 +123,7 @@ function digitIdsTargetedBySelectors(
   const ids = new Set<string>();
   for (const style of styles) {
     try {
-      postcss.parse(style.content).walkRules((rule) => {
+      styleRoot(style).walkRules((rule) => {
         for (const selector of rule.selectors) addUnescapedDigitIds(selector, ids);
       });
     } catch {
@@ -184,6 +201,20 @@ function selectorAliasesRuntimeHiddenStyle(selector: string): boolean {
     return false;
   }
   return unsafe;
+}
+
+function selectsOnInlineStyle(selector: string): boolean {
+  let found = false;
+  try {
+    selectorParser((root) => {
+      root.walkAttributes((node) => {
+        if (node.attribute.toLowerCase() === "style") found = true;
+      });
+    }).processSync(selector);
+  } catch {
+    return false;
+  }
+  return found;
 }
 
 const POSITION_PROPERTIES = new Set(["left", "top", "right", "bottom", "inset"]);
@@ -329,55 +360,15 @@ function describeStudioElement(tag: { raw: string; name: string }): string {
   return parts.join("");
 }
 
-const VISIBLE_MARKUP_COMMENT_PATTERN = /\/\*[\s\S]*?\*\//g;
-const VISIBLE_MARKUP_COMMENT_PROTECTED_BLOCK_PATTERN =
-  /<(style|script|template|title|noscript|pre|code|textarea|text)\b[^>]*>[\s\S]*?<\/\1(?:\s[^>]*)?>/gi;
-
-interface SourceRange {
-  start: number;
-  end: number;
-}
-
-function findProtectedVisibleMarkupRanges(source: string): SourceRange[] {
-  const ranges: SourceRange[] = [];
-  for (const match of source.matchAll(VISIBLE_MARKUP_COMMENT_PROTECTED_BLOCK_PATTERN)) {
-    ranges.push({ start: match.index, end: match.index + match[0].length });
-  }
-  return ranges;
-}
-
-function isInsideSourceRange(index: number, ranges: SourceRange[]): boolean {
-  return ranges.some((range) => range.start <= index && index < range.end);
-}
-
-function isInsideHtmlTag(source: string, index: number): boolean {
-  let inTag = false;
-  let quote: '"' | "'" | null = null;
-  for (let i = 0; i < index; i++) {
-    const char = source[i];
-    if (!inTag) {
-      if (char === "<") inTag = true;
-      continue;
-    }
-    if (quote) {
-      if (char === quote) quote = null;
-      continue;
-    }
-    if (char === '"' || char === "'") {
-      quote = char;
-    } else if (char === ">") {
-      inTag = false;
-    }
-  }
-  return inTag;
-}
-
 function findVisibleMarkupCommentLeak(source: string): string | null {
-  const protectedRanges = findProtectedVisibleMarkupRanges(source);
-  for (const match of source.matchAll(VISIBLE_MARKUP_COMMENT_PATTERN)) {
-    if (isInsideHtmlTag(source, match.index)) continue;
-    if (isInsideSourceRange(match.index, protectedRanges)) continue;
-    return match[0];
+  const protectedRanges = protectedBlockRanges(source);
+  const insideHtmlTag = htmlTagTracker(source);
+  let range = 0;
+  for (const comment of blockComments(source)) {
+    if (insideHtmlTag(comment.index)) continue;
+    while (protectedRanges[range] && protectedRanges[range]!.end <= comment.index) range++;
+    if ((protectedRanges[range]?.start ?? Infinity) <= comment.index) continue;
+    return comment.text;
   }
   return null;
 }
@@ -387,12 +378,12 @@ type ScaffoldSize = { width: string; height: string };
 // Groups 1 and 3 are prefix text for applyResolutionPreset's in-place
 // replace; lint only reads the digit groups (2 and 4).
 function readHtmlBodyCssSize(source: string): ScaffoldSize | null {
-  const widthFirst = source.match(HTML_BODY_CSS_WIDTH_FIRST_RE);
+  const widthFirst = matchHtmlBodyCssWidthFirst(source);
   if (widthFirst) {
     const [, , width = "", , height = ""] = widthFirst;
     return { width, height };
   }
-  const heightFirst = source.match(HTML_BODY_CSS_HEIGHT_FIRST_RE);
+  const heightFirst = matchHtmlBodyCssHeightFirst(source);
   if (heightFirst) {
     const [, , height = "", , width = ""] = heightFirst;
     return { width, height };
@@ -401,7 +392,7 @@ function readHtmlBodyCssSize(source: string): ScaffoldSize | null {
 }
 
 function readViewportMetaSize(source: string): ScaffoldSize | null {
-  const match = source.match(VIEWPORT_META_SIZE_RE);
+  const match = matchViewportMetaSize(source);
   if (!match) return null;
   const [, , width = "", , height = ""] = match;
   return { width, height };
@@ -441,7 +432,7 @@ function describeRootDimensionsDrift(
   const declared = `Root composition declares data-width="${dataWidth}" data-height="${dataHeight}"`;
   if (!bodyCssMismatch) {
     return {
-      message: `${declared}, but ${viewportMismatch}. The viewport meta has no effect on capture — the renderer sizes the viewport from the root's own data-width/data-height — so this is stale metadata, not a clipping risk.`,
+      message: `${declared}, but ${viewportMismatch}. The viewport meta has no effect on capture (the renderer sizes the viewport from the root's own data-width/data-height), so this is stale metadata, not a clipping risk.`,
       fixHint:
         "update the meta viewport to match, or scaffold with `hyperframes init --resolution portrait`",
     };
@@ -483,7 +474,7 @@ export const coreRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = [
 
   // root_missing_composition_id + root_missing_dimensions
   // fallow-ignore-next-line complexity
-  ({ rootTag }) => {
+  ({ rootTag, options }) => {
     const findings: HyperframeLintFinding[] = [];
     if (!rootTag || !readDecodedAttr(rootTag.raw, "data-composition-id")) {
       findings.push({
@@ -495,7 +486,10 @@ export const coreRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = [
         snippet: truncateSnippet(rootTag?.raw || ""),
       });
     }
-    if (!rootTag || !readAttr(rootTag.raw, "data-width") || !readAttr(rootTag.raw, "data-height")) {
+    if (
+      !options.isSubComposition &&
+      (!rootTag || !readAttr(rootTag.raw, "data-width") || !readAttr(rootTag.raw, "data-height"))
+    ) {
       findings.push({
         code: "root_missing_dimensions",
         severity: "error",
@@ -549,14 +543,10 @@ export const coreRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = [
     let opens = 0;
     let closes = 0;
     let firstTag = "";
-    for (const match of source.matchAll(
-      /<script\b[\s\S]*?<\/script[^>]*>|<style\b|<\/style\s*>/gi,
-    )) {
-      const token = match[0].toLowerCase();
-      if (token.startsWith("<script")) continue;
-      if (token.startsWith("</style")) closes += 1;
+    for (const tag of styleTagTokens(source)) {
+      if (tag.toLowerCase().startsWith("</style")) closes += 1;
       else opens += 1;
-      if (!firstTag) firstTag = match[0];
+      if (!firstTag) firstTag = tag;
     }
     if (opens === closes) return [];
     return [
@@ -598,11 +588,16 @@ export const coreRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = [
       return [];
     }
     if (/(?:^|\s)data-no-timeline(?=[\s=/]|$)/i.test(rootTag?.attrs || "")) return [];
+    if (options.scriptsOutsideProjectUnread?.length) return [];
     const findings: HyperframeLintFinding[] = [];
+    const registered = [source, ...(options.externalScripts ?? []).map((script) => script.content)];
     if (
-      !TIMELINE_REGISTRY_INIT_PATTERN.test(source) &&
-      !TIMELINE_REGISTRY_ASSIGN_PATTERN.test(source) &&
-      !TIMELINE_REGISTRY_OBJECT_LITERAL_PATTERN.test(source)
+      !registered.some(
+        (text) =>
+          TIMELINE_REGISTRY_INIT_PATTERN.test(text) ||
+          TIMELINE_REGISTRY_ASSIGN_PATTERN.test(text) ||
+          TIMELINE_REGISTRY_OBJECT_LITERAL_PATTERN.test(text),
+      )
     ) {
       findings.push({
         code: "missing_timeline_registry",
@@ -654,7 +649,7 @@ export const coreRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = [
       if (!/transition/i.test(style.content)) continue;
       let root: postcss.Root;
       try {
-        root = postcss.parse(style.content);
+        root = styleRoot(style);
       } catch {
         // The CSS syntax rule reports malformed style blocks separately.
         continue;
@@ -700,11 +695,12 @@ export const coreRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = [
     const findings: HyperframeLintFinding[] = [];
     const reportedRepeatedIds = new Set<string>();
     const reportedHiddenStyleSelectors = new Set<string>();
+    const reportedInlineStyleSelectors = new Set<string>();
     const reportedReducedIdSelectors = new Set<string>();
     for (const style of styles) {
       let root: postcss.Root;
       try {
-        root = postcss.parse(style.content);
+        root = styleRoot(style);
       } catch (error) {
         findings.push({
           ...locate(
@@ -716,6 +712,8 @@ export const coreRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = [
           code: "css_parse_error",
           severity: "error",
           message: `CSS parse error: ${error instanceof Error ? error.message : "unknown"}`,
+          fixHint:
+            "Check the CSS at the reported line for an unclosed brace, quote, or comment, or a missing semicolon between declarations.",
         });
         continue;
       }
@@ -735,6 +733,23 @@ export const coreRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = [
             });
           }
 
+          if (!reportedInlineStyleSelectors.has(selector) && selectsOnInlineStyle(selector)) {
+            reportedInlineStyleSelectors.add(selector);
+            findings.push({
+              code: "inline_style_attribute_selector",
+              severity: "error",
+              message:
+                `Selector "${selector}" reads the inline \`style\` attribute. GSAP writes inline styles every ` +
+                "frame, and each write then restyles far more than the animated element, " +
+                "so the preview slows to a crawl.",
+              selector,
+              fixHint:
+                "Let the runtime hide hidden clips; it already hides their contents. For a state of your own, " +
+                "toggle a class or data attribute from your script and select on that.",
+              snippet: truncateSnippet(rule.toString()),
+            });
+          }
+
           if (
             !forcesOpacityZero ||
             reportedHiddenStyleSelectors.has(selector) ||
@@ -749,7 +764,8 @@ export const coreRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = [
             message: `Selector "${selector}" observes HyperFrames' runtime-owned hidden style and forces opacity to zero. The renderer hides each native video before copying its computed opacity to the visible replacement frame, so this rule makes both transparent.`,
             selector,
             fixHint:
-              'Restrict the guard to sub-composition hosts, for example `[data-composition-src][style*="visibility: hidden"]` and `[data-composition-file][style*="visibility: hidden"]`. Do not derive arbitrary element or media opacity from runtime-owned inline visibility.',
+              "Remove this rule; the runtime already hides a hidden clip and its contents. To fade or hide something " +
+              "yourself, animate it on the timeline, or toggle a class or data attribute and select on that.",
             snippet: truncateSnippet(rule.toString()),
           });
         }
@@ -766,7 +782,7 @@ export const coreRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = [
       findings.push({
         code: "unclosed_tag_swallowed_element",
         severity: "error",
-        message: `<${tag.name}> is missing its closing \`>\` before the next \`<\` — the following element is swallowed as bogus attribute text and never becomes a real node.`,
+        message: `<${tag.name}> is missing its closing \`>\` before the next \`<\`, so the following element is swallowed as bogus attribute text and never becomes a real node.`,
         fixHint: "Close the previous tag's `>` before opening the next element.",
         snippet: truncateSnippet(tag.raw),
       });
@@ -776,7 +792,7 @@ export const coreRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = [
 
   // invalid_inline_script_syntax (malformed close tag)
   ({ source }) => {
-    if (!INVALID_SCRIPT_CLOSE_PATTERN.test(source)) return [];
+    if (!hasInvalidScriptClose(source)) return [];
     return [
       {
         code: "invalid_inline_script_syntax",
@@ -791,14 +807,9 @@ export const coreRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = [
   ({ scripts, locate }) => {
     const findings: HyperframeLintFinding[] = [];
     for (const script of scripts) {
-      const attrs = script.attrs || "";
-      if (
-        /\bsrc\s*=/.test(attrs) ||
-        /\btype\s*=\s*["'](?:application\/json|application\/hyperframes-slideshow\+json|importmap|module)["']/.test(
-          attrs,
-        )
-      )
-        continue;
+      const tag = `<script ${script.attrs}>`;
+      const type = readDecodedAttr(tag, "type")?.trim().toLowerCase() ?? "";
+      if (readDecodedAttr(tag, "src") !== null || SCRIPT_SYNTAX_EXEMPT_TYPES.has(type)) continue;
       const syntaxError = getInlineScriptSyntaxError(script.content);
       if (!syntaxError) continue;
       findings.push({
@@ -918,6 +929,11 @@ export const coreRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = [
         hint: "Use a seeded PRNG (e.g. a simple mulberry32) so renders are deterministic across frames.",
       },
       {
+        pattern: /crypto\.randomUUID\s*\(/,
+        label: "crypto.randomUUID()",
+        hint: "Use a seeded PRNG (e.g. a simple mulberry32) so renders are deterministic across frames.",
+      },
+      {
         pattern: /gsap\.utils\.random\s*\(/,
         label: "gsap.utils.random()",
         hint: "Each render worker initializes independently, so random values diverge across chunks. Use a seeded PRNG or fixed values.",
@@ -935,9 +951,9 @@ export const coreRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = [
     ];
 
     for (const script of scripts) {
-      const withoutComments = stripJsComments(script.content);
+      const withoutComments = stripJsComments(blankInlinedGsapLibrary(script.content));
       // Strings are content, not code. A composition that DISPLAYS source (the
-      // code-snippet blocks, /pr-to-video) carries `Math.random()` inside a string
+      // code-snippet blocks) carries `Math.random()` inside a string
       // literal it never executes, and reported itself non-deterministic with no
       // way to clear the error while still rendering the snippet.
       const executable = stripStringLiterals(withoutComments);

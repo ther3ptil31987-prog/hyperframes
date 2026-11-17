@@ -28,6 +28,10 @@ If you need a classic `<script>` tag instead of ESM, use the explicit global bui
 
 The player loads the composition in a sandboxed iframe, auto-detects its dimensions and duration, and scales it responsively to fit the container.
 
+Add or remove `controls` at any time. When shown, the controls reflect the current playback state, position and speed.
+
+The fullscreen button fills the screen with the whole player, controls included. It appears only where the page can go fullscreen, so not on iPhone Safari and not inside a cross-origin iframe without `allow="fullscreen"`. It follows every exit, including Esc. Set `disable-fullscreen` to hide it. A refused request fires the browser's `fullscreenerror` on the player.
+
 ### With a framework
 
 ```typescript
@@ -51,6 +55,8 @@ Set `type` to a video type and the player plays `src` in a `<video playsinline>`
 ></hyperframes-player>
 ```
 
+Removing or emptying `src` unloads the video and pauses it at 0:00.
+
 ### Poster image
 
 Show a static image before playback starts:
@@ -72,7 +78,7 @@ Show a static image before playback starts:
 | `audio-src`             | string                          | —             | Audio URL for parent-frame playback (mobile)                                |
 | `width`                 | number                          | 1920          | Composition width in pixels (aspect ratio)                                  |
 | `height`                | number                          | 1080          | Composition height in pixels (aspect ratio)                                 |
-| `controls`              | boolean                         | false         | Show play/pause, scrubber, and time display                                 |
+| `controls`              | boolean                         | false         | Show play/pause, scrubber, time, volume, speed, and fullscreen controls     |
 | `muted`                 | boolean                         | false         | Mute audio playback                                                         |
 | `audio-locked`          | boolean                         | false         | Force-mute and hide the volume controls so the viewer cannot turn sound on  |
 | `poster`                | string                          | —             | Image URL shown before playback starts                                      |
@@ -84,6 +90,8 @@ Show a static image before playback starts:
 | `assets-loading-ui`     | `player \| none`                | `player`      | `none` never shows the loading-assets card; asset events still fire         |
 | `low-power-idle`        | boolean                         | false         | While paused, check in once a second, not every 80 ms (many-player pages)   |
 | `disable-click-to-play` | boolean                         | false         | A click on the player no longer plays or pauses (host overlays own clicks)  |
+| `disable-fullscreen`    | boolean                         | false         | Hide the fullscreen button; `requestFullscreen()` still works               |
+| `no-load-timeout`       | boolean                         | false         | Slow loads never fail at 8 s; the page owns the deadline. Errors still fail |
 | `range-start`           | number                          | —             | Film second where playback starts, loops back to and parks when paused      |
 | `range-end`             | number                          | —             | Film second the range ends before: it stops or loops on the frame before it |
 
@@ -149,6 +157,7 @@ player.ready; // boolean (read-only)
 player.compositionWidth; // number (read-only), the composition's width
 player.compositionHeight; // number (read-only), the composition's height
 player.disableClickToPlay; // boolean (read/write)
+player.disableFullscreen; // boolean (read/write)
 player.playbackRate; // number (read/write)
 player.muted; // boolean (read/write)
 player.audioLocked; // boolean (read/write) — force-mute + hide volume controls

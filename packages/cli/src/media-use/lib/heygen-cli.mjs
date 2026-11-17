@@ -10,8 +10,8 @@ export const HEYGEN_MIN_VERSION = "0.3.0";
 // installer text out of the runtime module; the docs are the safer source of
 // truth for platform-specific setup.
 export const HEYGEN_INSTALL_COMMAND =
-  "Install the CLI from https://developers.heygen.com/cli, then run: heygen auth login --oauth";
-export const HEYGEN_AUTH_COMMAND = "heygen auth login --oauth";
+  "Install the CLI from https://developers.heygen.com/cli, then run: hyperframes auth login";
+export const HEYGEN_AUTH_COMMAND = "hyperframes auth login";
 export const HEYGEN_UPDATE_COMMAND = "heygen update";
 export const HEYGEN_CLIENT_SOURCE_ARGV = ["--headers", "X-HeyGen-Client-Source: media-use"];
 
@@ -68,7 +68,11 @@ function classifyHeygenErrorResult(err) {
   }
 
   const version = firstSemver(text);
-  if (version && versionLessThan(version, HEYGEN_MIN_VERSION)) {
+  // A CLI older than the --headers flag rejects it before printing any version.
+  if (
+    (version && versionLessThan(version, HEYGEN_MIN_VERSION)) ||
+    lower.includes("unknown flag: --headers")
+  ) {
     return { code: "outdated", message: HEYGEN_OUTDATED_MESSAGE };
   }
 
@@ -97,6 +101,19 @@ const pendingFailureTracking = new Set();
 // consume-once slot is sufficient. If resolve becomes an in-process/concurrent
 // API, move this state into a per-resolve context before reusing that path.
 let pendingRemediation = null;
+
+/** A music resolve miss after the heygen CLI was missing or too old: what is missing, the host app's own
+ * tool, the fix. Other types keep the generic miss. */
+export function heygenMiss(type, { code }) {
+  if (type !== "bgm") return null;
+  const outdated = code === "outdated";
+  const state = outdated ? `older than v${HEYGEN_MIN_VERSION}` : "not installed";
+  return {
+    code: outdated ? "heygen_cli_outdated" : "heygen_cli_missing",
+    fix: outdated ? HEYGEN_UPDATE_COMMAND : HEYGEN_INSTALL_COMMAND,
+    error: `${type} needs the heygen CLI, which is ${state}: use your host app's own music tool if it has one, or ${outdated ? "update" : "install"} the CLI.`,
+  };
+}
 
 export function consumeHeygenRemediation() {
   const remediation = pendingRemediation;

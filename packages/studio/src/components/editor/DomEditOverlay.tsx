@@ -5,11 +5,13 @@ import { type DomEditSelection } from "./domEditing";
 import type { PreviewMouseDownOptions } from "../../hooks/usePreviewInteraction";
 import { useMarqueeGestures } from "./marqueeCommit";
 import { MarqueeOverlay } from "./MarqueeOverlay";
+import type { MarqueeSelectionMode } from "../../utils/marqueeGeometry";
 import { resolveDomEditGroupOverlayRect } from "./domEditOverlayGeometry";
 import { useZOrderCrossedFlash, ZOrderCrossedFlash } from "./useZOrderCrossedFlash";
 import { useCanvasContextMenuState } from "./useCanvasContextMenuState";
 import {
   type BlockedMoveState,
+  type WaitingPressState,
   type DomEditGroupPathOffsetCommit,
   type FocusableDomEditOverlay,
   type MoveCommitOptions,
@@ -36,8 +38,10 @@ import { useMountEffect } from "../../hooks/useMountEffect";
 import { countStudioManualEditSave as counted } from "./manualEditsDom";
 import type { ZOrderAction, ZOrderPatch } from "./canvasContextMenuZOrder";
 import { getPreviewTargetFromPointer } from "../../utils/studioPreviewHelpers";
+import { pointerMayHitElement } from "./previewSelection";
 import { logSelect } from "../../utils/selectDebug";
 import { useOffCanvasIndicators } from "./useOffCanvasIndicators";
+import { DomEditGestureReadout } from "./DomEditGestureReadout";
 
 // Re-exports for external consumers — preserving existing import paths.
 export {
@@ -60,7 +64,7 @@ export interface DomEditOverlayProps {
   hoverSelection: DomEditSelection | null;
   allowCanvasMovement?: boolean;
   allowBodyDrag?: boolean;
-  /** "host": no hover, marquee, box re-select, or body drag if allowBodyDrag is false; Enter still opens text. */
+  /** "host": no marquee, box re-select, or body drag if allowBodyDrag is false; Enter still opens text. */
   canvasInput?: "overlay" | "host";
   onTextEditingChange?: (editing: boolean) => void;
   /** A click on a single selection's box, in either mode; the event may be the pointerup. */
@@ -102,7 +106,7 @@ export interface DomEditOverlayProps {
   onToggleRecording?: () => void;
   onMarqueeSelect?: (
     selections: DomEditSelection[],
-    additive: boolean,
+    mode: MarqueeSelectionMode,
   ) => DomSelectionResult | void;
   /**
    * Delete the selected canvas element.
@@ -166,6 +170,7 @@ export const DomEditOverlay = memo(function DomEditOverlay({
   const gestureRef = useRef<GestureState | null>(null);
   const groupGestureRef = useRef<GroupGestureState | null>(null);
   const blockedMoveRef = useRef<BlockedMoveState | null>(null);
+  const waitingPressRef = useRef<WaitingPressState | null>(null);
   const suppressNextBoxClickRef = useRef(false);
   const snapGuidesRef = useRef<SnapGuidesState | null>(null);
   const rafPausedRef = useRef(false);
@@ -273,6 +278,7 @@ export const DomEditOverlay = memo(function DomEditOverlay({
   });
 
   const gestures = createDomEditOverlayGestureHandlers({
+    activeCompositionPathRef,
     overlayRef,
     iframeRef,
     boxRef,
@@ -283,6 +289,7 @@ export const DomEditOverlay = memo(function DomEditOverlay({
     gestureRef,
     groupGestureRef,
     blockedMoveRef,
+    waitingPressRef,
     rafPausedRef,
     suppressNextBoxClickRef,
     setOverlayRect,
@@ -299,17 +306,17 @@ export const DomEditOverlay = memo(function DomEditOverlay({
   });
 
   useEffect(() => {
-    if (readOnly) gestures.clearPointerState(selectionRef);
+    if (readOnly) gestures.clearPointerState(selectionRef, true);
   }, [gestures, readOnly, selectionRef]);
   // A gesture that loses its pointer, the window or the overlay is cancelled, so its mark goes too.
-  const cancelGestureRef = useRef(() => {});
-  cancelGestureRef.current = () => gestures.clearPointerState(selectionRef);
+  const cancelGestureRef = useRef((_dropQueued?: boolean) => {});
+  cancelGestureRef.current = (dropQueued) => gestures.clearPointerState(selectionRef, dropQueued);
   useMountEffect(() => {
     const cancel = () => cancelGestureRef.current();
     window.addEventListener("blur", cancel);
     return () => {
       window.removeEventListener("blur", cancel);
-      cancel();
+      cancelGestureRef.current(true);
     };
   });
 
@@ -337,6 +344,7 @@ export const DomEditOverlay = memo(function DomEditOverlay({
     activeCompositionPathRef,
     onMarqueeSelectRef,
     selectionRef,
+    groupSelectionsRef,
     gestures,
   });
 
@@ -375,12 +383,7 @@ export const DomEditOverlay = memo(function DomEditOverlay({
       const candidate = resolveShiftClickCandidate({
         cached: hoverSelectionRef.current,
         elementAtPoint: shiftIframe
-          ? getPreviewTargetFromPointer(
-              shiftIframe,
-              event.clientX,
-              event.clientY,
-              activeCompositionPathRef.current,
-            )
+          ? getPreviewTargetFromPointer(shiftIframe, event.clientX, event.clientY)
           : null,
       });
       // Not confident: fall through untouched — no preventDefault, no suppression —
@@ -414,15 +417,7 @@ export const DomEditOverlay = memo(function DomEditOverlay({
     // Confirm emptiness with a fresh SYNCHRONOUS hit-test before committing.
     if (!hoverSelectionRef.current && onMarqueeSelectRef.current && compRect.width > 0) {
       const iframe = iframeRef.current;
-      const freshTarget = iframe
-        ? getPreviewTargetFromPointer(
-            iframe,
-            event.clientX,
-            event.clientY,
-            activeCompositionPathRef.current,
-          )
-        : null;
-      if (freshTarget) return;
+      if (iframe && pointerMayHitElement(iframe, event.clientX, event.clientY)) return;
       if (overlayRef.current) {
         // Anywhere empty on the overlay starts one, not just inside the frame.
         // An element dragged past the edge sits OUT there in the grey, and a
@@ -493,10 +488,10 @@ export const DomEditOverlay = memo(function DomEditOverlay({
       onPointerLeave={() => onCanvasPointerLeaveRef.current()}
       onPointerUp={marquee.onPointerUp}
       onPointerCancel={marquee.onPointerCancel}
-      onLostPointerCapture={() => cancelGestureRef.current()}
+      onLostPointerCapture={gestures.onLostPointerCapture}
       onContextMenu={hostInput ? undefined : handleContextMenu}
     >
-      {!hostInput && hoverSelection && hoverRect && compRect.width > 0 && (
+      {hoverSelection && hoverRect && compRect.width > 0 && (
         <div
           aria-hidden="true"
           data-dom-edit-hover-box="true"
@@ -536,6 +531,11 @@ export const DomEditOverlay = memo(function DomEditOverlay({
           onBoxClick={handleBoxClick}
         />
       )}
+      <DomEditGestureReadout
+        gestureRef={gestureRef}
+        overlayRef={overlayRef}
+        iframeRef={iframeRef}
+      />
       <ChildRectOutlines rects={compRect.width > 0 ? childRects : []} />
       {/* Mounted here rather than with the selection chrome: the chrome does
           not render for every selection, and the toolbar belongs to the

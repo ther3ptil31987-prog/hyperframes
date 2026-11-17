@@ -9,6 +9,11 @@ const coreRoot = resolve(fileURLToPath(new URL("../core/src", import.meta.url)))
 export default defineConfig({
   resolve: {
     alias: {
+      "@hyperframes/core/runtime/composition-length": resolve(
+        coreRoot,
+        "runtime/compositionLength.ts",
+      ),
+      "@hyperframes/core/studio-preview-mark": resolve(coreRoot, "studioPreviewMark.ts"),
       "@hyperframes/core/composition-contract": resolve(coreRoot, "compositionContract.ts"),
       "@hyperframes/parsers/composition-contract": resolve(
         coreRoot,
@@ -20,6 +25,18 @@ export default defineConfig({
   },
   test: {
     environment: "happy-dom",
+    environmentOptions: {
+      happyDOM: {
+        settings: {
+          handleDisabledFileLoadingAsSuccess: true,
+          enableIframePageLoading: true,
+          navigator: {
+            userAgent:
+              "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36",
+          },
+        },
+      },
+    },
     setupFiles: ["./src/slideshow/test-setup.ts"],
   },
 });

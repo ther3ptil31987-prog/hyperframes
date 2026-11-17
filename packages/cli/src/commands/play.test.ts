@@ -1,9 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, utimesSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { Hono } from "hono";
 import type { ProjectDir } from "../utils/project.js";
+import { MAX_OPEN_MEDIA_RANGE_BYTES } from "@hyperframes/studio-server";
 
 // `registerCompositionRoute` reaches these two studio-server helpers via a
 // module, since both files sit at the same depth under packages/cli/src/.
@@ -152,6 +153,24 @@ async function buildApp(project: ProjectDir, autoProxy: boolean): Promise<Hono> 
 }
 
 describe("registerCompositionRoute", () => {
+  it("does not serve env files, Git data or the tools' own records", async () => {
+    const project = tmpProject();
+    mkdirSync(join(project.dir, ".git"));
+    mkdirSync(join(project.dir, ".hyperframes"));
+    writeFileSync(join(project.dir, ".env"), "KEY=secret");
+    writeFileSync(join(project.dir, ".env.local"), "KEY=secret");
+    writeFileSync(join(project.dir, ".git", "config"), "[core]");
+    writeFileSync(join(project.dir, ".hyperframes", "lambda-stack-x.json"), "{}");
+    writeFileSync(join(project.dir, "logo.png"), "png");
+    const app = await buildApp(project, false);
+
+    for (const path of [".env", ".ENV", ".env.local", ".git/config"]) {
+      expect((await app.request(`/composition/${path}`)).status).toBe(404);
+    }
+    expect((await app.request("/composition/.hyperframes/lambda-stack-x.json")).status).toBe(404);
+    expect((await app.request("/composition/logo.png")).status).toBe(200);
+  });
+
   it("lets a browser revalidate the composition and its assets instead of refetching them", async () => {
     const project = tmpProject();
     writeFileSync(join(project.dir, "index.html"), "<html><head></head><body></body></html>");
@@ -160,17 +179,21 @@ describe("registerCompositionRoute", () => {
 
     const etags: Record<string, string> = {};
     for (const path of ["/composition/index.html", "/composition/clip.mp4"]) {
-      const first = await app.request(path);
+      const own = { "Sec-Fetch-Site": "same-origin" };
+      const first = await app.request(path, { headers: own });
       etags[path] = first.headers.get("ETag") ?? "";
       expect(etags[path]).not.toBe("");
       expect(first.headers.get("Cache-Control")).toBe("no-cache");
-      const again = await app.request(path, { headers: { "If-None-Match": etags[path] } });
+      const again = await app.request(path, { headers: { ...own, "If-None-Match": etags[path] } });
       expect(again.status).toBe(304);
     }
 
     writeFileSync(join(project.dir, "clip.mp4"), Buffer.from("0123456789abc", "utf-8"));
     const edited = await app.request("/composition/clip.mp4", {
-      headers: { "If-None-Match": etags["/composition/clip.mp4"] ?? "" },
+      headers: {
+        "Sec-Fetch-Site": "same-origin",
+        "If-None-Match": etags["/composition/clip.mp4"] ?? "",
+      },
     });
     expect(edited.status).toBe(200);
   });
@@ -216,6 +239,26 @@ describe("registerCompositionRoute", () => {
     expect(await ranged.text()).toBe("<svg");
   });
 
+  it("serves a same-size, same-mtime JSON edit fresh, labelled UTF-8", async () => {
+    const project = tmpProject();
+    const data = join(project.dir, "data.json");
+    const pinned = new Date("2026-01-01T00:00:00Z");
+    writeFileSync(data, '{"value":1}');
+    utimesSync(data, pinned, pinned);
+    const app = await buildApp(project, false);
+    const first = await app.request("/composition/data.json");
+    expect(first.headers.get("Content-Type")).toBe("application/json; charset=utf-8");
+    const etag = first.headers.get("ETag") ?? "";
+
+    writeFileSync(data, '{"value":2}');
+    utimesSync(data, pinned, pinned);
+    const edited = await app.request("/composition/data.json", {
+      headers: { "If-None-Match": etag },
+    });
+    expect(edited.status).toBe(200);
+    expect(await edited.text()).toBe('{"value":2}');
+  });
+
   it("answers a Range request on a plain asset with 206 + the requested byte slice", async () => {
     const project = tmpProject();
     writeFileSync(join(project.dir, "clip.mp4"), Buffer.from("0123456789", "utf-8"));
@@ -227,6 +270,22 @@ describe("registerCompositionRoute", () => {
     expect(res.headers.get("accept-ranges")).toBe("bytes");
     expect(res.headers.get("content-range")).toBe("bytes 2-5/10");
     expect(await res.text()).toBe("2345");
+  });
+
+  it("answers an open-ended media range with a bounded piece, not the rest of the file", async () => {
+    // Served to EOF, each <video> holds one of the browser's six connections (#6029).
+    const project = tmpProject();
+    const size = 8 * 1024 * 1024;
+    writeFileSync(join(project.dir, "clip.mp4"), Buffer.alloc(size, 0x61));
+    const app = await buildApp(project, false);
+
+    const res = await app.request("/composition/clip.mp4", { headers: { Range: "bytes=0-" } });
+
+    expect(res.status).toBe(206);
+    expect(res.headers.get("content-range")).toBe(
+      `bytes 0-${MAX_OPEN_MEDIA_RANGE_BYTES - 1}/${size}`,
+    );
+    expect((await res.arrayBuffer()).byteLength).toBe(MAX_OPEN_MEDIA_RANGE_BYTES);
   });
 
   it("serves the resolved proxy's bytes for ?hf-proxy=h264 on a hostile asset", async () => {
@@ -316,6 +375,45 @@ describe("registerCompositionRoute", () => {
     expect(mocks.resolveProxy).not.toHaveBeenCalled();
   });
 
+  // fails without the fix: another site's page could make this machine transcode the asset.
+  it.each(["cross-site", "same-site"])(
+    "refuses ?hf-proxy for a request from another site (%s) without starting a transcode",
+    async (site) => {
+      const project = tmpProject();
+      writeFileSync(join(project.dir, "clip.mp4"), "original-hevc-bytes");
+      const app = await buildApp(project, true);
+
+      const res = await app.request("/composition/clip.mp4?hf-proxy=h264", {
+        headers: { "Sec-Fetch-Site": site },
+      });
+
+      expect(res.status).toBe(403);
+      expect(mocks.resolveProxy).not.toHaveBeenCalled();
+      expect(mediaMocks.probeAssetCodec).not.toHaveBeenCalled();
+    },
+  );
+
+  it("still serves ?hf-proxy to the play page itself and plain assets to another site", async () => {
+    const project = tmpProject();
+    writeFileSync(join(project.dir, "clip.mp4"), "original-hevc-bytes");
+    const proxyPath = join(project.dir, "proxy.mp4");
+    writeFileSync(proxyPath, "transcoded-h264-bytes");
+    mocks.resolveProxy.mockResolvedValue(proxyPath);
+    const app = await buildApp(project, true);
+
+    const own = await app.request("/composition/clip.mp4?hf-proxy=h264", {
+      headers: { "Sec-Fetch-Site": "same-origin" },
+    });
+    expect(own.status).toBe(200);
+    expect(await own.text()).toBe("transcoded-h264-bytes");
+
+    const plain = await app.request("/composition/clip.mp4", {
+      headers: { "Sec-Fetch-Site": "cross-site" },
+    });
+    expect(plain.status).toBe(200);
+    expect(await plain.text()).toBe("original-hevc-bytes");
+  });
+
   it("serves the runtime script ahead of every author script", async () => {
     // Compositions read `window.__hyperframes.getVariables()` from an inline
     // script at init. A runtime injected before </body> loads after that script,
@@ -376,5 +474,79 @@ describe("registerCompositionRoute", () => {
     const proxyRes = await app.request("/composition/clip.mp4?hf-proxy=h264");
     expect(proxyRes.status).toBe(404);
     expect(mocks.resolveProxy).not.toHaveBeenCalled();
+  });
+});
+
+describe("a composition document another site loads", () => {
+  const MARK = '<meta name="hyperframes-preview-for-another-site">';
+  const SANDBOX = "sandbox allow-scripts";
+
+  async function setup() {
+    const project = tmpProject();
+    writeFileSync(join(project.dir, "index.html"), "<html><head></head><body></body></html>");
+    return buildApp(project, false);
+  }
+
+  it("is marked and sandboxed when another site frames it", async () => {
+    const app = await setup();
+    const res = await app.request("/composition/index.html", {
+      headers: { "Sec-Fetch-Site": "cross-site", "Sec-Fetch-Dest": "iframe" },
+    });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain(MARK);
+    expect(res.headers.get("Content-Security-Policy")).toBe(SANDBOX);
+    expect(res.headers.get("ETag")).toBeNull();
+  });
+
+  it("gets a marked 200, not a 304, for the unmarked copy's validators", async () => {
+    const app = await setup();
+    const own = await app.request("/composition/index.html", {
+      headers: { "Sec-Fetch-Site": "same-origin" },
+    });
+    const etag = own.headers.get("ETag") ?? "";
+    expect(etag).not.toBe("");
+    const res = await app.request("/composition/index.html", {
+      headers: { "Sec-Fetch-Site": "cross-site", "If-None-Match": etag },
+    });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toContain(MARK);
+  });
+
+  it("stays unmarked for the play page's own player", async () => {
+    const app = await setup();
+    const res = await app.request("/composition/index.html", {
+      headers: { "Sec-Fetch-Site": "same-origin", "Sec-Fetch-Dest": "iframe" },
+    });
+    expect(await res.text()).not.toContain(MARK);
+    expect(res.headers.get("Content-Security-Policy")).toBeNull();
+  });
+
+  it("is marked on a LAN name with no fetch metadata unless the play page sent it", async () => {
+    const app = await setup();
+    const lan = "http://192.168.1.20:3003";
+    const foreign = await app.request(`${lan}/composition/index.html`);
+    expect(await foreign.text()).toContain(MARK);
+    const own = await app.request(`${lan}/composition/index.html`, {
+      headers: { Referer: `${lan}/` },
+    });
+    expect(await own.text()).not.toContain(MARK);
+  });
+
+  // fails without the fix: a loopback load with no fetch metadata counted as the play page's own.
+  it("is marked on loopback with no fetch metadata unless the play page sent it", async () => {
+    const app = await setup();
+    const local = "http://localhost:3003";
+    const bare = await app.request(`${local}/composition/index.html`);
+    expect(await bare.text()).toContain(MARK);
+    expect(bare.headers.get("Content-Security-Policy")).toBe(SANDBOX);
+    const foreign = await app.request(`${local}/composition/index.html`, {
+      headers: { Referer: "http://elsewhere.example/page" },
+    });
+    expect(await foreign.text()).toContain(MARK);
+    const own = await app.request(`${local}/composition/index.html`, {
+      headers: { Referer: `${local}/` },
+    });
+    expect(await own.text()).not.toContain(MARK);
+    for (const res of [bare, own]) expect(res.headers.get("Vary")).toBe("Sec-Fetch-Site, Referer");
   });
 });

@@ -20,13 +20,14 @@ import {
   getShaderModeFromElement,
   prepareSrcForElement,
   prepareSrcdocForElement,
+  runtimeSrcFromElement,
 } from "./shader-options.js";
 import { createShaderLoader } from "./shader-loader-element.js";
 import { ShaderLoaderState } from "./shader-loader-state.js";
 import { PLAYER_STYLES } from "./styles.js";
 import { type DirectTimelineAdapter } from "./timeline-adapters.js";
 import { createVideoSource, isVideoType, type VideoSource } from "./video-source.js";
-import { runtimeProtocolMetadata } from "@hyperframes/core/runtime/protocol";
+import { frameDisplayScale, runtimeProtocolMetadata } from "@hyperframes/core/runtime/protocol";
 import {
   FIRST_FRAME_READINESS_SCOPE,
   scanPendingCompositionAssets,
@@ -51,8 +52,10 @@ const ASSETS_READY_TIMEOUT_MS = 8_000;
 const ASSETS_LOADING_ATTR = "assets-loading";
 // "player" (default) draws the loading-assets card; "none" never does, like shader-loading="none".
 const ASSETS_LOADING_UI_ATTR = "assets-loading-ui";
+const BUFFERING_ATTR = "buffering";
 const LOW_POWER_IDLE_ATTR = "low-power-idle";
 const DISABLE_CLICK_TO_PLAY_ATTR = "disable-click-to-play";
+const DISABLE_FULLSCREEN_ATTR = "disable-fullscreen";
 const RANGE_START_ATTR = "range-start";
 const RANGE_END_ATTR = "range-end";
 // paint-and-idle now always has a frame to wait on, so the overlay would
@@ -119,6 +122,7 @@ class HyperframesPlayer extends HTMLElement {
 
   private shadow: ShadowRoot;
   private container: HTMLDivElement;
+  private readonly sizer = document.createElement("div");
   private iframe: HTMLIFrameElement;
   private posterEl: HTMLImageElement | null = null;
   private controlsApi: ReturnType<typeof setupControls> | null = null;
@@ -134,6 +138,7 @@ class HyperframesPlayer extends HTMLElement {
   private _pendingPlay = false;
   private _assetsGeneration = 0;
   private _assetsLoadingShowTimer: ReturnType<typeof setTimeout> | null = null;
+  private _bufferingShowTimer: ReturnType<typeof setTimeout> | null = null;
   private _currentTime = 0;
   private _duration = 0;
   private _paused = true;
@@ -168,6 +173,8 @@ class HyperframesPlayer extends HTMLElement {
 
     adoptShadowStyles(this.shadow, PLAYER_STYLES);
     ({ container: this.container, iframe: this.iframe } = createCompositionIframe());
+    this.sizer.className = "hfp-sizer";
+    this.shadow.appendChild(this.sizer);
     this.shadow.appendChild(this.container);
 
     const loaderElements = createShaderLoader();
@@ -204,6 +211,8 @@ class HyperframesPlayer extends HTMLElement {
     });
 
     this.probe = new CompositionProbe(this.iframe, {
+      resolveRuntimeUrl: () => runtimeSrcFromElement(this),
+      hostOwnsDeadline: () => this.hasAttribute("no-load-timeout"),
       onReady: (result) => this._onProbeReady(result),
       onError: (message) => this._emit(new CustomEvent("error", { detail: { message } })),
     });
@@ -271,7 +280,7 @@ class HyperframesPlayer extends HTMLElement {
         // message fire before connectedCallback installs the parent message listener. Initial
         // attributes are applied below by connectedCallback; only live changes navigate here.
         if (!this.isConnected) break;
-        if (val) this._navigateSrc(val);
+        if (val || this._videoSource) this._navigateSrc(val ?? "");
         break;
       case "type": {
         const src = this.getAttribute("src");
@@ -431,6 +440,7 @@ class HyperframesPlayer extends HTMLElement {
     // starts playback — this premature call must not ALSO dispatch "play"
     // for what hasn't started, or a host listener sees it fire twice.
     let queuedForReady = false;
+    this._sendDisplayScale();
     if (!directTimelineStarted) {
       this._sendControl("play");
       // Only start the parent tick clock once the composition is ready and
@@ -443,6 +453,7 @@ class HyperframesPlayer extends HTMLElement {
       }
     }
     if (this._media.audioOwner === "parent") this._media.playAll();
+    else this._media.primeAll();
     this.controlsApi?.updatePlaying(true);
     if (!queuedForReady && announce) this._emit(new Event("play"));
     if (directTimelineStarted && this._directTimelineAdapter) {
@@ -706,6 +717,13 @@ class HyperframesPlayer extends HTMLElement {
   }
   set disableClickToPlay(disabled: boolean) {
     this.toggleAttribute(DISABLE_CLICK_TO_PLAY_ATTR, disabled);
+  }
+
+  get disableFullscreen() {
+    return this.hasAttribute(DISABLE_FULLSCREEN_ATTR);
+  }
+  set disableFullscreen(disabled: boolean) {
+    this.toggleAttribute(DISABLE_FULLSCREEN_ATTR, disabled);
   }
 
   get loop() {
@@ -1002,6 +1020,12 @@ class HyperframesPlayer extends HTMLElement {
       disabled: this._isSlideshowPlayer(),
     });
     this._sendControl("set-idle-heartbeat", { slow: this.hasAttribute(LOW_POWER_IDLE_ATTR) });
+    this._sendDisplayScale();
+  }
+
+  private _sendDisplayScale(): void {
+    const scale = frameDisplayScale(this.iframe);
+    if (scale) this._sendControl("set-display-scale", { scale });
   }
 
   private _reloadShaderOptions(): void {
@@ -1084,7 +1108,11 @@ class HyperframesPlayer extends HTMLElement {
     this.controlsApi?.updateTime(0, 0);
     this._syncVideoAudio();
     adapter.timeScale?.(this.playbackRate);
-    video.src = src;
+    if (src) video.src = src;
+    else {
+      video.removeAttribute("src");
+      video.load();
+    }
   }
 
   private _teardownVideo(): void {
@@ -1192,8 +1220,8 @@ class HyperframesPlayer extends HTMLElement {
    * iframe on every frame. Used for the runtime bridge path so that animation
    * advances even when the composition iframe's own rAF is throttled by
    * Chromium (e.g. deeply nested cross-origin iframes in Electron / Claude desktop).
-   * The runtime's own rAF loop still runs — ticking GSAP twice per frame is
-   * harmless because seekTimelineAndAdapters is idempotent.
+   * The runtime skips a tick seek only when that timeline time is already
+   * rendered. Host ticks still advance a throttled iframe.
    */
   private _startParentTickClock(): void {
     this._stopParentTickClock();
@@ -1216,7 +1244,7 @@ class HyperframesPlayer extends HTMLElement {
 
   private _onMessage(e: MessageEvent) {
     // The iframe window outlives its documents: a late composition message must not reach a video.
-    if (this._videoSource) return;
+    if (this._videoSource || this.probe.failed) return;
     this._applyThenEmit(() => this._handleRuntimeMessage(e));
   }
 
@@ -1258,6 +1286,7 @@ class HyperframesPlayer extends HTMLElement {
         this._rejectRuntimeDataDelivery(channel, requestId, message),
       onRuntimeTimelineReady: (duration, assetsReady) =>
         this._onRuntimeTimelineReady(duration, assetsReady),
+      setBuffering: (buffering) => this._setBuffering(buffering),
       setRuntimeFps: (fps) => {
         this._runtimeFps = fps;
       },
@@ -1361,6 +1390,23 @@ class HyperframesPlayer extends HTMLElement {
     }, ASSETS_LOADING_SHOW_DELAY_MS);
   }
 
+  private _setBuffering(buffering: boolean): void {
+    if (buffering) {
+      if (this._bufferingShowTimer !== null || this.hasAttribute(BUFFERING_ATTR)) return;
+      this._bufferingShowTimer = setTimeout(() => {
+        this._bufferingShowTimer = null;
+        this.setAttribute(BUFFERING_ATTR, "");
+        if (this.assetsLoadingUi !== "none") this.shaderLoader.showAssetsLoading("Buffering", "");
+      }, ASSETS_LOADING_SHOW_DELAY_MS);
+      return;
+    }
+    if (this._bufferingShowTimer !== null) clearTimeout(this._bufferingShowTimer);
+    this._bufferingShowTimer = null;
+    if (!this.hasAttribute(BUFFERING_ATTR)) return;
+    this.removeAttribute(BUFFERING_ATTR);
+    this.shaderLoader.hideAssetsLoading();
+  }
+
   private _hasPendingFirstFrameAssets(doc: Document): boolean {
     const { pendingMedia, pendingImages, fontsLoading } = scanPendingCompositionAssets(doc, {
       scope: FIRST_FRAME_READINESS_SCOPE,
@@ -1378,7 +1424,7 @@ class HyperframesPlayer extends HTMLElement {
     });
     const win = doc.defaultView as (Window & { __renderReady?: boolean }) | null;
     console.warn(
-      `[hyperframes-player] assets-loading timed out after ${ASSETS_READY_TIMEOUT_MS}ms — playing anyway`,
+      `[hyperframes-player] assets-loading timed out after ${ASSETS_READY_TIMEOUT_MS}ms, playing anyway`,
       {
         stuckMedia: pendingMedia.map(
           (el) => el.currentSrc || el.getAttribute("src") || `<${el.tagName.toLowerCase()}>`,
@@ -1413,6 +1459,7 @@ class HyperframesPlayer extends HTMLElement {
   /** Every host-driven navigation or teardown: the old document's handshake, asset wait and
    *  data deliveries end here. A queued play is the caller's, so only its owners clear it. */
   private _abandonComposition(reason: string): void {
+    this.probe.stop();
     this._ready = false;
     this._readyDocument = null;
     this._invalidateAssetsWait();
@@ -1427,6 +1474,7 @@ class HyperframesPlayer extends HTMLElement {
     this._directTimelineAdapter = null;
     this._directTimelineClock.stop();
     this._stopParentTickClock();
+    this._setBuffering(false);
     this.shaderLoader.reset();
     this._media.resetForIframeLoad();
   }
@@ -1475,6 +1523,7 @@ class HyperframesPlayer extends HTMLElement {
     const changed = width !== this._compositionWidth || height !== this._compositionHeight;
     this._compositionWidth = width;
     this._compositionHeight = height;
+    this.sizer.style.aspectRatio = `${width} / ${height}`;
     this._rescale();
     if (!changed) return;
     const detail = { compositionWidth: width, compositionHeight: height };
@@ -1537,9 +1586,10 @@ class HyperframesPlayer extends HTMLElement {
     // why in the field. Surface it once (not on every ResizeObserver tick —
     // a legitimately hidden/zero-sized player, e.g. a collapsed tab or
     // off-screen carousel card, would otherwise spam the console forever).
+    if (applied) this._sendDisplayScale();
     if (!applied && this._ready && !this._rescaleWarned) {
       this._rescaleWarned = true;
-      console.warn("[hyperframes-player] rescale no-op after ready — zero-size player element", {
+      console.warn("[hyperframes-player] rescale no-op after ready: zero-size player element", {
         src: this.getAttribute("src"),
         offsetWidth: this.offsetWidth,
         offsetHeight: this.offsetHeight,
@@ -1598,6 +1648,9 @@ class HyperframesPlayer extends HTMLElement {
       },
       this._isAudioLocked(),
     );
+    this.controlsApi.updateTime(this._currentTime, this._duration);
+    this.controlsApi.updatePlaying(!this._paused);
+    this.controlsApi.updateSpeed(this.playbackRate);
   }
 
   // Test-instrumentation pass-throughs (match original field names).

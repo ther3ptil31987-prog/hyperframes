@@ -153,6 +153,53 @@ describe("ThumbnailScheduler", () => {
     expect(richLoad).toHaveBeenCalledTimes(1);
   });
 
+  it("starts no visible or overscan video decode while the preview plays, but still a scrub's", async () => {
+    const scheduler = new ThumbnailScheduler();
+    const starts: string[] = [];
+    const load = (name: string) =>
+      vi.fn(async () => {
+        starts.push(name);
+        return result(name);
+      });
+    const video = { kind: "video" as const };
+    scheduler.setPlaybackActive(true);
+
+    const visible = scheduler.acquire(
+      request("visible", load("visible"), "visible", video),
+      vi.fn(),
+    );
+    scheduler.acquire(request("overscan", load("overscan"), "overscan", video), vi.fn());
+    scheduler.acquire(request("scrub", load("scrub"), "interaction", video), vi.fn());
+    scheduler.acquire(request("image", load("image"), "visible"), vi.fn());
+    await flush();
+    expect(starts).toEqual(["scrub", "image"]);
+
+    visible.updatePriority("interaction");
+    await flush();
+    expect(starts).toEqual(["scrub", "image", "visible"]);
+  });
+
+  it("drains the video decodes it held once playback pauses", async () => {
+    const scheduler = new ThumbnailScheduler();
+    const starts: string[] = [];
+    const load = (name: string) =>
+      vi.fn(async () => {
+        starts.push(name);
+        return result(name);
+      });
+    scheduler.setPlaybackActive(true);
+    scheduler.acquire(request("visible", load("visible"), "visible", { kind: "video" }), vi.fn());
+    scheduler.acquire(
+      request("overscan", load("overscan"), "overscan", { kind: "video" }),
+      vi.fn(),
+    );
+    await flush();
+    expect(starts).toEqual([]);
+
+    scheduler.setPlaybackActive(false);
+    await vi.waitFor(() => expect(starts).toEqual(["visible", "overscan"]));
+  });
+
   it("holds composition renders while the preview reloads and re-runs the ones it preempted", async () => {
     const scheduler = new ThumbnailScheduler();
     const signals: AbortSignal[] = [];
@@ -219,6 +266,26 @@ describe("ThumbnailScheduler", () => {
     expect(scheduler.getDiagnostics()).toMatchObject({ queued: 0, active: 0, leases: 0 });
   });
 
+  it("starts nothing that a release later in the same batch drops", async () => {
+    const scheduler = new ThumbnailScheduler(
+      resolveTimelineViewportBudgets({ concurrentVideoDecodes: 1 }),
+    );
+    const video = (key: string, load: ThumbnailRequest["load"]) =>
+      scheduler.acquire(request(key, load, "visible", { kind: "video" }), vi.fn());
+    const activeLease = video("active", () => deferred<ThumbnailLoadedResult>().promise);
+    const droppedLoad = vi.fn(async () => result("dropped"));
+    const droppedLease = video("dropped", droppedLoad);
+    const keptLoad = vi.fn(async () => result("kept"));
+    video("kept", keptLoad);
+
+    // A timeline jump unmounts its clips in one commit, the loading one first.
+    activeLease.release();
+    droppedLease.release();
+    await flush();
+    expect(droppedLoad).not.toHaveBeenCalled();
+    expect(keptLoad).toHaveBeenCalledTimes(1);
+  });
+
   it("frees an aborted job's slot at once, even when its loader ignores the abort", async () => {
     const scheduler = new ThumbnailScheduler(
       resolveTimelineViewportBudgets({ concurrentVideoDecodes: 1 }),
@@ -231,7 +298,6 @@ describe("ThumbnailScheduler", () => {
     lease.release();
     const nextLoad = vi.fn(async () => result("next"));
     scheduler.acquire(request("next", nextLoad, "visible", { kind: "video" }), vi.fn());
-    await flush();
     expect(nextLoad).toHaveBeenCalledTimes(1);
   });
 
@@ -317,6 +383,8 @@ describe("ThumbnailScheduler", () => {
     await vi.advanceTimersByTimeAsync(11);
     await flush();
     expect(signal?.aborted).toBe(true);
+    // Said apart from a cancel: a job that timed out without progress failed its source.
+    expect(signal?.reason).toMatchObject({ name: "TimeoutError" });
     expect(nextLoad).toHaveBeenCalledTimes(1);
     expect(scheduler.getSnapshot(hungRequest).status).toBe("error");
 

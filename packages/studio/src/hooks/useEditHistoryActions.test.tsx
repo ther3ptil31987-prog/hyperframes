@@ -4,11 +4,13 @@ import { act, createElement } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { STUDIO_MOTION_PATH } from "../components/editor/studioMotion";
+import { isPreviewChanging } from "../player/previewReloading";
 import { useEditHistoryActions, type EditHistoryHandle } from "./useEditHistoryActions";
 import {
   beginStudioPendingEdit,
   isStudioEditSaving,
   setStudioPendingEditClaimClock,
+  setStudioWaitingPressCancel,
   trackStudioPendingEdit,
 } from "../utils/studioPendingEdits";
 
@@ -18,6 +20,7 @@ let root: Root | null = null;
 afterEach(() => {
   act(() => root?.unmount());
   setStudioPendingEditClaimClock(null);
+  setStudioWaitingPressCancel(null);
 });
 
 type RestoreFiles = Record<string, { previous: string; restored: string }>;
@@ -71,6 +74,48 @@ const PREDICTED = { id: "e1", files: { "index.html": { previous: "B", restored: 
 const SERVER_FILES = { "index.html": { previous: "B", restored: "A2" } };
 
 describe("useEditHistoryActions", () => {
+  it("counts an undo as a preview change from its key until its preview update is applied", async () => {
+    const files = { "index.html": { previous: "B", restored: "A" } };
+    const stepped = { ok: true, label: "Undid: Move", paths: ["index.html"], files };
+    const { deps, actions } = mount(stepped);
+    let answer: () => void = () => {};
+    deps.editHistory.undo.mockImplementationOnce(
+      () => new Promise((resolve) => (answer = () => resolve(stepped))),
+    );
+    let applied: () => void = () => {};
+    deps.syncHistoryPreviewAfterApply.mockImplementationOnce(
+      () => new Promise<undefined>((resolve) => (applied = () => resolve(undefined))),
+    );
+    const undone = actions.undo();
+    expect(isPreviewChanging(), "from the key, before the server answers").toBe(true);
+    await vi.waitFor(() => expect(deps.editHistory.undo).toHaveBeenCalled());
+    expect(isPreviewChanging(), "while the server has the step").toBe(true);
+    answer();
+    await vi.waitFor(() => expect(deps.syncHistoryPreviewAfterApply).toHaveBeenCalled());
+    expect(isPreviewChanging(), "until the preview update is applied").toBe(true);
+    applied();
+    await act(() => undone);
+    expect(isPreviewChanging()).toBe(false);
+  });
+
+  it("takes back a canvas press still waiting to run, with no history step", async () => {
+    const { deps, actions } = mount({ ok: true, label: "Undid: Move" });
+    const cancel = vi.fn(() => (setStudioWaitingPressCancel(null), true));
+    setStudioWaitingPressCancel(cancel);
+    const revert = vi.fn(() => () => {});
+    const saving = beginStudioPendingEdit(revert);
+    await act(() => actions.redo());
+    expect(cancel, "redo leaves the press").not.toHaveBeenCalled();
+    await act(() => actions.undo());
+    expect(cancel).toHaveBeenCalledTimes(1);
+    expect(revert, "the press is newer than any edit still saving").not.toHaveBeenCalled();
+    expect(deps.editHistory.undo).not.toHaveBeenCalled();
+
+    await act(() => actions.undo());
+    expect(revert, "the following Cmd+Z takes back the edit still saving").toHaveBeenCalledTimes(1);
+    saving.settle();
+  });
+
   it("asks for the edit claimed after the key's claim count only when an edit was saving at the key", async () => {
     const { deps, actions } = mount({ ok: false, reason: "empty" });
     await act(() => actions.undo());

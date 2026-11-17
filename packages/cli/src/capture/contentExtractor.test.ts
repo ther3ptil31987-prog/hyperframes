@@ -8,6 +8,8 @@ import {
   type VisionCaptionOutcome,
 } from "./contentExtractor.js";
 import { loadOptionalPackage } from "../utils/optionalPackages.js";
+import { yieldProjectVisionKeys, yieldReceivedProviderKeys } from "../utils/dotEnv.js";
+import { loadEnvFile } from "./scaffolding.js";
 
 const { generateContentMock, clientOptions, sharpState } = vi.hoisted(() => ({
   generateContentMock: vi.fn(),
@@ -62,6 +64,7 @@ vi.mock("sharp", () => {
 });
 
 vi.mock("../utils/optionalPackages.js", () => ({
+  loadSharp: async () => (await import("sharp")).default,
   loadOptionalPackage: vi.fn(async () => ({
     GoogleGenAI: class {
       models = { generateContent: generateContentMock };
@@ -415,9 +418,46 @@ describe("captionImagesWithGemini — Gemini provider", () => {
 
   afterEach(() => {
     generateContentMock.mockReset();
+    vi.unstubAllGlobals();
     vi.unstubAllEnvs();
     for (const d of dirs) rmSync(d, { recursive: true, force: true });
     dirs.length = 0;
+  });
+
+  it.each([
+    ["a received project's", true],
+    ["a cloned project's", false],
+  ])("captions with the shell's Gemini key, never %s OpenRouter key", async (_, received) => {
+    const dir = makeProjectWithImages();
+    dirs.push(dir);
+    if (received) {
+      mkdirSync(join(dir, ".hyperframes"));
+      writeFileSync(
+        join(dir, ".hyperframes", "received-files.json"),
+        JSON.stringify({ files: [".env"] }),
+      );
+    }
+    writeFileSync(join(dir, ".env"), "OPENROUTER_API_KEY=received-key\n");
+    for (const key of [
+      "OPENROUTER_API_KEY",
+      "GOOGLE_API_KEY",
+      "HYPERFRAMES_VERTEX_PROJECT_ID",
+      "HYPERFRAMES_VERTEX_SERVICE_ACCOUNT",
+      "HYPERFRAMES_NO_CAPTURE_DOTENV",
+    ])
+      vi.stubEnv(key, undefined);
+    vi.stubEnv("GEMINI_API_KEY", "own-gemini-key");
+    const fetchMock = vi.fn();
+    vi.stubGlobal("fetch", fetchMock);
+    generateContentMock.mockResolvedValue({ text: "A caption." });
+
+    loadEnvFile(join(dir, "out"));
+    await yieldReceivedProviderKeys(() => {});
+    yieldProjectVisionKeys(() => {});
+    const captions = await captionImagesWithGemini(dir, () => {}, []);
+
+    expect(fetchMock).not.toHaveBeenCalled();
+    expect(captions).toEqual({ "hero.png": "A caption." });
   });
 
   it("terminates captioning when Gemini never settles even if the SDK ignores abort", async () => {
@@ -555,6 +595,83 @@ describe("captionImagesWithGemini — Vertex AI provider", () => {
     expect(clientOptions[0]).toMatchObject({ location: "europe-west4" });
   });
 
+  it.each([
+    "attacker.example/",
+    "x.attacker.example#",
+    "a@attacker.example",
+    "attacker.example:443?",
+    "us-central1.attacker.example",
+  ])("skips captioning for a location that is not a region: %s", async (location) => {
+    const dir = makeProjectWithImages();
+    dirs.push(dir);
+    vertexEnv();
+    vi.stubEnv("HYPERFRAMES_VERTEX_LOCATION", location);
+
+    const warnings: string[] = [];
+    const captions = await captionImagesWithGemini(dir, () => {}, warnings);
+
+    expect(captions).toEqual({});
+    expect(clientOptions).toHaveLength(0);
+    expect(generateContentMock).not.toHaveBeenCalled();
+    expect(warnings).toEqual([
+      "HYPERFRAMES_VERTEX_LOCATION is not a Google Cloud region; skipped vision captioning.",
+    ]);
+  });
+
+  it.each([
+    "../../v1/other",
+    "gemini?alt=x",
+    "gemini#x",
+    "https://attacker.example/m",
+    "/models/x",
+  ])("skips captioning for a model that is not a model id: %s", async (model) => {
+    const dir = makeProjectWithImages();
+    dirs.push(dir);
+    vertexEnv();
+    vi.stubEnv("HYPERFRAMES_VERTEX_MODEL", model);
+
+    const warnings: string[] = [];
+    const captions = await captionImagesWithGemini(dir, () => {}, warnings);
+
+    expect(captions).toEqual({});
+    expect(clientOptions).toHaveLength(0);
+    expect(warnings).toEqual([
+      "HYPERFRAMES_VERTEX_MODEL is not a model id; skipped vision captioning.",
+    ]);
+  });
+
+  it.each([
+    "gemini-2.5-flash",
+    "google/gemini-2.5-flash",
+    "publishers/anthropic/models/claude-sonnet-4@20250514",
+    "projects/example.com:proj/locations/us-central1/endpoints/123",
+  ])("accepts the model id %s", async (model) => {
+    const dir = makeProjectWithImages();
+    dirs.push(dir);
+    vertexEnv();
+    vi.stubEnv("HYPERFRAMES_VERTEX_MODEL", model);
+    generateContentMock.mockResolvedValue({ text: "A caption." });
+
+    const captions = await captionImagesWithGemini(dir, () => {}, []);
+
+    expect(captions).toEqual({ "hero.png": "A caption." });
+    expect(generateContentMock.mock.calls[0]?.[0]).toMatchObject({ model });
+  });
+
+  it.each(["global", "us", "eu", "europe-west4"])("accepts the region %s", async (location) => {
+    const dir = makeProjectWithImages();
+    dirs.push(dir);
+    vertexEnv();
+    vi.stubEnv("HYPERFRAMES_VERTEX_LOCATION", location);
+    vi.stubEnv("HYPERFRAMES_VERTEX_MODEL", "publishers/google/models/gemini-2.5-flash-001");
+    generateContentMock.mockResolvedValue({ text: "A caption." });
+
+    const captions = await captionImagesWithGemini(dir, () => {}, []);
+
+    expect(captions).toEqual({ "hero.png": "A caption." });
+    expect(clientOptions[0]).toMatchObject({ location });
+  });
+
   it("spends no output budget on thinking", async () => {
     // Thinking tokens come out of maxOutputTokens, so a model left free to think can consume
     // the whole budget and return empty text: a successful request that produces no caption.
@@ -607,6 +724,36 @@ describe("captionImagesWithGemini — Vertex AI provider", () => {
       status: "degraded",
       reason: "internal-error",
     });
+  });
+
+  it.each([
+    {
+      type: "external_account",
+      token_url: "https://collector.example/token",
+      credential_source: { file: "/home/user/.ssh/id_ed25519" },
+    },
+    {
+      type: "impersonated_service_account",
+      service_account_impersonation_url: "https://collector.example/impersonate",
+      source_credentials: {},
+    },
+    { type: "service_account", token_uri: "https://collector.example/token" },
+    { type: "service_account", credential_source: { url: "http://169.254.169.254/" } },
+  ])("refuses a credential that is not a plain service-account key: $type", async (credential) => {
+    const dir = makeProjectWithImages();
+    dirs.push(dir);
+    vi.stubEnv("OPENROUTER_API_KEY", "");
+    vi.stubEnv("GEMINI_API_KEY", "");
+    vi.stubEnv("HYPERFRAMES_VERTEX_PROJECT_ID", "prefab-kit-000000");
+    vi.stubEnv("HYPERFRAMES_VERTEX_SERVICE_ACCOUNT", JSON.stringify(credential));
+
+    const warnings: string[] = [];
+    const captions = await captionImagesWithGemini(dir, () => {}, warnings);
+
+    expect(captions).toEqual({});
+    expect(clientOptions).toHaveLength(0);
+    expect(generateContentMock).not.toHaveBeenCalled();
+    expect(warnings.join(" ")).toContain("not a service-account key");
   });
 
   it("stays on OpenRouter when the user has opted into it explicitly", async () => {

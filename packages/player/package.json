@@ -1,6 +1,6 @@
 {
   "name": "@hyperframes/player",
-  "version": "0.8.137",
+  "version": "0.9.63",
   "description": "Embeddable web component for HyperFrames compositions",
   "repository": {
     "type": "git",
@@ -29,10 +29,13 @@
   },
   "scripts": {
     "build": "tsup && node scripts/verify-runtime-pin.mjs",
-    "typecheck": "tsc --noEmit && tsc --noEmit -p tests/perf/tsconfig.json",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tests/perf/tsconfig.json && tsc --noEmit -p tests/playbench/tsconfig.json",
     "test": "vitest run",
     "test:browser-security": "bun run tests/browser/sandbox-origin.ts",
-    "perf": "bun run tests/perf/index.ts"
+    "test:browser-raster": "bun run tests/browser/preview-raster-size.ts",
+    "test:browser-box": "bun run tests/browser/player-box.ts",
+    "perf": "bun run tests/perf/index.ts",
+    "playbench": "bun run tests/playbench/run.ts"
   },
   "dependencies": {
     "@hyperframes/core": "workspace:*"
@@ -43,6 +46,6 @@
     "puppeteer-core": "^25.2.1",
     "tsup": "^8.0.0",
     "typescript": "^5.0.0",
-    "vitest": "^4.1.11"
+    "vitest": "^4.1.12"
   }
 }

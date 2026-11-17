@@ -25,6 +25,7 @@ import {
 } from "./gsapShared";
 import { useStableHandlers } from "./useStableHandlers";
 import { progressAtTime, runEaseOf, timeAtProgress, warpsTime } from "../utils/gsapKeyframeEases";
+import { countOf } from "../utils/countOf";
 
 type RecordedKeyframe = {
   percentage: number;
@@ -182,11 +183,11 @@ export function useGestureCommit({
         frozenSamples.length > 0 ? (frozenSamples[frozenSamples.length - 1]?.time ?? 0) : 0;
 
       if (frozenSamples.length <= 2) {
-        showToast("No gesture detected — move the pointer while recording", "error");
+        showToast("No gesture detected. Move the pointer while recording", "error");
         return;
       }
       if (duration <= 0) {
-        showToast("Recording too short — try again", "error");
+        showToast("Recording too short. Try again", "error");
         return;
       }
 
@@ -213,7 +214,7 @@ export function useGestureCommit({
       // would record the gesture onto every sibling sharing it.
       const selector = sel.id ? idSelector(sel.id) : sel.selector;
       if (!selector) {
-        showToast("Cannot save — element has no selector", "error");
+        showToast("Cannot save: element has no selector", "error");
         return;
       }
       // A recorded gesture becomes a NEW tween, so its target must address one
@@ -375,7 +376,7 @@ export function useGestureCommit({
         }
         trackPreviewEditResult("gesture_recording", recordingMethodRef.current, outcome.finish());
       }
-      showToast(`Recorded ${sortedPcts.length} keyframes`, "info");
+      showToast(`Recorded ${countOf(sortedPcts.length, "keyframe")}`, "info");
     } catch (err) {
       console.error("[GR:error]", err);
       showToast(`Gesture commit failed: ${err}`, "error");
@@ -412,7 +413,7 @@ export function useGestureCommit({
       }
       const iframe = previewIframeRef.current;
       if (!iframe) {
-        showToast("Preview not ready — try again", "error");
+        showToast("Preview not ready. Try again", "error");
         return;
       }
 

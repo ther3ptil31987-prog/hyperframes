@@ -128,7 +128,7 @@ describe("measureManualOffsetDragScreenToOffsetMatrix", () => {
   });
 
   it("measures movement in parent viewport pixels when the element is inside a scaled iframe", () => {
-    const window = new Window();
+    const window = new Window({ settings: { enableIframePageLoading: true } });
     const iframe = window.document.createElement("iframe");
     window.document.body.append(iframe);
     const iframeWindow = iframe.contentWindow;
@@ -449,6 +449,29 @@ describe("GSAP-element drag — dot-a flies regressions", () => {
     expect(element.hasAttribute("data-hf-studio-path-offset")).toBe(false);
     // ...and the position survives in the GSAP transform (no stale var to compose).
     expect(element.style.getPropertyValue("transform")).toMatch(/translate\(/);
+  });
+});
+
+describe("a drag that starts while an earlier gesture is still saving", () => {
+  it("keeps the timelines paused until the later drag ends", () => {
+    const { element, member } = makeGsapDot();
+    let paused = false;
+    const timeline = {
+      pause: () => (paused = true),
+      paused: (v?: boolean) => (paused = v ?? paused),
+    };
+    (element.ownerDocument.defaultView as unknown as { __timelines: unknown }).__timelines = {
+      main: timeline,
+    };
+    const earlier = member();
+    applyManualOffsetDragCommit(earlier, -50, 0);
+    const later = member();
+
+    endManualOffsetDragMembers([earlier]);
+
+    expect(paused).toBe(true);
+    endManualOffsetDragMembers([later]);
+    expect(paused).toBe(false);
   });
 });
 

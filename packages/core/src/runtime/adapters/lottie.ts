@@ -1,53 +1,8 @@
 import type { RuntimeDeterministicAdapter } from "../types";
 import { swallow } from "../diagnostics";
 
-/**
- * Lottie adapter for HyperFrames
- *
- * Supports lottie-web and @lottiefiles/dotlottie-web.
- *
- * ## Usage in a composition
- *
- * ### lottie-web (classic):
- * ```html
- * <script src="https://cdnjs.cloudflare.com/ajax/libs/bodymovin/5.12.2/lottie.min.js"></script>
- * <div id="anim"></div>
- * <script>
- *   const anim = lottie.loadAnimation({
- *     container: document.getElementById('anim'),
- *     renderer: 'svg',
- *     loop: false,
- *     autoplay: false,
- *     path: 'animation.json',
- *   });
- *   // Register so the adapter can seek it:
- *   window.__hfLottie = window.__hfLottie || [];
- *   window.__hfLottie.push(anim);
- * </script>
- * ```
- *
- * ### @lottiefiles/dotlottie-web:
- * ```html
- * <script src="https://unpkg.com/@lottiefiles/dotlottie-web"></script>
- * <canvas id="anim"></canvas>
- * <script>
- *   const player = new DotLottie({
- *     canvas: document.getElementById('anim'),
- *     src: 'animation.lottie',
- *     autoplay: false,
- *   });
- *   window.__hfLottie = window.__hfLottie || [];
- *   window.__hfLottie.push(player);
- * </script>
- * ```
- *
- * Multiple animations are supported — all are seeked in sync.
- *
- * ## Auto-discovery
- *
- * The adapter also attempts to auto-discover Lottie animations registered
- * via the global `lottie` object, so compositions that call
- * `lottie.loadAnimation(...)` without manually registering still work.
+/** Seeks paused lottie-web and dotLottie instances registered on window.__hfLottie.
+ * Setup: skills/hyperframes/references/runtimes.md
  */
 export function createLottieAdapter(params?: {
   resolveStartSeconds?: (element: Element) => number;
@@ -113,10 +68,22 @@ export function createLottieAdapter(params?: {
               anim.goToAndStop(time * 1000, false);
             }
           } else if (isDotLottiePlayer(anim)) {
-            // @lottiefiles/dotlottie-web: DotLottie
-            // .seek(frame) — frame is 0-100 percentage OR frame number depending on version
-            // Newer versions use setFrame(frame) or seek(percentage)
-            if (typeof anim.setCurrentRawFrameValue === "function") {
+            if (typeof anim.setFrame === "function") {
+              const totalFrames = anim.totalFrames ?? 0;
+              const duration = anim.duration ?? 0;
+              if (
+                !Number.isFinite(totalFrames) ||
+                totalFrames <= 0 ||
+                !Number.isFinite(duration) ||
+                duration <= 0
+              ) {
+                continue;
+              }
+              const frame = (time * totalFrames) / duration;
+              anim.setFrame(
+                Math.min(loops ? wrapFrame(frame, totalFrames) : frame, totalFrames - 1),
+              );
+            } else if (typeof anim.setCurrentRawFrameValue === "function") {
               // dotlottie-web v2+: direct frame setter
               const totalFrames = anim.totalFrames ?? 0;
               const fps = anim.frameRate ?? 30;
@@ -288,6 +255,7 @@ interface LottieWebGlobal {
 interface DotLottiePlayer {
   play: () => void;
   pause: () => void;
+  setFrame?: (frame: number) => void;
   seek?: (percentage: number) => void;
   setCurrentRawFrameValue?: (frame: number) => void;
   totalFrames?: number;

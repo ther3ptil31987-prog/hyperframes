@@ -48,7 +48,44 @@ function compositionBoxSelector(scope: string): string {
   return `${scope}:not(:has([${INNER_ROOT_ATTR}])), ${scope} > [${INNER_ROOT_ATTR}]`;
 }
 
+function dropRootCompositionIdAttr(
+  selector: string,
+  authoredRootId: string | null | undefined,
+  compositionId: string,
+): string {
+  const trimmed = authoredRootId?.trim();
+  if (!trimmed) return selector;
+  const authored = escapeRegExp(`[${AUTHORED_ROOT_ID_ATTR}="${escapeCssAttributeValue(trimmed)}"]`);
+  const quotedCompId = escapeRegExp(compositionId);
+  const comp = String.raw`\[\s*data-composition-id\s*=\s*(?:"${quotedCompId}"|'${quotedCompId}')\s*\]`;
+  return selector.replace(new RegExp(`(${authored})${comp}|${comp}(${authored})`, "g"), "$1$2");
+}
+
 function scopeSelector(
+  selector: string,
+  scope: string,
+  compositionId: string,
+  authoredRootId?: string | null,
+  compoundAuthoredRoot?: boolean,
+  scopeRootSelectors?: boolean,
+): string {
+  const authored = normalizeAuthoredRootIdSelector(selector, authoredRootId);
+  const wrapperAlone = dropRootCompositionIdAttr(authored, authoredRootId, compositionId);
+  const scopeOnce = (text: string) =>
+    scopeSelectorOnce(
+      text,
+      scope,
+      compositionId,
+      authoredRootId,
+      compoundAuthoredRoot,
+      scopeRootSelectors,
+    );
+  if (wrapperAlone === authored) return scopeOnce(selector);
+  // A named host carries the id, the preserved inner root the authored id; an anonymous host's wrapper carries both.
+  return `${scopeOnce(authored).trim()}, ${scopeOnce(wrapperAlone).trim()}`;
+}
+
+function scopeSelectorOnce(
   selector: string,
   scope: string,
   compositionId: string,
@@ -161,41 +198,127 @@ function isNestedInsideAnotherRule(rule: Rule): boolean {
   return false;
 }
 
+type ScopeOptions = { compoundAuthoredRoot?: boolean; scopeRootSelectors?: boolean };
+
 export function scopeCssToComposition(
   css: string,
   compositionId: string,
   scopeSelectorOverride?: string,
   authoredRootId?: string | null,
-  options?: { compoundAuthoredRoot?: boolean; scopeRootSelectors?: boolean },
+  options?: ScopeOptions,
 ): string {
   const trimmedCompositionId = compositionId.trim();
   if (!css || !trimmedCompositionId) return css;
   const scope =
     scopeSelectorOverride ||
     `[data-composition-id="${escapeCssAttributeValue(trimmedCompositionId)}"]`;
-  let root: postcss.Root;
-  try {
-    root = postcss.parse(css);
-  } catch {
-    return "";
-  }
+  const root = parseCss(css);
+  return root ? scopeParsedCss(root, scope, trimmedCompositionId, authoredRootId, options) : "";
+}
 
+function parseCss(css: string): postcss.Root | null {
+  try {
+    return postcss.parse(css);
+  } catch {
+    return null;
+  }
+}
+
+function forEachScopedRule(root: postcss.Root, visit: (rule: Rule) => void): void {
   root.walkRules((rule) => {
     if (isInsideGlobalAtRule(rule)) return;
     if (isNestedInsideAnotherRule(rule)) return;
+    visit(rule);
+  });
+}
+
+function scopeParsedCss(
+  root: postcss.Root,
+  scope: string,
+  compositionId: string,
+  authoredRootId: string | null | undefined,
+  options: ScopeOptions | undefined,
+): string {
+  forEachScopedRule(root, (rule) => {
     rule.selectors = rule.selectors.map((selector) =>
       scopeSelector(
         selector,
         scope,
-        trimmedCompositionId,
+        compositionId,
         authoredRootId,
         options?.compoundAuthoredRoot,
         options?.scopeRootSelectors,
       ),
     );
   });
-
   return root.toResult({ map: false }).css;
+}
+
+// Shaped like every scope it stands in for, so each selector test treats the two alike; its only `[` is
+// its first character, so no occurrence of it overlaps another or the text around it.
+const PLACEHOLDER_ID = "hf-scope-placeholder";
+const PLACEHOLDER_SCOPE = `[data-composition-id="${PLACEHOLDER_ID}"]`;
+// No quote, bracket, backslash, space or `$` (a String.replace pattern): such a scope lands verbatim.
+const PLAIN_ID = /^[\w.:-]+$/;
+const PLAIN_SCOPE = /^\[data-composition-id="([\w.:-]+)"\]$/;
+
+/** `scopeCssToComposition` for sheets mounted many times: each sheet is scoped once around a
+ * placeholder scope, which each mount's own scope then replaces. */
+export function createCompositionCssScoper(): typeof scopeCssToComposition {
+  const templates = new Map<string, string | null>();
+  return (css, compositionId, scopeSelectorOverride, authoredRootId, options) => {
+    const trimmedId = compositionId.trim();
+    const scope = scopeSelectorOverride ?? "";
+    const scopeId = PLAIN_SCOPE.exec(scope)?.[1];
+    if (
+      !scopeId ||
+      scopeId === trimmedId ||
+      !PLAIN_ID.test(trimmedId) ||
+      trimmedId === PLACEHOLDER_ID
+    )
+      return scopeCssToComposition(
+        css,
+        compositionId,
+        scopeSelectorOverride,
+        authoredRootId,
+        options,
+      );
+    const key = JSON.stringify([
+      trimmedId,
+      authoredRootId ?? null,
+      Boolean(options?.compoundAuthoredRoot),
+      Boolean(options?.scopeRootSelectors),
+      css,
+    ]);
+    let template = templates.get(key);
+    if (template === undefined) {
+      template = scopeTemplate(css, trimmedId, authoredRootId, options);
+      templates.set(key, template);
+    }
+    return template === null
+      ? scopeCssToComposition(css, compositionId, scopeSelectorOverride, authoredRootId, options)
+      : template.split(PLACEHOLDER_SCOPE).join(scope);
+  };
+}
+
+/** Null when the placeholder is already in the sheet, or a selector keeps its raw text (it holds a comment). */
+function scopeTemplate(
+  css: string,
+  compositionId: string,
+  authoredRootId: string | null | undefined,
+  options: ScopeOptions | undefined,
+): string | null {
+  if (css.includes(PLACEHOLDER_SCOPE)) return null;
+  if (!css) return css;
+  const root = parseCss(css);
+  if (!root) return "";
+  let rawSelector = false;
+  forEachScopedRule(root, (rule) => {
+    rawSelector ||= Boolean(rule.raws.selector);
+  });
+  return rawSelector
+    ? null
+    : scopeParsedCss(root, PLACEHOLDER_SCOPE, compositionId, authoredRootId, options);
 }
 
 function isFontFaceAtRule(node: { type: string; name?: string }): node is AtRule {
@@ -219,7 +342,14 @@ function fontFaceKey(atRule: AtRule): string {
 
 /** Drops repeats of an identical `@font-face` across the given style texts, keeping the last copy:
  * the last matching rule is the one the browser uses, so a rule in between never gains precedence. */
-export function dedupeFontFaceRules(styleTexts: string[]): string[] {
+export const dedupeFontFaceRules = (styleTexts: string[]): string[] => dropFontFaces(styleTexts);
+
+export function hoistFontFaceRules(styleTexts: string[]): { styles: string[]; faces: string[] } {
+  const faces: string[] = [];
+  return { styles: dropFontFaces(styleTexts, faces), faces };
+}
+
+function dropFontFaces(styleTexts: string[], hoisted?: string[]): string[] {
   const seen = new Set<string>();
   return [...styleTexts]
     .reverse()
@@ -235,12 +365,13 @@ export function dedupeFontFaceRules(styleTexts: string[]): string[] {
       for (const node of [...(root.nodes ?? [])].reverse()) {
         if (!isFontFaceAtRule(node)) continue;
         const key = fontFaceKey(node);
-        if (seen.has(key)) {
-          node.remove();
-          changed = true;
-        } else {
+        if (!seen.has(key)) {
           seen.add(key);
+          if (!hoisted) continue;
+          hoisted.unshift(node.toString());
         }
+        node.remove();
+        changed = true;
       }
       return changed ? root.toResult({ map: false }).css : css;
     })
@@ -281,6 +412,9 @@ const SCOPED_HYPERFRAMES_EXPRESSION = `!__hfBaseHyperframes
         },
       })`;
 
+export const AUTHORED_SOURCE_BEGIN = "/*hf-authored-begin*/";
+export const AUTHORED_SOURCE_END = "/*hf-authored-end*/";
+
 export function scopedModulePrelude(
   timelineCompositionId: string,
   compositionSrc?: string | null,
@@ -310,6 +444,9 @@ export function wrapScopedCompositionScript(
   const rootSelectorPatternLiteral = jsonScriptLiteral(
     String.raw`\[\s*data-composition-id\s*=\s*(?:"${escapedCompositionId}"|'${escapedCompositionId}')\s*\]`,
   );
+  const timelineRootSelectorPatternLiteral = jsonScriptLiteral(
+    String.raw`\[\s*data-composition-id\s*=\s*(?:"${escapeRegExp(timelineCompositionId)}"|'${escapeRegExp(timelineCompositionId)}')\s*\]`,
+  );
   const timingSelectorPatternLiteral = jsonScriptLiteral(
     String.raw`\s*\[\s*data-(?:start|duration)\s*=\s*(?:"[^"]*"|'[^']*')\s*\]`,
   );
@@ -330,6 +467,7 @@ export function wrapScopedCompositionScript(
     : "");
   var __hfRoot = null;
   var __hfRootSelectorPattern = ${rootSelectorPatternLiteral};
+  var __hfTimelineRootSelectorPattern = ${timelineRootSelectorPatternLiteral};
   var __hfTimingSelectorPattern = ${timingSelectorPatternLiteral};
   var __hfAuthoredRootSelector = __hfAuthoredRootId
     ? "[" + __hfAuthoredRootAttr + '="' + __hfEscapeAttr(__hfAuthoredRootId) + '"]'
@@ -341,7 +479,11 @@ export function wrapScopedCompositionScript(
     if (!__hfCompId || typeof selector !== "string") return selector;
     var normalized = selector
       .replace(new RegExp(__hfRootSelectorPattern + '(?:' + __hfTimingSelectorPattern + ')+', 'g'), __hfRootSelector)
-      .replace(new RegExp('(?:' + __hfTimingSelectorPattern + ')+' + __hfRootSelectorPattern, 'g'), __hfRootSelector);
+      .replace(new RegExp('(?:' + __hfTimingSelectorPattern + ')+' + __hfRootSelectorPattern, 'g'), __hfRootSelector)
+      .replace(new RegExp(__hfRootSelectorPattern, 'g'), __hfRootSelector);
+    if (__hfTimelineCompId !== __hfCompId) {
+      normalized = normalized.replace(new RegExp(__hfTimelineRootSelectorPattern, 'g'), __hfRootSelector);
+    }
     return window.__hfSvgSelectorAliases.rewrite(normalized, __hfAuthoredRootEntries);
   };
   var __hfFindRoot = function() {
@@ -415,10 +557,8 @@ export function wrapScopedCompositionScript(
           if (prop !== __hfCompId) {
             return Reflect.get(target, prop, target);
           }
-          var authoredValue = Reflect.get(target, prop, target);
-          return authoredValue === undefined
-            ? Reflect.get(target, __hfTimelineCompId, target)
-            : authoredValue;
+          var runtimeValue = Reflect.get(target, __hfTimelineCompId, target);
+          return runtimeValue === undefined ? Reflect.get(target, prop, target) : runtimeValue;
         },
         set: function(target, prop, value, receiver) {
           if (prop !== __hfCompId) {
@@ -426,11 +566,15 @@ export function wrapScopedCompositionScript(
           }
           // The authored node remains in the compiled DOM when its local id
           // differs from the runtime mount id, so readiness legitimately sees
-          // both compositions. Publish the same timeline under both identities
-          // instead of replacing one with the other.
-          var authoredSet = Reflect.set(target, __hfCompId, value, target);
+          // both compositions. Publish the same timeline under both identities,
+          // unless another mount of the same file already owns the authored one.
+          var authoredValue = Reflect.get(target, __hfCompId, target);
+          var ownsAuthored =
+            authoredValue === undefined ||
+            authoredValue === Reflect.get(target, __hfTimelineCompId, target);
           var runtimeSet = Reflect.set(target, __hfTimelineCompId, value, target);
-          return authoredSet && runtimeSet;
+          if (!ownsAuthored) return runtimeSet;
+          return Reflect.set(target, __hfCompId, value, target) && runtimeSet;
         },
       });
     }
@@ -483,16 +627,22 @@ export function wrapScopedCompositionScript(
       })
     : window;
   var __hfResolveGsapTarget = function(target) {
-    if (typeof target === "string") return __hfQueryAll(target);
-    if (!Array.isArray(target)) return target;
-    return target.reduce(function(resolved, item) {
+    if (typeof target !== "string" && !Array.isArray(target)) return target;
+    var resolved = typeof target === "string" ? __hfQueryAll(target) : target.reduce(function(resolved, item) {
       if (typeof item === "string") {
         return resolved.concat(Array.prototype.slice.call(__hfQueryAll(item)));
       }
       resolved.push(item);
       return resolved;
     }, []);
-
+    if (!resolved.length) {
+      // GSAP warns "GSAP target " + targets + " not found"; a bare empty match list prints an
+      // empty name. Keep the authored selector as the text while still targeting nothing here.
+      var originalTarget = String(target);
+      resolved = [];
+      resolved.toString = function() { return originalTarget; };
+    }
+    return resolved;
   };
   var __hfScopeTimeline = function(timeline) {
     if (!timeline || timeline.__hfScopedCompositionRoot === __hfFindRoot()) return timeline;
@@ -571,12 +721,18 @@ export function wrapScopedCompositionScript(
   var __hfBaseHyperframes = window.__hyperframes;
   var __hfScopedHyperframes = ${SCOPED_HYPERFRAMES_EXPRESSION};
   var __hfRun = function() {
+    var report = window.__hfScriptState;
+    if (typeof report === "function") report("start", __hfCompositionSrc || "index.html");
     try {
       (function(document, gsap, window, __hyperframes) {
+${AUTHORED_SOURCE_BEGIN}
 ${source.replace(/<\/(script)/gi, "<\\/$1")}
+${AUTHORED_SOURCE_END}
       }).call(window, __hfScopedDocument, __hfScopedGsap, __hfScopedWindow, __hfScopedHyperframes);
     } catch (_err) {
       console.error(__hfErrorLabel, __hfCompId, _err);
+    } finally {
+      if (typeof report === "function") report("finish", __hfCompositionSrc || "index.html");
     }
   };
   // What the script started on the global gsap timeline, by any route, for a scene swap to revert.
@@ -636,4 +792,16 @@ export function buildVariablesByCompScript(
   if (!variablesByComp || Object.keys(variablesByComp).length === 0) return null;
   const json = jsonScriptLiteral(variablesByComp);
   return `window.__hfVariablesByComp = Object.assign({}, window.__hfVariablesByComp || {}, ${json});`;
+}
+
+/** Writes the table in <head>, so it exists before the composition scripts, which wait for web fonts. */
+export function emitVariablesByCompScript(
+  document: Document,
+  variablesByComp: Record<string, Record<string, unknown>>,
+): void {
+  const text = buildVariablesByCompScript(variablesByComp);
+  if (!text || !document.head) return;
+  const script = document.createElement("script");
+  script.textContent = text;
+  document.head.appendChild(script);
 }

@@ -1,6 +1,11 @@
 import { DEFAULT_IMAGE_TIMELINE_DURATION_SECONDS } from "@hyperframes/parsers/media-duration";
 import { describe, it, expect, afterEach } from "vitest";
-import { collectRuntimeTimelinePayload } from "./timeline";
+import {
+  collectRuntimeTimelinePayload,
+  isRuntimeElementVisibleAt,
+  runtimeElementWindow,
+} from "./timeline";
+import { createRuntimeStartTimeResolver } from "./startResolver";
 
 type TimelineTestWindow = Window & {
   __timelines?: Record<string, { duration: () => number }>;
@@ -1109,5 +1114,54 @@ describe("collectRuntimeTimelinePayload", () => {
       expect(result.durationSeconds).toBe(154.8);
       expect(result.durationInFrames).toBe(Math.ceil(154.8 * 30));
     });
+  });
+});
+
+describe("runtimeElementWindow", () => {
+  afterEach(() => {
+    document.body.innerHTML = "";
+  });
+
+  // A root with no data-duration and a 2 s timeline under a 6 s video went black from 2 s.
+  it("ends a nested scene with its timeline, but never the root", () => {
+    document.body.innerHTML = `<div id="main" data-composition-id="main" data-start="0">
+      <div id="scene" data-composition-id="scene" data-start="0"></div></div>`;
+    const timelineRegistry = { main: { duration: () => 2 }, scene: { duration: () => 2 } };
+    const options = { timelineRegistry, resolver: createRuntimeStartTimeResolver({}) };
+    expect(runtimeElementWindow(document.getElementById("main")!, options)).toEqual({
+      start: 0,
+      end: Number.POSITIVE_INFINITY,
+    });
+    expect(runtimeElementWindow(document.getElementById("scene")!, options)).toEqual({
+      start: 0,
+      end: 2,
+    });
+  });
+});
+
+describe("isRuntimeElementVisibleAt", () => {
+  afterEach(() => {
+    document.body.innerHTML = "";
+  });
+
+  // fails without the fix: snapshot and preview read the authored seconds, so a title held across two clips whose
+  // second start sits a hair past 100 s went blank at exactly 100 s, the frame render shows it on.
+  it("puts a clip edge a hair off a frame on that frame for preview and snapshot, as render does", () => {
+    document.body.innerHTML = `<div id="main" data-composition-id="main" data-start="0" data-duration="110">
+      <div id="held" data-start="90" data-duration="10"></div>
+      <div id="rest" data-start="100.00002" data-duration="10"></div></div>`;
+    const shownAt = (currentTime: number) =>
+      ["held", "rest"].filter((id) =>
+        isRuntimeElementVisibleAt(document.getElementById(id)!, {
+          currentTime,
+          compositionDuration: 110,
+          canonicalFps: 30,
+          timelineRegistry: {},
+          resolver: createRuntimeStartTimeResolver({}),
+        }),
+      );
+    expect(shownAt(99.875)).toEqual(["held"]);
+    expect(shownAt(100)).toEqual(["rest"]);
+    expect(shownAt(100.125)).toEqual(["rest"]);
   });
 });

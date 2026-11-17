@@ -1,4 +1,5 @@
 import { buildProjectApiPath } from "../utils/projectRouting";
+import { editContextTarget } from "../utils/studioFileHistory";
 import { useCallback } from "react";
 import { findUnsafeDomPatchValues } from "@hyperframes/core/studio-api/finite-mutation";
 import { FONT_EXT } from "../utils/mediaTypes";
@@ -23,6 +24,7 @@ import {
 } from "./useDomEditCommitsHelpers";
 import type { CutoverResult } from "../utils/sdkCutover";
 import { serializeStudioFileMutations } from "../utils/studioFileMutationCoordinator";
+import { encodeUrlPath } from "@hyperframes/parsers";
 
 export interface UseDomEditCommitsParams {
   activeCompPath: string | null;
@@ -112,7 +114,7 @@ export function useDomEditCommits({
       return {
         family: fontFamilyFromAssetPath(asset),
         path: asset,
-        url: buildProjectApiPath(projectId, `/preview/${asset}`),
+        url: buildProjectApiPath(projectId, `/preview/${encodeUrlPath(asset)}`),
       };
     },
     [fileTree, projectId, importedFontAssetsRef],
@@ -177,6 +179,13 @@ export function useDomEditCommits({
                   coalesceKey: options.coalesceKey,
                   coalesceMs: options.coalesceMs,
                   files,
+                  targets: batches
+                    .filter((batch) => Object.hasOwn(files, batch.sourceFile))
+                    .flatMap((batch) =>
+                      batch.patches.map(({ target }) =>
+                        editContextTarget(batch.sourceFile, target),
+                      ),
+                    ),
                 });
               }
               return {

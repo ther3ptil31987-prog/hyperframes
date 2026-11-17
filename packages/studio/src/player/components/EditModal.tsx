@@ -1,4 +1,5 @@
 import { useState, useCallback, useMemo, useRef } from "react";
+import { createPortal } from "react-dom";
 import { useMountEffect } from "../../hooks/useMountEffect";
 import { usePlayerStore } from "../store/playerStore";
 import { formatTime } from "../lib/time";
@@ -126,7 +127,7 @@ export function EditPopover({ rangeStart, rangeEnd, anchorX, anchorY, onClose }:
     zIndex: 200,
   };
 
-  return (
+  return createPortal(
     <div ref={popoverRef} style={style}>
       <div className="w-80 bg-neutral-900 border border-neutral-700/60 rounded-xl shadow-2xl shadow-black/40 overflow-hidden">
         {/* Header */}
@@ -134,7 +135,7 @@ export function EditPopover({ rangeStart, rangeEnd, anchorX, anchorY, onClose }:
           <div className="flex items-center gap-2">
             <div className="w-1.5 h-1.5 rounded-full bg-studio-accent" />
             <span className="text-[11px] font-medium text-neutral-300">
-              {formatTime(start)} — {formatTime(end)}
+              {formatTime(start)} to {formatTime(end)}
             </span>
           </div>
           <span className="text-[10px] text-neutral-600">
@@ -175,7 +176,7 @@ export function EditPopover({ rangeStart, rangeEnd, anchorX, anchorY, onClose }:
         {/* Action */}
         {copyError && (
           <p className="px-3 pb-2 text-[10px] text-danger-ink" role="alert">
-            Copy failed — check clipboard permissions and try again.
+            Copy failed. Check clipboard permissions and try again.
           </p>
         )}
         <div className="grid grid-cols-2 gap-2 px-3 pb-3">
@@ -205,6 +206,7 @@ export function EditPopover({ rangeStart, rangeEnd, anchorX, anchorY, onClose }:
           </button>
         </div>
       </div>
-    </div>
+    </div>,
+    document.body,
   );
 }

@@ -1,15 +1,17 @@
-import { failCommand } from "../../utils/commandResult.js";
+import { isUnattended } from "../../utils/attendedTerminal.js";
+import { CliUsageError, failCommand } from "../../utils/commandResult.js";
 /**
  * `hyperframes auth logout` — remove the credential file. With
  * `--keep-api-key`, only the OAuth block is cleared (no-op for
  * API-key-only stores).
  *
- * Env-only credentials (`HEYGEN_API_KEY`, `HYPERFRAMES_API_KEY`) can't
- * be cleared by this command — we tell the user to unset them.
+ * Env-only credentials (`HEYGEN_API_KEY`, `HYPERFRAMES_API_KEY`,
+ * `HEYGEN_ACCESS_TOKEN`) can't be cleared by this command — we tell the user to unset them.
  */
 
-import { defineCommand } from "citty";
+import { defineCommand } from "../../utils/defineCommand.js";
 import {
+  ENV_CREDENTIAL_VAR,
   clearOAuth,
   configDir,
   credentialPath,
@@ -57,20 +59,23 @@ export default defineCommand({
 });
 
 function warnIfEnvCredentialActive(): void {
-  if (process.env["HEYGEN_API_KEY"] || process.env["HYPERFRAMES_API_KEY"]) {
+  const active = Object.values(ENV_CREDENTIAL_VAR).filter((name) => process.env[name]);
+  if (active.length > 0) {
     console.log(
-      c.warn(
-        "An env-var credential is active. Unset HEYGEN_API_KEY / HYPERFRAMES_API_KEY to remove it.",
-      ),
+      c.warn(`An env-var credential is active. Unset ${active.join(" / ")} to remove it.`),
     );
   }
 }
 
 async function ensureConfirmed(yes: boolean, keepApiKey: boolean): Promise<boolean> {
   if (yes) return true;
+  if (isUnattended())
+    throw new CliUsageError(
+      "Signing out requires confirmation. Run hyperframes auth logout --yes to sign out without a prompt.",
+    );
   const prompt = keepApiKey
-    ? `This will sign out of any active OAuth session on this machine (~/.heygen lives at ${configDir()}). Continue? [y/N] `
-    : `This will sign out of HeyGen on this machine (~/.heygen lives at ${configDir()}). Continue? [y/N] `;
+    ? `This will sign out of any active OAuth session on this machine (~/.hyperframes lives at ${configDir()}). Continue? [y/N] `
+    : `This will sign out of HeyGen on this machine (~/.hyperframes lives at ${configDir()}). Continue? [y/N] `;
   return confirmInteractive(prompt);
 }
 

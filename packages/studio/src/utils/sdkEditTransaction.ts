@@ -1,3 +1,4 @@
+import type { EditContextTarget } from "./studioFileHistory";
 import { openComposition, type Composition } from "@hyperframes/sdk";
 import { hashContent, markSelfWrite } from "../hooks/sdkSelfWriteRegistry";
 import { trackStudioEvent } from "./studioTelemetry";
@@ -31,6 +32,7 @@ export interface CutoverDeps {
   editHistory: {
     recordEdit: (entry: {
       label: string;
+      targets?: EditContextTarget[];
       coalesceKey?: string;
       coalesceMs?: number;
       files: Record<string, { before: string; after: string }>;
@@ -56,6 +58,7 @@ export interface CutoverDeps {
 }
 
 export interface CutoverOptions {
+  targets?: EditContextTarget[];
   label?: string;
   coalesceKey?: string;
   /** Coalesce window (ms); Infinity folds across a slow round-trip. */
@@ -232,6 +235,15 @@ async function rollbackWrite(
   }
 }
 
+function historyEntryOptions(options?: CutoverOptions) {
+  return {
+    label: options?.label ?? "Edit layer",
+    ...(options?.targets && { targets: options.targets }),
+    ...(options?.coalesceKey ? { coalesceKey: options.coalesceKey } : {}),
+    ...(options?.coalesceMs != null ? { coalesceMs: options.coalesceMs } : {}),
+  };
+}
+
 async function writeAndRecord(
   after: string,
   targetPath: string,
@@ -247,9 +259,7 @@ async function writeAndRecord(
   }
   try {
     await deps.editHistory.recordEdit({
-      label: options?.label ?? "Edit layer",
-      ...(options?.coalesceKey ? { coalesceKey: options.coalesceKey } : {}),
-      ...(options?.coalesceMs != null ? { coalesceMs: options.coalesceMs } : {}),
+      ...historyEntryOptions(options),
       files: { [targetPath]: { before: originalContent, after } },
     });
     return null;

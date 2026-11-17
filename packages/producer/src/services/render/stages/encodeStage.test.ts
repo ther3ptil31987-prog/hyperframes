@@ -46,6 +46,7 @@ mock.module("@hyperframes/engine", () => ({
   }),
   resolveConfig: () => resolvedEngineConfig,
   runFfmpeg: runFfmpegMock,
+  spawnStreamingEncoder: mock(),
 }));
 
 const tempDirs: string[] = [];
@@ -129,6 +130,7 @@ describe("gif encode args", () => {
   it("builds the palettegen pass with diff statistics", () => {
     expect(buildGifPalettegenArgs(input)).toEqual([
       "-y",
+      "-xerror",
       "-framerate",
       "15",
       "-reinit_filter",
@@ -144,6 +146,7 @@ describe("gif encode args", () => {
   it("builds the paletteuse pass with Sierra dithering and loop count", () => {
     expect(buildGifPaletteuseArgs({ ...input, loop: 3 })).toEqual([
       "-y",
+      "-xerror",
       "-framerate",
       "15",
       "-reinit_filter",
@@ -205,6 +208,58 @@ describe("frame pattern follows the capture format, not the output's alpha need"
     await runEncodeStage(makeInput());
 
     expect(encodeFramesFromDirMock.mock.calls[0]?.[1]).toBe("frame_%06d.jpg");
+  });
+});
+
+describe("runEncodeStage progress", () => {
+  async function stagesSeen(input: EncodeStageInput, totalFrames: number): Promise<unknown[]> {
+    const { runEncodeStage } = await import("./encodeStage.js");
+    input.job.totalFrames = totalFrames;
+    const seen: unknown[] = [];
+    await runEncodeStage({
+      ...input,
+      onProgress: (job, stage) =>
+        void seen.push({ stage, progress: job.progress, ...job.stageProgress }),
+    });
+    return seen;
+  }
+
+  it("reports the frames ffmpeg has encoded, for the bar and for machines", async () => {
+    encodeFramesFromDirMock.mockImplementationOnce(async (...args: unknown[]) => {
+      (args[6] as (frames: number) => void)(2);
+      return { success: true, outputPath: "", durationMs: 1, framesEncoded: 4, fileSize: 1 };
+    });
+    expect(await stagesSeen(makeInput(), 4)).toEqual([
+      { stage: "Encoding video", progress: 75, code: "encode", done: 0, total: 4 },
+      { stage: "Encoding frame 2/4", progress: 83, code: "encode", done: 2, total: 4 },
+      { stage: "Encoding frame 4/4", progress: 90, code: "encode", done: 4, total: 4 },
+    ]);
+  });
+
+  it("closes a PNG sequence at its last frame", async () => {
+    const paths = createFramesDir("png");
+    const pngs = makeInput({
+      framesDir: paths.framesDir,
+      outputPath: join(paths.root, "frames-out"),
+      isPngSequence: true,
+    });
+    expect(await stagesSeen(pngs, 4)).toEqual([
+      { stage: "Writing PNG sequence", progress: 75, code: "encode", done: 0, total: 4 },
+      { stage: "Encoding frame 4/4", progress: 90, code: "encode", done: 4, total: 4 },
+    ]);
+  });
+
+  it("closes a GIF encode at its last frame, though ffmpeg reports none in between", async () => {
+    const paths = createFramesDir("jpg");
+    const gif = makeInput({
+      framesDir: paths.framesDir,
+      outputPath: join(paths.root, "out.gif"),
+      isGif: true,
+    });
+    expect(await stagesSeen(gif, 4)).toEqual([
+      { stage: "Encoding GIF", progress: 75, code: "encode", done: 0, total: 4 },
+      { stage: "Encoding frame 4/4", progress: 90, code: "encode", done: 4, total: 4 },
+    ]);
   });
 });
 
@@ -279,62 +334,23 @@ describe("runEncodeStage config plumbing", () => {
     await expect(runEncodeStage(makeInput())).rejects.not.toBeInstanceOf(EncoderInterruptedError);
   });
 
-  it("scales the encode timeout for long compositions", async () => {
-    const { runEncodeStage } = await import("./encodeStage.js");
-
-    await runEncodeStage(
-      makeInput({
-        job: {
-          ...makeInput().job,
-          duration: 754.8,
-        },
-        engineConfig: { ffmpegEncodeTimeout: 600_000 },
-      }),
-    );
-
-    expect(encodeFramesFromDirMock.mock.calls[0]?.[5]).toEqual({
-      ffmpegEncodeTimeout: 3_019_200,
-    });
-  });
-
-  it("gives the reported long high-quality encode a 24x source-duration budget", async () => {
+  it("gives a long high-quality encode the configured no-progress timeout, unscaled", async () => {
     const { runEncodeStage } = await import("./encodeStage.js");
     const input = makeInput();
+    const engineConfig = { ffmpegEncodeTimeout: 600_000 };
 
     await runEncodeStage(
       makeInput({
         job: {
           ...input.job,
           config: { ...input.job.config, quality: "high" },
-          duration: 331.273,
+          duration: 754.8,
         },
-        engineConfig: { ffmpegEncodeTimeout: 600_000 },
+        engineConfig,
       }),
     );
 
-    expect(encodeFramesFromDirMock.mock.calls[0]?.[5]).toEqual({
-      ffmpegEncodeTimeout: 7_950_552,
-    });
-  });
-
-  it("keeps the 4x budget for a standard encode", async () => {
-    const { runEncodeStage } = await import("./encodeStage.js");
-    const input = makeInput();
-
-    await runEncodeStage(
-      makeInput({
-        job: {
-          ...input.job,
-          config: { ...input.job.config, quality: "standard" },
-          duration: 331.273,
-        },
-        engineConfig: { ffmpegEncodeTimeout: 600_000 },
-      }),
-    );
-
-    expect(encodeFramesFromDirMock.mock.calls[0]?.[5]).toEqual({
-      ffmpegEncodeTimeout: 1_325_092,
-    });
+    expect(encodeFramesFromDirMock.mock.calls[0]?.[5]).toBe(engineConfig);
   });
 
   it("preserves a larger operator timeout for high-quality encoding", async () => {

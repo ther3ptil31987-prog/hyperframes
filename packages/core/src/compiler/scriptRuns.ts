@@ -1,32 +1,9 @@
+import { isJavaScriptType } from "./compositionAssembly";
+
 export interface InlineScriptRun {
   members: Element[];
   /** First later script that executes on its own; the merged run must stay before it. Null: end of body. */
   anchor: Element | null;
-}
-
-// The HTML spec's JavaScript MIME type essence matches: a script with any of these types runs as classic.
-const JAVASCRIPT_TYPES = new Set([
-  "",
-  "application/ecmascript",
-  "application/javascript",
-  "application/x-ecmascript",
-  "application/x-javascript",
-  "text/ecmascript",
-  "text/javascript",
-  "text/javascript1.0",
-  "text/javascript1.1",
-  "text/javascript1.2",
-  "text/javascript1.3",
-  "text/javascript1.4",
-  "text/javascript1.5",
-  "text/jscript",
-  "text/livescript",
-  "text/x-ecmascript",
-  "text/x-javascript",
-]);
-
-export function isJavaScriptType(el: Element): boolean {
-  return JAVASCRIPT_TYPES.has((el.getAttribute("type") || "").trim().toLowerCase());
 }
 
 function isClassicInline(el: Element): boolean {
@@ -143,7 +120,11 @@ export function cssStyleMergeKey(el: Element): string | undefined {
   return JSON.stringify([media === "all" ? "" : media, el.getAttribute("title") ?? ""]);
 }
 
-export const UNCONDITIONAL_CSS_KEY = JSON.stringify(["", ""]);
+const UNCONDITIONAL_CSS_KEY = JSON.stringify(["", ""]);
+
+export function isAlwaysAppliedStyle(el: Element): boolean {
+  return cssStyleMergeKey(el) === UNCONDITIONAL_CSS_KEY && !el.closest("template, noscript, svg");
+}
 
 /** A link's identity and condition; fetch attributes (crossorigin, integrity, referrerpolicy) are not compared. */
 function linkDedupeKey(el: Element): string {

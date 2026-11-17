@@ -5,6 +5,7 @@
 
 import { ContextMenu as BaseContextMenu } from "@base-ui/react/context-menu";
 import { Menu as BaseMenu } from "@base-ui/react/menu";
+import { useRef } from "react";
 import type { ComponentPropsWithoutRef, ElementType, ReactElement, ReactNode } from "react";
 import { cn } from "./cn";
 
@@ -20,7 +21,19 @@ type StyledProps<T extends ElementType> = Omit<ComponentPropsWithoutRef<T>, "cla
 export type PopupPreviewState = "open";
 
 /** Where the portal puts the popup. `null` keeps it inline, next to its trigger. */
-type PortalContainer = ComponentPropsWithoutRef<typeof BaseMenu.Portal>["container"];
+export type PortalContainer = ComponentPropsWithoutRef<typeof BaseMenu.Portal>["container"];
+
+const CONTENTS = { display: "contents" } as const;
+
+/** Base UI reads a `null` container as "not resolved yet" and renders nothing, so give `null` a host by the trigger. */
+export function useInlinePortal(container: PortalContainer) {
+  const host = useRef<HTMLSpanElement>(null);
+  if (container !== null) return { host: null, portal: { container } };
+  return {
+    host: <span ref={host} style={CONTENTS} />,
+    portal: { container: host, style: CONTENTS },
+  };
+}
 
 /** Matches Tooltip's gap from its trigger, and its viewport margin. */
 const SIDE_OFFSET = 6;
@@ -34,7 +47,7 @@ const VIEWPORT_MARGIN = 8;
 export function floatingMotion(openDuration: "duration-open" | "duration-tooltip") {
   return cn(
     "origin-[var(--transform-origin)] outline-hidden",
-    "transition-[opacity,transform] ease-out-quint",
+    "transition-[opacity,scale] ease-out-quint",
     openDuration,
     "data-[ending-style]:duration-close data-[ending-style]:ease-in",
     "data-[starting-style]:[opacity:var(--popup-enter-opacity)]",
@@ -58,8 +71,8 @@ export const POPUP_LAYER = "z-200";
 const menuPopup = cn(popupSurface, "min-w-36 p-1 shadow-menu");
 
 /** One row. `data-highlighted` is set by keyboard and pointer alike, so the seen row is the Enter row. */
-const itemBase = cn(
-  "flex cursor-default select-none items-center justify-between gap-6 rounded-sm px-2 py-1.5",
+export const menuItemBase = cn(
+  "flex cursor-default select-none items-center justify-between gap-6 rounded-[calc(var(--radius-lg)-4px)] px-2 py-1.5",
   "text-step-11 whitespace-nowrap text-text-1",
   "outline-hidden transition-colors ease-out-quint duration-hover",
   "data-[highlighted]:bg-hover data-[highlighted]:text-text-0",
@@ -77,12 +90,51 @@ interface PositionedProps {
   side?: "top" | "bottom" | "left" | "right";
   align?: "start" | "center" | "end";
   sideOffset?: number;
-  /** Portal target. Pass the shadow root when the trigger lives in one. */
+  /** Portal target. Pass the shadow root when the trigger lives in one; `null` keeps it inline. */
   container?: PortalContainer;
   /** Names the popup for assistive tech. A menu with no name is unlabelled. */
   "aria-label"?: string;
   className?: string;
   "data-preview-state"?: PopupPreviewState;
+}
+
+/** What Base UI hands `onOpenChange`: why it would close, the event, and a way to keep it open. */
+type OpenChangeDetails = { reason: string; event: Event; cancel: () => void };
+
+/**
+ * The topmost open layer owns Escape. Escape pressed inside a dialog that holds neither this popup nor its trigger (one
+ * opened from the popup's own row) keeps the popup open and leaves the key alone, so that dialog closes first; the
+ * popup hears the next Escape, once it is on top again.
+ */
+export function useTopLayerEscape<D extends OpenChangeDetails>(
+  onOpenChange: ((open: boolean, details: D) => void) | undefined,
+) {
+  const own = useRef<{ popup: Element | null; trigger: Element | null }>({
+    popup: null,
+    trigger: null,
+  });
+  const change = (open: boolean, details: D) => {
+    const { popup, trigger } = own.current;
+    if (
+      !open &&
+      details.reason === "escape-key" &&
+      insideLayerAbove([popup, trigger], details.event)
+    )
+      return details.cancel();
+    onOpenChange?.(open, details);
+  };
+  return {
+    popup: (el: Element | null) => void (own.current.popup = el),
+    trigger: (el: Element | null) => void (own.current.trigger = el),
+    onOpenChange: change,
+  };
+}
+
+/** Whether `event` started inside an open dialog or modal that holds none of `own`. */
+function insideLayerAbove(own: (Element | null)[], event: Event): boolean {
+  const from = event.composedPath()[0];
+  const layer = from instanceof Element ? from.closest('dialog[open], [aria-modal="true"]') : null;
+  return layer !== null && !own.some((el) => el !== null && layer.contains(el));
 }
 
 interface MenuProps
@@ -109,10 +161,13 @@ export function Menu({
   "data-preview-state": previewState,
   ...root
 }: MenuProps) {
+  const inline = useInlinePortal(container);
+  const escape = useTopLayerEscape(root.onOpenChange);
   return (
-    <BaseMenu.Root {...root}>
-      <BaseMenu.Trigger render={trigger} />
-      <BaseMenu.Portal container={container}>
+    <BaseMenu.Root {...root} onOpenChange={escape.onOpenChange}>
+      <BaseMenu.Trigger ref={escape.trigger} render={trigger} />
+      {inline.host}
+      <BaseMenu.Portal {...inline.portal}>
         <BaseMenu.Positioner
           side={side}
           align={align}
@@ -121,6 +176,7 @@ export function Menu({
           className={POPUP_LAYER}
         >
           <BaseMenu.Popup
+            ref={escape.popup}
             aria-label={ariaLabel}
             data-preview-state={previewState}
             className={cn(menuPopup, className)}
@@ -153,12 +209,16 @@ export function ContextMenu({
   "data-preview-state": previewState,
   ...root
 }: Omit<ContextMenuProps, "side" | "align" | "sideOffset">) {
+  const inline = useInlinePortal(container);
+  const escape = useTopLayerEscape(root.onOpenChange);
   return (
-    <BaseContextMenu.Root {...root}>
-      <BaseContextMenu.Trigger render={trigger} />
-      <BaseContextMenu.Portal container={container}>
+    <BaseContextMenu.Root {...root} onOpenChange={escape.onOpenChange}>
+      <BaseContextMenu.Trigger ref={escape.trigger} render={trigger} />
+      {inline.host}
+      <BaseContextMenu.Portal {...inline.portal}>
         <BaseContextMenu.Positioner collisionPadding={VIEWPORT_MARGIN} className={POPUP_LAYER}>
           <BaseContextMenu.Popup
+            ref={escape.popup}
             aria-label={ariaLabel}
             data-preview-state={previewState}
             className={cn(menuPopup, className)}
@@ -193,7 +253,10 @@ interface MenuItemProps extends StyledProps<typeof BaseMenu.Item> {
 /** One action. `disabled` items are skipped by the arrow keys, not just dimmed. */
 export function MenuItem({ shortcut, tone, className, children, ...props }: MenuItemProps) {
   return (
-    <BaseMenu.Item className={cn(itemBase, tone === "danger" && itemDanger, className)} {...props}>
+    <BaseMenu.Item
+      className={cn(menuItemBase, tone === "danger" && itemDanger, className)}
+      {...props}
+    >
       <span className="truncate">{children}</span>
       {shortcut ? <MenuShortcut>{shortcut}</MenuShortcut> : null}
     </BaseMenu.Item>
@@ -212,7 +275,7 @@ interface MenuRadioItemProps extends StyledProps<typeof BaseMenu.RadioItem> {
 /** One choice in a `MenuRadioGroup`. The dot renders only while it is checked. */
 export function MenuRadioItem({ className, children, ...props }: MenuRadioItemProps) {
   return (
-    <BaseMenu.RadioItem className={cn(itemBase, className)} {...props}>
+    <BaseMenu.RadioItem className={cn(menuItemBase, className)} {...props}>
       <span className="truncate">{children}</span>
       {/* Fixed box so a checked and an unchecked row keep the same width. */}
       <span className="flex size-3 shrink-0 items-center justify-center">
@@ -229,7 +292,7 @@ export function MenuCheckboxItem({
   ...props
 }: StyledProps<typeof BaseMenu.CheckboxItem>) {
   return (
-    <BaseMenu.CheckboxItem className={cn(itemBase, className)} {...props}>
+    <BaseMenu.CheckboxItem className={cn(menuItemBase, className)} {...props}>
       <span className="truncate">{children}</span>
       <span className="flex size-3 shrink-0 items-center justify-center text-accent-ink">
         <BaseMenu.CheckboxItemIndicator>✓</BaseMenu.CheckboxItemIndicator>

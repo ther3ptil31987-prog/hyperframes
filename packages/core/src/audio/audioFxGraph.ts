@@ -81,6 +81,8 @@ export interface FxNodeHandle {
    * parameter key. Absent for a node whose values cannot be scheduled.
    */
   automation?: Record<string, FxParamTarget[]>;
+  /** Drop internal state (delay lines, held gain) when the signal jumps, as on a seek. */
+  reset?(): void;
   dispose(): void;
 }
 
@@ -250,13 +252,16 @@ function onePoleBuilder(kind: "highpass" | "lowpass"): Builder {
   };
 }
 
-function workletBuilder(processor: string): Builder {
-  return (ctx, p) => {
-    const node = new AudioWorkletNode(ctx, processor, { processorOptions: { ...p } });
+function workletBuilder(processor: string, resettable = false): Builder {
+  return (ctx, p, elapsed) => {
+    const node = new AudioWorkletNode(ctx, processor, {
+      processorOptions: { ...p, __hfElapsed: elapsed },
+    });
     return {
       input: node,
       output: node,
       update: (v) => node.port.postMessage({ ...v }),
+      ...(resettable ? { reset: () => node.port.postMessage({ __hfReset: true }) } : {}),
       dispose: () => {
         // Disconnecting is not enough to retire an AudioWorkletProcessor: it
         // lives until its `process()` returns false, and these all returned
@@ -503,6 +508,7 @@ const BUILDERS: Record<string, Builder> = {
   "biquad-lowpass": biquad("lowpass", false),
   "worklet-compressor": workletBuilder("hf-compressor"),
   "worklet-limiter": workletBuilder("hf-limiter"),
+  "worklet-truepeak": workletBuilder("hf-truepeak", true),
   "worklet-gate": workletBuilder("hf-gate"),
   "worklet-bitcrush": workletBuilder("hf-bitcrush"),
   "worklet-pitchshift": workletBuilder("hf-pitchshift"),
@@ -549,6 +555,8 @@ export interface FxChainHandle {
   presets: Record<string, FxParamTarget[]>;
   /** Re-parameterise in place when the shape is unchanged; false if a rebuild is needed. */
   update(chain: HfAudioFxChain): boolean;
+  /** Clear the state of every effect that carries signal history. */
+  reset(): void;
   dispose(): void;
 }
 
@@ -609,7 +617,8 @@ function shapeOf(chain: HfAudioFxChain): string {
       // author's own node while the render, which rebuilds, blended out the
       // preset's.
       const run = node.fromPreset ? `%${node.fromPreset}` : "";
-      return `${node.type}${poles}${fixedFreq}${wave}${run}`;
+      const lookahead = node.type === "truepeak" ? `^${p.lookahead}` : "";
+      return `${node.type}${poles}${fixedFreq}${wave}${lookahead}${run}`;
     })
     .join("|");
 }
@@ -730,6 +739,9 @@ export function buildFxChain(
       // that `shapeOf(next)` equals it, so recomputing was a whole normalise +
       // join per observer tick to write back the string that was already there.
       return true;
+    },
+    reset() {
+      for (const { handle } of handles) handle.reset?.();
     },
     dispose() {
       for (const { handle } of handles) handle.dispose();

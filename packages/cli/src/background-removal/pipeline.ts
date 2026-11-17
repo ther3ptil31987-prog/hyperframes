@@ -18,9 +18,16 @@ import { randomUUID } from "node:crypto";
 import { renameSync, rmSync } from "node:fs";
 import { basename, dirname, extname, join } from "node:path";
 import { findFFmpeg, findFFprobe, getFFmpegInstallHint } from "../browser/ffmpeg.js";
+import { runCancellableProcess } from "../utils/cancellableProcess.js";
+import { readFrames } from "./frameReader.js";
 import { createSession, type Session } from "./inference.js";
 import { type Device, type ModelId } from "./manager.js";
-import { DEFAULT_VP9_CPU_USED, renderProvenanceArgs } from "@hyperframes/engine";
+import {
+  DEFAULT_VP9_CPU_USED,
+  SDR_RGB_TO_BT709_FILTER,
+  SDR_RGB_TO_TAGGED_BT709_FILTER,
+  renderProvenanceArgs,
+} from "@hyperframes/engine";
 
 export type OutputFormat = "webm" | "mov" | "png";
 
@@ -111,6 +118,60 @@ interface EngineMetadata {
   durationSeconds: number;
 }
 
+async function decoderTransposesDimensions(inputPath: string): Promise<boolean> {
+  const ffprobePath = findFFprobe();
+  if (!ffprobePath) throw new Error(`ffprobe is required. Install: ${getFFmpegInstallHint()}`);
+  const { stdout } = await runCancellableProcess(
+    ffprobePath,
+    [
+      "-v",
+      "error",
+      "-select_streams",
+      "v:0",
+      "-show_streams",
+      "-print_format",
+      "json",
+      "--",
+      inputPath,
+    ],
+    { timeoutMs: 30_000, maxBufferBytes: 256 * 1024 },
+  );
+  const probe: unknown = JSON.parse(stdout);
+  if (
+    typeof probe !== "object" ||
+    probe === null ||
+    !("streams" in probe) ||
+    !Array.isArray(probe.streams)
+  )
+    return false;
+  const stream: unknown = probe.streams[0];
+  if (typeof stream !== "object" || stream === null) return false;
+  const sideData =
+    "side_data_list" in stream && Array.isArray(stream.side_data_list) ? stream.side_data_list : [];
+  const matrix: unknown = sideData.find(
+    (entry: unknown) =>
+      typeof entry === "object" &&
+      entry !== null &&
+      "side_data_type" in entry &&
+      entry.side_data_type === "Display Matrix",
+  );
+  let rotation: unknown =
+    typeof matrix === "object" && matrix !== null && "rotation" in matrix
+      ? matrix.rotation
+      : undefined;
+  if (
+    rotation === undefined &&
+    "tags" in stream &&
+    typeof stream.tags === "object" &&
+    stream.tags !== null &&
+    "rotate" in stream.tags
+  )
+    rotation = Number(stream.tags.rotate);
+  if (typeof rotation !== "number" || !Number.isFinite(rotation)) return false;
+  const angle = ((rotation % 360) + 360) % 360;
+  return Math.abs(angle - 90) < 1 || Math.abs(angle - 270) < 1;
+}
+
 async function probeMedia(inputPath: string): Promise<MediaInfo> {
   const isImage = inferInputKind(inputPath) === "image";
   const engine = (await import("@hyperframes/engine")) as {
@@ -124,7 +185,14 @@ async function probeMedia(inputPath: string): Promise<MediaInfo> {
 
   const fps = meta.fps || 30;
   const frameCount = meta.durationSeconds ? Math.round(meta.durationSeconds * fps) : 0;
-  return { width: meta.width, height: meta.height, fps, frameCount };
+  // Phone-video display matrices transpose FFmpeg's decoded rows; raw frame sizing must follow them.
+  const transposed = await decoderTransposesDimensions(inputPath);
+  return {
+    width: transposed ? meta.height : meta.width,
+    height: transposed ? meta.width : meta.height,
+    fps,
+    frameCount,
+  };
 }
 
 export function buildEncoderArgs(
@@ -152,6 +220,8 @@ export function buildEncoderArgs(
   if (format === "webm") {
     return [
       ...base,
+      "-vf",
+      SDR_RGB_TO_BT709_FILTER,
       "-c:v",
       "libvpx-vp9",
       "-b:v",
@@ -168,11 +238,6 @@ export function buildEncoderArgs(
       "0",
       "-pix_fmt",
       "yuva420p",
-      // Tag the output as BT.709 limited range so browsers use the same
-      // YUV→RGB matrix the source video was encoded with. Without these tags
-      // ffmpeg's default RGB→YUV conversion is BT.601, which causes a visible
-      // color shift (red/skin tones in particular) when the matted overlay is
-      // composited over the original mp4.
       "-colorspace",
       "bt709",
       "-color_primaries",
@@ -191,6 +256,8 @@ export function buildEncoderArgs(
   if (format === "mov") {
     return [
       ...base,
+      "-vf",
+      SDR_RGB_TO_TAGGED_BT709_FILTER,
       "-c:v",
       "prores_ks",
       "-profile:v",
@@ -205,22 +272,6 @@ export function buildEncoderArgs(
     ];
   }
   return [...base, "-frames:v", "1", "-pix_fmt", "rgba", "-update", "1", outputPath];
-}
-
-async function* readFrames(
-  stream: NodeJS.ReadableStream,
-  frameBytes: number,
-): AsyncGenerator<Buffer> {
-  let buffered: Buffer = Buffer.alloc(0);
-  for await (const chunk of stream) {
-    buffered =
-      buffered.length === 0 ? (chunk as Buffer) : Buffer.concat([buffered, chunk as Buffer]);
-    while (buffered.length >= frameBytes) {
-      // Copy because the next concat would clobber the underlying memory.
-      yield Buffer.from(buffered.subarray(0, frameBytes));
-      buffered = buffered.subarray(frameBytes);
-    }
-  }
 }
 
 export interface RenderTargets {

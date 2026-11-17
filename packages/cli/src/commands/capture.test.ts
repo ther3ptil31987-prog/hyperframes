@@ -3,6 +3,7 @@ import {
   lstatSync,
   mkdirSync,
   mkdtempSync,
+  realpathSync,
   readFileSync,
   rmSync,
   symlinkSync,
@@ -10,7 +11,12 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { CliRuntimeError } from "../utils/commandResult.js";
+import { pathToFileURL } from "node:url";
+import {
+  CliRuntimeError,
+  CliUsageError,
+  registerRootExitRequester,
+} from "../utils/commandResult.js";
 import { CAPTURE_PHASE_SCHEMA } from "../capture/types.js";
 
 const { captureWebsiteMock } = vi.hoisted(() => ({
@@ -36,7 +42,7 @@ const { captureWebsiteMock } = vi.hoisted(() => ({
       screenshots: [],
       tokens: { sections: [], fonts: [] },
       assets: [],
-      warnings: [],
+      warnings: [] as string[],
     };
   }),
 }));
@@ -163,11 +169,201 @@ describe("capture command — vision control", () => {
             json: true,
           },
         } as never),
-      ).rejects.toBeInstanceOf(CliRuntimeError);
+      ).rejects.toBeInstanceOf(CliUsageError);
 
       expect(captureWebsiteMock).not.toHaveBeenCalled();
     },
   );
+
+  it.each(["0", "-1", "1.5", "3junk", "", "Infinity"])(
+    "rejects invalid --max-screenshots %s before capture starts",
+    async (value) => {
+      vi.spyOn(console, "log").mockImplementation(() => {});
+      const error = vi.spyOn(console, "error").mockImplementation(() => {});
+      await expect(
+        captureCommand.run!({
+          args: {
+            url: "https://example.com",
+            output: "/tmp/hf-invalid-count",
+            "max-screenshots": value,
+            json: true,
+          },
+        } as never),
+      ).rejects.toBeInstanceOf(CliUsageError);
+      expect(error).toHaveBeenCalledWith("--max-screenshots must be a positive integer.");
+      expect(captureWebsiteMock).not.toHaveBeenCalled();
+    },
+  );
+
+  it("passes a local HTML file and its root into capture", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const site = mkdtempSync(join(tmpdir(), "hf-capture-local-cmd-"));
+    try {
+      mkdirSync(join(site, "pages"));
+      writeFileSync(join(site, "pages", "about.html"), "<h1>about</h1>");
+      await captureCommand.run!({
+        args: {
+          "local-file": join(site, "pages", "about.html"),
+          "local-root": site,
+          output: "/tmp/hf-local-cmd",
+          json: true,
+        },
+      } as never);
+      expect(captureWebsiteMock).toHaveBeenCalledWith(
+        expect.objectContaining({
+          url: pathToFileURL(realpathSync.native(join(site, "pages", "about.html"))).href,
+          localFile: join(site, "pages", "about.html"),
+          localRoot: site,
+        }),
+        undefined,
+      );
+    } finally {
+      rmSync(site, { recursive: true, force: true });
+    }
+  });
+
+  it.each([
+    [{ "local-file": "/definitely/missing/page.html" }, "Local file not found"],
+    [{ url: "https://example.com", "local-file": "/tmp" }, "either a URL or --local-file"],
+    [{ url: "https://example.com", "local-root": "/tmp" }, "--local-root requires --local-file"],
+  ])("refuses %o before capturing", async (target, message) => {
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    await expect(
+      captureCommand.run!({
+        args: { ...target, output: "/tmp/hf-local-refused", json: true },
+      } as never),
+    ).rejects.toThrow("url" in target ? CliUsageError : CliRuntimeError);
+    expect(error.mock.calls.flat().join("\n")).toContain(message);
+    expect(captureWebsiteMock).not.toHaveBeenCalled();
+  });
+
+  it("passes a validated screenshot limit into capture", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    await captureCommand.run!({
+      args: {
+        url: "https://example.com",
+        output: "/tmp/hf-count",
+        "max-screenshots": "3",
+        json: true,
+      },
+    } as never);
+    expect(captureWebsiteMock).toHaveBeenCalledWith(
+      expect.objectContaining({ maxScreenshots: 3 }),
+      undefined,
+    );
+  });
+
+  it.each([
+    ["1s", 1_000],
+    ["2m", 120_000],
+    ["45000", 45_000],
+    [undefined, 120_000],
+  ])("passes --timeout %s into capture as %i ms", async (timeout, expectedMs) => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    await captureCommand.run!({
+      args: { url: "https://example.com", output: "/tmp/hf-timeout", timeout, json: true },
+    } as never);
+    expect(captureWebsiteMock).toHaveBeenCalledWith(
+      expect.objectContaining({ timeout: expectedMs }),
+      undefined,
+    );
+  });
+
+  it("warns and keeps the default page-load timeout when --timeout is not a duration", async () => {
+    vi.spyOn(console, "log").mockImplementation(() => {});
+    const error = vi.spyOn(console, "error").mockImplementation(() => {});
+    await captureCommand.run!({
+      args: { url: "https://example.com", output: "/tmp/hf-timeout", timeout: "abc", json: true },
+    } as never);
+    expect(captureWebsiteMock).toHaveBeenCalledWith(
+      expect.objectContaining({ timeout: 120_000 }),
+      undefined,
+    );
+    expect(error).toHaveBeenCalledWith(
+      expect.stringContaining('--timeout "abc" is not a duration'),
+    );
+  });
+
+  it.each([
+    [true, 0],
+    [false, 1],
+  ])("asks to end the process once its result is out (ok %s)", async (ok, exitCode) => {
+    vi.useFakeTimers();
+    const exit = vi.fn();
+    registerRootExitRequester(exit);
+    try {
+      vi.spyOn(console, "log").mockImplementation(() => {});
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      captureWebsiteMock.mockResolvedValueOnce({
+        ok,
+        projectDir: "/tmp/capture",
+        url: "https://example.com",
+        title: "Example",
+        extracted: {},
+        screenshots: [],
+        tokens: { sections: [], fonts: [] },
+        assets: [],
+        warnings: [],
+      });
+      await captureCommand.run!({
+        args: { url: "https://example.com", output: "/tmp/hf-exit", json: true },
+      } as never).catch(() => {});
+      expect(exit).not.toHaveBeenCalled();
+      vi.advanceTimersByTime(100);
+      expect(exit).toHaveBeenCalledWith(exitCode);
+    } finally {
+      registerRootExitRequester(() => {});
+      vi.useRealTimers();
+    }
+  });
+
+  it("asks to end the process with 1 after a capture that threw", async () => {
+    vi.useFakeTimers();
+    const exit = vi.fn();
+    registerRootExitRequester(exit);
+    try {
+      vi.spyOn(console, "log").mockImplementation(() => {});
+      vi.spyOn(console, "error").mockImplementation(() => {});
+      captureWebsiteMock.mockRejectedValueOnce(new Error("browser crashed"));
+      await captureCommand.run!({
+        args: { url: "https://example.com", output: "/tmp/hf-exit-threw", json: true },
+      } as never).catch(() => {});
+      vi.advanceTimersByTime(100);
+      expect(exit).toHaveBeenCalledWith(1);
+    } finally {
+      registerRootExitRequester(() => {});
+      vi.useRealTimers();
+    }
+  });
+
+  it("returns a nonzero command result after presenting failed capture JSON once", async () => {
+    const log = vi.spyOn(console, "log").mockImplementation(() => {});
+    vi.spyOn(console, "error").mockImplementation(() => {});
+    captureWebsiteMock.mockResolvedValueOnce({
+      ok: false,
+      projectDir: "/tmp/capture",
+      url: "https://example.com",
+      title: "Example",
+      extracted: {},
+      screenshots: [],
+      tokens: { sections: [], fonts: [] },
+      assets: [],
+      warnings: [
+        "0/3 requested screenshot files captured: --capture-budget exhausted during lazy scrolling",
+      ],
+    });
+    await expect(
+      captureCommand.run!({
+        args: {
+          url: "https://example.com",
+          output: "/tmp/hf-failed-capture",
+          json: true,
+        },
+      } as never),
+    ).rejects.toMatchObject({ result: { exitCode: 1 } });
+    expect(log).toHaveBeenCalledTimes(1);
+    expect(JSON.parse(String(log.mock.calls[0]?.[0]))).toMatchObject({ ok: false, screenshots: 0 });
+  });
 
   it("emits a versioned phase record without the captured URL", async () => {
     vi.spyOn(console, "log").mockImplementation(() => {});
@@ -221,7 +417,10 @@ describe("capture command — vision control", () => {
       const payload = log.mock.calls.at(-1)?.[0];
       expect(typeof payload).toBe("string");
       if (typeof payload !== "string") throw new Error("Expected JSON failure payload");
-      expect(JSON.parse(payload)).toMatchObject({ ok: false, error: "required extraction failed" });
+      expect(JSON.parse(payload)).toMatchObject({
+        ok: false,
+        error: expect.objectContaining({ message: "required extraction failed" }),
+      });
     } finally {
       rmSync(dir, { recursive: true, force: true });
     }

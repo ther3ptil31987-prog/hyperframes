@@ -55,7 +55,7 @@ export function PromptPreviewModal({
         ref={containerRef}
         role="dialog"
         aria-modal="true"
-        aria-label={`Ask agent — ${title}`}
+        aria-label={`Ask agent: ${title}`}
         tabIndex={-1}
         className="w-[560px] max-h-[80vh] flex flex-col rounded-2xl border border-neutral-800 bg-neutral-950 shadow-2xl outline-hidden"
         onClick={(e) => e.stopPropagation()}
@@ -91,6 +91,7 @@ export function PromptPreviewModal({
           </p>
           <textarea
             ref={textareaRef}
+            aria-label="Prompt"
             value={value}
             onChange={(e) => setValue(e.target.value)}
             onKeyDown={(e) => {

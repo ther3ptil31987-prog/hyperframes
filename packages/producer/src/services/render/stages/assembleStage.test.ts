@@ -20,7 +20,9 @@ vi.mock("../audioPadTrim.js", () => ({
   padOrTrimAudioToVideoFrameCount: padOrTrimAudioMock,
 }));
 
+const { reportAssembleProgressMock } = vi.hoisted(() => ({ reportAssembleProgressMock: vi.fn() }));
 vi.mock("../shared.js", () => ({
+  reportAssembleProgress: reportAssembleProgressMock,
   updateJobStatus: vi.fn(),
 }));
 
@@ -42,6 +44,7 @@ function makeInput(overrides: Partial<AssembleStageInput> = {}): AssembleStageIn
     audioOutputPath: "/tmp/audio.m4a",
     outputPath: "/tmp/output.mp4",
     hasAudio: true,
+    ffmpegProcessTimeout: 1_234_000,
     abortSignal: undefined,
     assertNotAborted: () => {},
     ...overrides,
@@ -76,14 +79,40 @@ describe("runAssembleStage audio duration parity", () => {
       audioPath: "/tmp/audio.m4a",
       outputPath: "/tmp/audio.duration-normalized.m4a",
       signal: undefined,
+      timeoutMs: 1_234_000,
     });
     expect(muxVideoWithAudioMock).toHaveBeenCalledWith(
       "/tmp/video-only.mp4",
       "/tmp/audio.duration-normalized.m4a",
       "/tmp/output.mp4",
       undefined,
-      { audioCodec: "aac" },
+      { audioCodec: "aac", ffmpegProcessTimeout: 1_234_000 },
       { num: 30, den: 1 },
+      expect.any(Function),
+    );
+  });
+
+  it("normalizes from the PCM the audio stage kept, not from its AAC", async () => {
+    await runAssembleStage(makeInput({ audioPcmPath: "/tmp/audio-source.wav" }));
+
+    expect(padOrTrimAudioMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        audioPath: "/tmp/audio.m4a",
+        sourcePath: "/tmp/audio-source.wav",
+      }),
+    );
+  });
+
+  it("gives a silent mp4's faststart the render's configured ffmpeg timeout", async () => {
+    await runAssembleStage(makeInput({ hasAudio: false }));
+
+    expect(applyFaststartMock).toHaveBeenCalledWith(
+      "/tmp/video-only.mp4",
+      "/tmp/output.mp4",
+      undefined,
+      { ffmpegProcessTimeout: 1_234_000 },
+      { num: 30, den: 1 },
+      expect.any(Function),
     );
   });
 
@@ -95,6 +124,7 @@ describe("runAssembleStage audio duration parity", () => {
       audioPath: "/tmp/audio.m4a",
       outputPath: "/tmp/audio.duration-normalized.m4a",
       signal: undefined,
+      timeoutMs: 1_234_000,
     });
   });
 
@@ -156,6 +186,34 @@ describe("runAssembleStage audio duration parity", () => {
   });
 });
 
+describe("runAssembleStage progress", () => {
+  beforeEach(() => {
+    resetMocks();
+    reportAssembleProgressMock.mockReset();
+  });
+
+  it.each([
+    ["the audio mux", true],
+    ["MP4 faststart", false],
+  ])("reports the seconds %s has written against the video's length", async (_pass, hasAudio) => {
+    const write = async (...args: unknown[]) => {
+      (args.at(-1) as (seconds: number) => void)(0.5);
+      return { success: true };
+    };
+    muxVideoWithAudioMock.mockImplementation(write);
+    applyFaststartMock.mockImplementation(write);
+    const input = makeInput({ hasAudio });
+    await runAssembleStage(input);
+    expect(reportAssembleProgressMock).toHaveBeenCalledWith(input.job, 0.5, 1, undefined);
+  });
+
+  it("closes at the video's full length when no pass reports seconds", async () => {
+    const input = makeInput({ hasAudio: false });
+    await runAssembleStage(input);
+    expect(reportAssembleProgressMock.mock.calls).toEqual([[input.job, 1, 1, undefined]]);
+  });
+});
+
 describe("runAssembleStage HLS packaging", () => {
   beforeEach(resetMocks);
 
@@ -173,12 +231,13 @@ describe("runAssembleStage HLS packaging", () => {
       audioPath: "/tmp/audio.m4a",
       outputPath: "/tmp/audio.duration-normalized.m4a",
       signal: undefined,
+      timeoutMs: 1_234_000,
     });
     expect(packageHlsMock).toHaveBeenCalledWith(
       "/tmp/video-only.mp4",
       "/tmp/audio.duration-normalized.m4a",
       "/tmp/output-hls",
-      { segmentSeconds: 6, signal: undefined },
+      { segmentSeconds: 6, signal: undefined, ffmpegProcessTimeout: 1_234_000 },
     );
     expect(muxVideoWithAudioMock).not.toHaveBeenCalled();
     expect(applyFaststartMock).not.toHaveBeenCalled();
@@ -191,6 +250,7 @@ describe("runAssembleStage HLS packaging", () => {
     expect(packageHlsMock).toHaveBeenCalledWith("/tmp/video-only.mp4", null, "/tmp/output-hls", {
       segmentSeconds: 4,
       signal: undefined,
+      ffmpegProcessTimeout: 1_234_000,
     });
     expect(applyFaststartMock).not.toHaveBeenCalled();
   });
@@ -198,14 +258,22 @@ describe("runAssembleStage HLS packaging", () => {
   it("defaults to 4 s segments", async () => {
     await runAssembleStage(hlsInput());
 
-    expect(packageHlsMock.mock.calls[0]?.[3]).toEqual({ segmentSeconds: 4, signal: undefined });
+    expect(packageHlsMock.mock.calls[0]?.[3]).toEqual({
+      segmentSeconds: 4,
+      signal: undefined,
+      ffmpegProcessTimeout: 1_234_000,
+    });
   });
 
   it("forwards the abort signal to the packager", async () => {
     const abortSignal = new AbortController().signal;
     await runAssembleStage(hlsInput({ abortSignal }));
 
-    expect(packageHlsMock.mock.calls[0]?.[3]).toEqual({ segmentSeconds: 4, signal: abortSignal });
+    expect(packageHlsMock.mock.calls[0]?.[3]).toEqual({
+      segmentSeconds: 4,
+      signal: abortSignal,
+      ffmpegProcessTimeout: 1_234_000,
+    });
   });
 
   it("throws 'HLS packaging failed' with the ffmpeg error appended", async () => {

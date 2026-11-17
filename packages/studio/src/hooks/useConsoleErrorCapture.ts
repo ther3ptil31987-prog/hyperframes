@@ -1,5 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from "react";
+import {
+  previewConsoleErrorText,
+  STUDIO_PREVIEW_ERRORS,
+} from "@hyperframes/core/studio-preview-mark";
+import { onPreviewDocumentLoaded } from "../player/sceneSwap";
+import { previewConsoleErrors, previewFrameOpaque } from "../player/lib/previewChannel";
 import type { LintFinding } from "../components/LintModal";
+
+const SEALED_POLL_MS = 1_000;
 
 /**
  * Captures `console.error` and `window.onerror` events from a preview iframe
@@ -16,13 +24,48 @@ export function useConsoleErrorCapture(previewIframe: HTMLIFrameElement | null) 
 
   // eslint-disable-next-line no-restricted-syntax
   useEffect(() => {
+    resetErrors();
     if (!previewIframe) return;
 
     let patchedWin: (Window & typeof globalThis) | null = null;
     let origConsoleError: ((...args: unknown[]) => void) | null = null;
     let errorHandler: ((e: ErrorEvent) => void) | null = null;
+    let stopSealedReads: (() => void) | null = null;
+
+    const record = (texts: readonly string[]) => {
+      if (texts.length === 0) return;
+      consoleErrorsRef.current = [
+        ...consoleErrorsRef.current,
+        ...texts.map((message) => ({ severity: "error" as const, message })),
+      ];
+      setConsoleErrors([...consoleErrorsRef.current]);
+    };
+
+    const readSealedErrors = (iframe: HTMLIFrameElement) => {
+      let live = true;
+      let read = 0;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const poll = async () => {
+        for (;;) {
+          const page = await previewConsoleErrors(iframe, read);
+          if (!live) return;
+          if (!page) break;
+          read += page.errors.length;
+          record(page.errors);
+          if (!page.truncated || page.errors.length === 0) break;
+        }
+        timer = setTimeout(poll, SEALED_POLL_MS);
+      };
+      void poll();
+      return () => {
+        live = false;
+        clearTimeout(timer);
+      };
+    };
 
     const detachErrorCapture = () => {
+      stopSealedReads?.();
+      stopSealedReads = null;
       const win = patchedWin;
       if (!win) return;
       patchedWin = null;
@@ -40,6 +83,11 @@ export function useConsoleErrorCapture(previewIframe: HTMLIFrameElement | null) 
 
     const attachErrorCapture = () => {
       detachErrorCapture();
+      resetErrors();
+      if (previewFrameOpaque(previewIframe)) {
+        stopSealedReads = readSealedErrors(previewIframe);
+        return;
+      }
       try {
         const win = previewIframe.contentWindow as (Window & typeof globalThis) | null;
         if (!win) return;
@@ -49,40 +97,25 @@ export function useConsoleErrorCapture(previewIframe: HTMLIFrameElement | null) 
         origConsoleError = win.console.error.bind(win.console);
         win.console.error = function (...args: unknown[]) {
           origConsoleError!(...args);
-          const text = args.map((a) => (a instanceof Error ? a.message : String(a))).join(" ");
-          if (text.includes("favicon")) return;
-          consoleErrorsRef.current = [
-            ...consoleErrorsRef.current,
-            { severity: "error", message: text },
-          ];
-          setConsoleErrors([...consoleErrorsRef.current]);
+          const text = previewConsoleErrorText(args);
+          if (text !== null) record([text]);
         };
-        errorHandler = (e: ErrorEvent) => {
-          const text = e.message || String(e);
-          consoleErrorsRef.current = [
-            ...consoleErrorsRef.current,
-            { severity: "error", message: text },
-          ];
-          setConsoleErrors([...consoleErrorsRef.current]);
-        };
+        errorHandler = (e: ErrorEvent) => record([e.message || String(e)]);
         win.addEventListener("error", errorHandler);
+        const raised: unknown = Reflect.get(win, STUDIO_PREVIEW_ERRORS);
+        if (Array.isArray(raised)) record(raised.map(String));
       } catch {
         /* same-origin only */
       }
     };
 
     attachErrorCapture();
-    const handleLoad = () => {
-      consoleErrorsRef.current = [];
-      setConsoleErrors(null);
-      attachErrorCapture();
-    };
-    previewIframe.addEventListener("load", handleLoad);
+    const stopLoaded = onPreviewDocumentLoaded(previewIframe, attachErrorCapture);
     return () => {
-      previewIframe.removeEventListener("load", handleLoad);
+      stopLoaded();
       detachErrorCapture();
     };
-  }, [previewIframe]);
+  }, [previewIframe, resetErrors]);
 
-  return { consoleErrors, setConsoleErrors, resetErrors };
+  return { consoleErrors, setConsoleErrors };
 }

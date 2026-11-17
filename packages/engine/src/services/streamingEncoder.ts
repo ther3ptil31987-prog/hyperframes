@@ -27,21 +27,36 @@ import { dirname } from "path";
 import {
   type GpuEncoder,
   getCachedGpuEncoder,
+  getCachedNvencPresets,
   getGpuEncoderName,
   buildVideoToolboxRateControlArgs,
   mapPresetForGpuEncoder,
 } from "../utils/gpuEncoder.js";
-import { formatFfmpegError, isExternalFfmpegInterruption } from "../utils/runFfmpeg.js";
+import {
+  ffmpegStatsReader,
+  formatFfmpegError,
+  isExternalFfmpegInterruption,
+} from "../utils/runFfmpeg.js";
 import { getFfmpegBinary } from "../utils/ffmpegBinaries.js";
-import { getHdrEncoderColorParams } from "../utils/hdr.js";
+import { getHdrEncoderColorParams, hdrFrameTagsFilter } from "../utils/hdr.js";
 import { withEvenDimensionPad } from "../utils/evenDimensions.js";
-import { SDR_CAPTURE_TO_BT709_FILTER, SDR_RGB_TO_BT709_FILTER } from "../utils/sdrCaptureColor.js";
+import {
+  SDR_CAPTURE_TO_BT709_FILTER,
+  SDR_RGB_TO_TAGGED_BT709_FILTER,
+} from "../utils/sdrCaptureColor.js";
 import { DEFAULT_CONFIG, type EngineConfig } from "../config.js";
 import { fpsToFfmpegArg, fpsToNumber, type Fps } from "@hyperframes/core";
+import type { VideoLayerInput } from "./videoFrameExtractor.js";
 import { appendVp9CpuUsedArg } from "./vp9Options.js";
+import { appendSoftwareEncoderThreadsArg } from "./softwareEncoderThreads.js";
 import { appendRenderProvenanceArgs } from "../utils/renderProvenance.js";
 
-import { appendLockedGopArgs, lockedGopCodecParams, resolveLockedGopSize } from "./chunkEncoder.js";
+import {
+  appendLockedGopArgs,
+  appendRateCapArgs,
+  lockedGopCodecParams,
+  resolveLockedGopSize,
+} from "./chunkEncoder.js";
 
 // Re-export EncoderOptions so callers can reference the type via this module.
 export type { EncoderOptions } from "./chunkEncoder.types.js";
@@ -149,12 +164,16 @@ export interface StreamingEncoderOptions {
   preset?: string;
   quality?: number;
   bitrate?: string;
+  maxBitrate?: string;
+  bufferSize?: string;
   pixelFormat?: string;
   /** libvpx-vp9 -cpu-used value. Defaults to the engine VP9 setting. */
   vp9CpuUsed?: number;
   useGpu?: boolean;
   imageFormat?: "jpeg" | "png";
   hdr?: { transfer: import("../utils/hdr.js").HdrTransfer };
+  /** A source video ffmpeg composites under the piped RGBA frames; see `buildVideoLayerInput`. */
+  videoLayer?: VideoLayerInput;
   /** When set, use rawvideo input instead of image2pipe. For HDR PQ-encoded frames. */
   rawInputFormat?: "rgb48le";
   /**
@@ -167,6 +186,7 @@ export interface StreamingEncoderOptions {
   lockGopForChunkConcat?: boolean;
   /** Required when `lockGopForChunkConcat` is `true`. Frames per GOP. */
   gopSize?: number;
+  softwareEncoderThreads?: number;
 }
 
 export interface StreamingEncoderResult {
@@ -176,6 +196,8 @@ export interface StreamingEncoderResult {
   error?: string;
   /** Stable machine-readable cause for failures safe to retry on a fresh host. */
   failureReason?: "external_interruption";
+  /** Total time `writeFrame` waited for FFmpeg to drain its stdin pipe. */
+  drainWaitMs?: number;
 }
 
 export interface StreamingEncoder {
@@ -187,7 +209,8 @@ export interface StreamingEncoder {
    * calls would interleave frame bytes on the pipe and race the drain wait.
    */
   writeFrame: (buffer: Buffer) => Promise<boolean>;
-  close: () => Promise<StreamingEncoderResult>;
+  /** `onFramesEncoded` hears ffmpeg's encoded-frame count while close waits for it to finish. */
+  close: (onFramesEncoded?: (frames: number) => void) => Promise<StreamingEncoderResult>;
   getExitStatus: () => "running" | "success" | "error";
   /**
    * The FFmpeg failure reason (exit code + tail of stderr), or `undefined`
@@ -212,6 +235,7 @@ export function buildStreamingArgs(
   options: StreamingEncoderOptions,
   outputPath: string,
   gpuEncoder: GpuEncoder = null,
+  nvencPresets?: ReadonlySet<string>,
 ): string[] {
   const {
     fps,
@@ -269,9 +293,20 @@ export function buildStreamingArgs(
       "-",
     );
   }
+  if (options.videoLayer) args.push(...options.videoLayer.inputArgs);
   args.push("-r", fpsToFfmpegArg(fps));
 
   const shouldUseGpu = useGpu && gpuEncoder !== null;
+  if (
+    options.videoLayer &&
+    (imageFormat !== "png" ||
+      options.rawInputFormat ||
+      shouldUseGpu ||
+      (codec !== "h264" && codec !== "h265"))
+  ) {
+    throw new Error("videoLayer needs software h264/h265 and PNG frames");
+  }
+  appendRateCapArgs(args, options);
 
   if (codec === "h264" || codec === "h265") {
     if (shouldUseGpu) {
@@ -280,7 +315,7 @@ export function buildStreamingArgs(
 
       switch (gpuEncoder) {
         case "nvenc":
-          args.push("-preset", mapPresetForGpuEncoder("nvenc", preset));
+          args.push("-preset", mapPresetForGpuEncoder("nvenc", preset, nvencPresets));
           if (bitrate) args.push("-b:v", bitrate);
           else args.push("-cq", String(quality));
           break;
@@ -330,6 +365,7 @@ export function buildStreamingArgs(
     } else {
       const encoderName = codec === "h264" ? "libx264" : "libx265";
       args.push("-c:v", encoderName, "-preset", preset);
+      appendSoftwareEncoderThreadsArg(args, encoderName, options.softwareEncoderThreads);
       if (bitrate) args.push("-b:v", bitrate);
       else args.push("-crf", String(quality));
 
@@ -364,10 +400,10 @@ export function buildStreamingArgs(
       } else {
         args.push(xParamsFlag, `aq-mode=3:aq-strength=0.8:deblock=1,1:${colorParams}${gopParams}`);
       }
-      // Apple devices require hvc1 tag for HEVC playback (default hev1 won't open in QuickTime)
-      if (codec === "h265") {
-        args.push("-tag:v", "hvc1");
-      }
+    }
+    // Apple devices require hvc1 tag for HEVC playback (default hev1 won't open in QuickTime)
+    if (codec === "h265") {
+      args.push("-tag:v", "hvc1");
     }
   } else if (codec === "vp9") {
     args.push("-c:v", "libvpx-vp9", "-b:v", bitrate || "0", "-crf", String(quality));
@@ -380,6 +416,7 @@ export function buildStreamingArgs(
     }
   } else if (codec === "prores") {
     args.push("-c:v", "prores_ks", "-profile:v", preset, "-vendor", "apl0");
+    args.push("-vf", SDR_RGB_TO_TAGGED_BT709_FILTER);
     args.push("-pix_fmt", pixelFormat);
     appendRenderProvenanceArgs(args, outputPath);
     return [...args, "-y", outputPath];
@@ -414,24 +451,42 @@ export function buildStreamingArgs(
       );
     }
 
-    // Raw HDR input (from WebGPU pipeline) is already PQ-encoded, so only SDR gets a
-    // conversion: raw sRGB or Chrome's BT.601 JPEG screenshots to BT.709 limited range.
-    const sdrFilter = options.rawInputFormat
-      ? SDR_RGB_TO_BT709_FILTER
-      : SDR_CAPTURE_TO_BT709_FILTER;
-    if (options.rawInputFormat && options.hdr) {
-      // No filter needed — PQ data goes straight to encoder
-    } else if (gpuEncoder === "vaapi") {
+    // Raw HDR input (from WebGPU pipeline) is already PQ-encoded and is only tagged; SDR is
+    // converted: raw sRGB or Chrome's BT.601 JPEG screenshots to tagged BT.709 limited range.
+    const frameFilter =
+      options.rawInputFormat && options.hdr
+        ? hdrFrameTagsFilter(options.hdr.transfer)
+        : options.rawInputFormat
+          ? SDR_RGB_TO_TAGGED_BT709_FILTER
+          : SDR_CAPTURE_TO_BT709_FILTER;
+    if (gpuEncoder === "vaapi") {
       // vaapi already runs `format=nv12,hwupload`; the nv12 conversion aligns
       // odd dimensions before upload, so only prepend the colour conversion.
       const vfIdx = args.indexOf("-vf");
       if (vfIdx !== -1) {
-        args[vfIdx + 1] = `${sdrFilter},${args[vfIdx + 1]}`;
+        args[vfIdx + 1] = `${frameFilter},${args[vfIdx + 1]}`;
       }
+    } else if (options.videoLayer) {
+      const video = `[1:v]${options.videoLayer.filters.join(",")},format=gbrp[v]`;
+      const tail = withEvenDimensionPad(
+        SDR_RGB_TO_TAGGED_BT709_FILTER,
+        pixelFormat,
+        options.width,
+        options.height,
+      );
+      args.push(
+        "-filter_complex",
+        `${video};[0:v]format=rgba[o];[v][o]overlay=eof_action=endall:format=gbrp,${tail}[vout]`,
+        "-map",
+        "[vout]",
+      );
     } else {
       // Pad odd dimensions up to even so 4:2:0 encoders (software and
       // nvenc/videotoolbox/qsv/amf) don't abort with "height not divisible by 2".
-      args.push("-vf", withEvenDimensionPad(sdrFilter, pixelFormat, options.width, options.height));
+      args.push(
+        "-vf",
+        withEvenDimensionPad(frameFilter, pixelFormat, options.width, options.height),
+      );
     }
 
     // Fixed timescale for consistent A/V timing across platforms.
@@ -461,15 +516,41 @@ export async function spawnStreamingEncoder(
   signal?: AbortSignal,
   config?: Partial<Pick<EngineConfig, "ffmpegStreamingTimeout">>,
 ): Promise<StreamingEncoder> {
-  const outputDir = dirname(outputPath);
-  if (!existsSync(outputDir)) mkdirSync(outputDir, { recursive: true });
-
   let gpuEncoder: GpuEncoder = null;
   if (options.useGpu) {
     gpuEncoder = await getCachedGpuEncoder();
   }
 
-  const args = buildStreamingArgs(options, outputPath, gpuEncoder);
+  const nvencPresets = gpuEncoder === "nvenc" ? await getCachedNvencPresets() : undefined;
+  const args = buildStreamingArgs(options, outputPath, gpuEncoder, nvencPresets);
+  const checksJpeg = !options.rawInputFormat && (options.imageFormat ?? "jpeg") === "jpeg";
+  return spawnFfmpegStream(outputPath, args, {
+    signal,
+    config,
+    checkFrame: checksJpeg
+      ? (frame, index) => {
+          const error = jpegInputError(frame);
+          if (error) throw new Error(`Invalid JPEG input at frame ${index}: ${error}`);
+        }
+      : undefined,
+  });
+}
+
+export function spawnFfmpegStream(
+  outputPath: string,
+  args: string[],
+  {
+    signal,
+    config,
+    checkFrame,
+  }: {
+    signal?: AbortSignal;
+    config?: Partial<Pick<EngineConfig, "ffmpegStreamingTimeout">>;
+    checkFrame?: (frame: Buffer, index: number) => void;
+  },
+): StreamingEncoder {
+  const outputDir = dirname(outputPath);
+  if (!existsSync(outputDir)) mkdirSync(outputDir, { recursive: true });
 
   const ffmpeg: ChildProcess = spawn(getFfmpegBinary(), args, {
     stdio: ["pipe", "pipe", "pipe"],
@@ -497,9 +578,16 @@ export async function spawnStreamingEncoder(
   // libx264 printed its summary and exited 255, observable as
   // "Streaming encode failed: FFmpeg exited with code 255" with audio:0kB).
   const streamingTimeout = config?.ffmpegStreamingTimeout ?? DEFAULT_CONFIG.ffmpegStreamingTimeout;
+  let framesEncoded = 0;
+  let onFramesEncoded: ((frames: number) => void) | undefined;
   const managed = new ManagedChildProcess(ffmpeg, {
     signal,
     inactivityTimeoutMs: streamingTimeout,
+    onStderr: ffmpegStatsReader(({ frames }) => {
+      if (frames === undefined) return;
+      framesEncoded = frames;
+      onFramesEncoded?.(frames);
+    }),
   });
   const exitPromise = managed.wait().then((outcome) => {
     exitCode = outcome.exitCode;
@@ -555,6 +643,7 @@ export async function spawnStreamingEncoder(
   };
 
   let inputFrameIndex = 0;
+  let drainWaitMs = 0;
   const encoder: StreamingEncoder = {
     writeFrame: async (buffer: Buffer): Promise<boolean> => {
       const stdin = ffmpeg.stdin;
@@ -575,10 +664,7 @@ export async function spawnStreamingEncoder(
       // so without this copy the pipe would read partially-overwritten data
       // and flicker.
       const copy = Buffer.from(buffer);
-      if (!options.rawInputFormat && (options.imageFormat ?? "jpeg") === "jpeg") {
-        const error = jpegInputError(copy);
-        if (error) throw new Error(`Invalid JPEG input at frame ${inputFrameIndex}: ${error}`);
-      }
+      checkFrame?.(copy, inputFrameIndex);
       const accepted = stdin.write(copy);
       inputFrameIndex++;
       // Reset inactivity timer immediately ONLY on `accepted === true`. `true`
@@ -596,7 +682,9 @@ export async function spawnStreamingEncoder(
         return true;
       }
 
+      const drainStart = Date.now();
       const drainResult = await waitForDrainOrExit(stdin);
+      drainWaitMs += Date.now() - drainStart;
       if (drainResult !== "drain" || exitStatus !== "running") {
         return false;
       }
@@ -604,7 +692,7 @@ export async function spawnStreamingEncoder(
       return true;
     },
 
-    close: async (): Promise<StreamingEncoderResult> => {
+    close: async (onEncoded?: (frames: number) => void): Promise<StreamingEncoderResult> => {
       // INVARIANT: close() is idempotent. The renderOrchestrator HDR cleanup
       // path tracks an `encoderClosed` flag and may still re-call close() in
       // the outer finally if the inner cleanup raised before the flag flipped.
@@ -616,6 +704,10 @@ export async function spawnStreamingEncoder(
       // repeated calls. If you change this method, preserve idempotency or
       // a regression here will silently double-close ffmpeg and produce
       // harder-to-trace errors at the orchestrator layer.
+      if (onEncoded && exitStatus === "running") {
+        onFramesEncoded = onEncoded;
+        onEncoded(framesEncoded);
+      }
       const stdin = ffmpeg.stdin;
       if (stdin && !stdin.destroyed) {
         await new Promise<void>((resolve) => {
@@ -658,7 +750,7 @@ export async function spawnStreamingEncoder(
 
       const fileSize = existsSync(outputPath) ? statSync(outputPath).size : 0;
 
-      return { success: true, durationMs, fileSize };
+      return { success: true, durationMs, fileSize, drainWaitMs };
     },
 
     getExitStatus: () => exitStatus,

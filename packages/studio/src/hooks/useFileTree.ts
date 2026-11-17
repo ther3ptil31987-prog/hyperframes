@@ -4,6 +4,9 @@ import { FONT_EXT } from "../utils/mediaTypes";
 import { fontFamilyFromAssetPath, type ImportedFontAsset } from "../components/editor/fontAssets";
 import { captureProjectProvenance } from "../components/feedback/projectProvenance";
 import { studioApiFetch } from "../utils/studioApiFetch";
+import { trackStudioEvent } from "../utils/studioTelemetry";
+import { errorProps } from "../utils/rejectionTelemetry";
+import { encodeUrlPath } from "@hyperframes/parsers";
 
 interface UseFileTreeOptions {
   projectId: string | null;
@@ -21,6 +24,19 @@ interface FetchedFileTree {
 // Stable references so a mismatched projectId doesn't create a new array every render
 // and defeat useMemo/useCallback deps downstream (e.g. the `assets` memo below).
 const EMPTY_FILE_LIST: string[] = [];
+
+type TreeListing = { files?: string[]; compositions?: string[] };
+
+async function readTreeListing(projectId: string, signal: AbortSignal): Promise<TreeListing> {
+  const res = await studioApiFetch(buildProjectApiPath(projectId), { signal });
+  if (!res.ok) throw new Error(`tree fetch failed: ${res.status}`);
+  return res.json();
+}
+
+function reportRefreshFailure(err: unknown): void {
+  const { error_name, error_message } = errorProps(err);
+  trackStudioEvent("file_tree_refresh_failed", { error_name, error_message });
+}
 
 /**
  * Holds the tree with the `projectId` it was fetched for; exposes empty/not-loaded
@@ -73,6 +89,7 @@ export function useFileTree({ projectId, projectIdRef }: UseFileTreeOptions) {
 
   const refreshRequestRef = useRef(0);
   const refreshAbortRef = useRef<AbortController | null>(null);
+  const failureReportedRef = useRef(false);
 
   const refreshFileTree = useCallback(async () => {
     const pid = projectIdRef.current;
@@ -83,14 +100,16 @@ export function useFileTree({ projectId, projectIdRef }: UseFileTreeOptions) {
     const requestId = ++refreshRequestRef.current;
     const controller = new AbortController();
     refreshAbortRef.current = controller;
-    let data: { files?: string[]; compositions?: string[] };
+    let data: TreeListing;
     try {
-      const res = await studioApiFetch(buildProjectApiPath(pid), { signal: controller.signal });
-      data = await res.json();
+      data = await readTreeListing(pid, controller.signal);
     } catch (err) {
       if (err instanceof DOMException && err.name === "AbortError") return;
-      throw err;
+      if (!failureReportedRef.current) reportRefreshFailure(err);
+      failureReportedRef.current = true;
+      return;
     }
+    failureReportedRef.current = false;
     if (data.files && requestId === refreshRequestRef.current) {
       setFetched((prev) =>
         prev?.projectId === pid
@@ -119,7 +138,7 @@ export function useFileTree({ projectId, projectIdRef }: UseFileTreeOptions) {
         .map((asset) => ({
           family: fontFamilyFromAssetPath(asset),
           path: asset,
-          url: projectId ? buildProjectApiPath(projectId, `/preview/${asset}`) : "",
+          url: projectId ? buildProjectApiPath(projectId, `/preview/${encodeUrlPath(asset)}`) : "",
         })),
     [assets, projectId],
   );

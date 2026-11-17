@@ -1,10 +1,12 @@
 import { createHash } from "node:crypto";
 import {
+  chmodSync,
   existsSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
   rmSync,
   truncateSync,
   writeFileSync,
@@ -14,7 +16,9 @@ import { basename, dirname, join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { DownloadOptions } from "../cloud/download.js";
+import { execFileSync } from "node:child_process";
 import {
+  decodeTimeoutMs,
   ensureParakeetModel,
   installSherpaRuntime,
   SHERPA_RUNTIME_DIR,
@@ -25,6 +29,7 @@ import {
   transcribeWithSherpa,
   type ModelFile,
 } from "./sherpa.js";
+import { encodeWav } from "./wav.test-helpers.js";
 
 const file = (name: string, content: string): ModelFile => ({
   name,
@@ -57,6 +62,18 @@ function fakeRuntime(root: string, body: string, version = "1.13.8") {
   writeFileSync(join(pkg, "index.js"), body);
 }
 
+const runtimeRoots: string[] = [];
+function runtimeDirectory(): string {
+  const root = mkdtempSync(join(tmpdir(), "hf-sherpa-runtime-"));
+  runtimeRoots.push(root);
+  const dir = join(root, "runtime");
+  mkdirSync(dir);
+  return dir;
+}
+afterEach(() => {
+  for (const root of runtimeRoots.splice(0)) rmSync(root, { recursive: true, force: true });
+});
+
 describe("installSherpaRuntime", () => {
   it.each([
     ["darwin", "arm64", "sherpa-onnx-darwin-arm64@1.13.8"],
@@ -68,12 +85,27 @@ describe("installSherpaRuntime", () => {
     );
   });
 
+  it.skipIf(process.platform === "win32")(
+    "does not remove a broken runtime under a writable ancestor",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "hf-sherpa-unsafe-"));
+      runtimeRoots.push(root);
+      const dir = join(root, "cache", "runtime");
+      fakeRuntime(dir, BROKEN);
+      chmodSync(root, 0o777);
+      const run = vi.fn();
+      await expect(installSherpaRuntime({ dir, run })).rejects.toThrow();
+      expect(existsSync(join(dir, "node_modules", "sherpa-onnx-node", "index.js"))).toBe(true);
+      expect(run).not.toHaveBeenCalled();
+    },
+  );
+
   it("asks npm for the runtime and its native package at the same exact version", async () => {
     const run = vi.fn(async (_args: string[]) => {
       throw new Error("stop before touching the cache");
     });
     const cancel = new AbortController();
-    const dir = mkdtempSync(join(tmpdir(), "hf-sherpa-runtime-"));
+    const dir = runtimeDirectory();
     await installSherpaRuntime({ run, signal: cancel.signal, dir }).catch(() => undefined);
     rmSync(dir, { recursive: true, force: true });
     expect((run.mock.calls[0] as unknown[] | undefined)?.[1]).toBe(cancel.signal);
@@ -83,19 +115,19 @@ describe("installSherpaRuntime", () => {
   });
 
   it("reinstalls a runtime that is present but does not load", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "hf-sherpa-runtime-"));
+    const dir = runtimeDirectory();
     try {
       fakeRuntime(dir, BROKEN);
       expect(await sherpaRuntimeLoadError(dir)).toBe(
         "libonnxruntime.so: cannot open shared object",
       );
-      const run = vi.fn(async (args: string[]) =>
-        fakeRuntime(args[args.indexOf("--prefix") + 1]!, LOADS),
+      const run = vi.fn(async (_args: string[], _signal?: AbortSignal, cwd?: string) =>
+        fakeRuntime(cwd!, LOADS),
       );
 
       expect(await installSherpaRuntime({ run, dir })).toEqual({
         installed: true,
-        runtimePath: join(dir, "node_modules", "sherpa-onnx-node", "index.js"),
+        runtimePath: realpathSync(join(dir, "node_modules", "sherpa-onnx-node", "index.js")),
       });
       expect(run).toHaveBeenCalledTimes(1);
       expect(await sherpaRuntimeLoadError(dir)).toBeNull();
@@ -105,13 +137,13 @@ describe("installSherpaRuntime", () => {
   });
 
   it("leaves a runtime that loads alone", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "hf-sherpa-runtime-"));
+    const dir = runtimeDirectory();
     try {
       fakeRuntime(dir, LOADS);
       const run = vi.fn();
       expect(await installSherpaRuntime({ run, dir })).toEqual({
         installed: false,
-        runtimePath: join(dir, "node_modules", "sherpa-onnx-node", "index.js"),
+        runtimePath: realpathSync(join(dir, "node_modules", "sherpa-onnx-node", "index.js")),
       });
       expect(run).not.toHaveBeenCalled();
     } finally {
@@ -120,10 +152,10 @@ describe("installSherpaRuntime", () => {
   });
 
   it("fails with the loader's error when the reinstalled runtime still does not load", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "hf-sherpa-runtime-"));
+    const dir = runtimeDirectory();
     try {
-      const run = vi.fn(async (args: string[]) =>
-        fakeRuntime(args[args.indexOf("--prefix") + 1]!, BROKEN),
+      const run = vi.fn(async (_args: string[], _signal?: AbortSignal, cwd?: string) =>
+        fakeRuntime(cwd!, BROKEN),
       );
       await expect(installSherpaRuntime({ run, dir })).rejects.toThrow(
         "The sherpa-onnx runtime was reinstalled but still does not load (libonnxruntime.so: cannot open shared object). Use --engine whisper for now.",
@@ -136,7 +168,7 @@ describe("installSherpaRuntime", () => {
   it.skipIf(process.platform === "win32").each(["SIGINT", "SIGHUP"])(
     "treats a probe stopped by %s as a cancel and keeps the runtime",
     async (signal) => {
-      const dir = mkdtempSync(join(tmpdir(), "hf-sherpa-runtime-"));
+      const dir = runtimeDirectory();
       try {
         fakeRuntime(dir, `process.kill(process.pid, "${signal}");`);
         const run = vi.fn();
@@ -150,7 +182,7 @@ describe("installSherpaRuntime", () => {
   );
 
   it("reads its own probe timeout as a broken runtime, not a cancel, and says so", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "hf-sherpa-runtime-"));
+    const dir = runtimeDirectory();
     try {
       fakeRuntime(dir, "Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 5000);");
       expect(await sherpaRuntimeLoadError(dir, 300)).toBe("loading it timed out after 0.3 s");
@@ -160,7 +192,7 @@ describe("installSherpaRuntime", () => {
   });
 
   it("reports timeout even when the runtime handles SIGTERM and exits zero", async () => {
-    const dir = mkdtempSync(join(tmpdir(), "hf-sherpa-runtime-"));
+    const dir = runtimeDirectory();
     try {
       fakeRuntime(
         dir,
@@ -183,6 +215,7 @@ describe("a pinned Sherpa copy beside the CLI", () => {
   let root: string;
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), "hf-sherpa-beside-"));
+    writeFileSync(join(root, "speech.wav"), encodeWav(new Float32Array(100).fill(0.5), 100));
   });
   afterEach(() => {
     vi.restoreAllMocks();
@@ -204,7 +237,7 @@ describe("a pinned Sherpa copy beside the CLI", () => {
     return `
 if (process.pid === ${process.pid}) require("node:fs").writeFileSync(${JSON.stringify(parentMarker)}, "");
 module.exports = {
-  readWave() { return { sampleRate: 100, samples: new Float32Array(100).fill(0.5) }; },
+  readWave() { throw new Error("External buffers are not allowed"); },
   OfflineRecognizer: class {
     createStream() { return { acceptWaveform() {} }; }
     decode() {}
@@ -226,8 +259,11 @@ module.exports = {
     const result = JSON.parse(readFileSync(join(out, "transcript.json"), "utf-8"));
     expect(result).toEqual([{ text: "hello", start: 0, end: 1 }]);
     const event = { type: "progress", phase: "transcription", model: "parakeet-tdt-0.6b-v3" };
+    // The worker's one 1 s window streams its words before the final transcript.
     expect(onEvent.mock.calls).toEqual([
-      [{ ...event, status: "started" }],
+      // The started line sizes the WAV as 16 kHz mono: 44 header bytes and 100 samples here.
+      [{ ...event, status: "started", durationSeconds: (44 + 2 * 100) / 32_000 }],
+      [{ type: "words", model: event.model, words: result, through: 1 }],
       [{ ...event, status: "completed" }],
     ]);
     expect(existsSync(join(root, "loaded-in-parent"))).toBe(false);
@@ -239,7 +275,7 @@ module.exports = {
     expect(await sherpaRuntimeLoadError(cache, 60_000, cliUrl)).toBeNull();
     expect(await installSherpaRuntime({ dir: cache, cliUrl, run })).toEqual({
       installed: false,
-      runtimePath: pinnedPath,
+      runtimePath: realpathSync(pinnedPath),
     });
     expect(run).not.toHaveBeenCalled();
     expect(existsSync(cache)).toBe(false);
@@ -464,4 +500,17 @@ describe("sherpaUnsupportedReason", () => {
       /this system is linux-arm/,
     );
   });
+});
+
+describe("decodeTimeoutMs", () => {
+  // 1851.245125 s of audio once gave 3702490.25, which execFile refused as out of range.
+  it.each([1851.245125, 10_000_000])(
+    "gives execFile a timeout it accepts for %s s of audio",
+    (seconds) => {
+      const timeout = decodeTimeoutMs(seconds);
+      expect(Number.isInteger(timeout)).toBe(true);
+      expect(timeout).toBeGreaterThanOrEqual(Math.min(seconds * 2000, 2 ** 31 - 1));
+      expect(() => execFileSync(process.execPath, ["-e", ""], { timeout })).not.toThrow();
+    },
+  );
 });

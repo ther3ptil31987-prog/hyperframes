@@ -1,13 +1,59 @@
 import { execFileSync, spawnSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  mkdtempSync,
+  openSync,
+  readFileSync,
+  rmSync,
+  truncateSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { applyVolumeEnvelopeToWav } from "./audioVolumeEnvelope.js";
 import { defaultAudioFxParams, type HfAudioFxChain } from "@hyperframes/core/audio-fx";
-import { applyAudioFxChain, AudioFxRenderError, readWav, writeWav } from "./audioFxRender.js";
+import {
+  applyAudioFxChain,
+  AudioFxRenderError,
+  planAudioFxSegments,
+  readWav,
+  readWavHeader,
+  resolveDataBytes,
+  writeWav,
+} from "./audioFxRender.js";
+import {
+  MIXED_AUDIO_FILENAME,
+  parseAudioElements,
+  parseMasterFxChain,
+  processCompositionAudio,
+} from "./audioMixer.js";
 import { resolveHeadlessShellPath } from "./browserManager.js";
 import { getFfmpegBinary } from "../utils/ffmpegBinaries.js";
+
+const wholeFileReads = vi.hoisted(() => ({ paths: [] as string[] }));
+const openedFds = vi.hoisted(() => ({
+  log: [] as { path: string; fd: number; closed: boolean }[],
+}));
+vi.mock("node:fs", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:fs")>();
+  const readFileSync = ((path: Parameters<typeof actual.readFileSync>[0], ...rest: unknown[]) => {
+    wholeFileReads.paths.push(String(path));
+    return (actual.readFileSync as (...a: unknown[]) => unknown)(path, ...rest);
+  }) as typeof actual.readFileSync;
+  const openSync = ((path: Parameters<typeof actual.openSync>[0], ...rest: unknown[]) => {
+    const fd = (actual.openSync as (...a: unknown[]) => number)(path, ...rest);
+    openedFds.log.push({ path: String(path), fd, closed: false });
+    return fd;
+  }) as typeof actual.openSync;
+  const closeSync = ((fd: number) => {
+    const open = openedFds.log.findLast((entry) => entry.fd === fd && !entry.closed);
+    if (open) open.closed = true;
+    return actual.closeSync(fd);
+  }) as typeof actual.closeSync;
+  return { ...actual, readFileSync, openSync, closeSync };
+});
 
 /** Same probe the ffmpeg-dependent suites use: ask the binary, don't assume it. */
 const HAS_FFMPEG = spawnSync(getFfmpegBinary(), ["-version"], { encoding: "utf-8" }).status === 0;
@@ -48,7 +94,11 @@ const SR = 48000;
 
 const chainOf = (...types: string[]): HfAudioFxChain => ({
   version: 1,
-  nodes: types.map((t) => ({ type: t, enabled: true, params: defaultAudioFxParams(t) })),
+  nodes: types.map((t) => ({
+    type: t,
+    enabled: true,
+    params: defaultAudioFxParams(t),
+  })),
 });
 
 let dir: string;
@@ -226,7 +276,13 @@ describe.skipIf(!HAS_BROWSER)("browser render", () => {
       input,
       {
         version: 1,
-        nodes: [{ type: "peaking", enabled: true, params: { frequency: 440, gain: -30, q: 1 } }],
+        nodes: [
+          {
+            type: "peaking",
+            enabled: true,
+            params: { frequency: 440, gain: -30, q: 1 },
+          },
+        ],
       },
       outPath,
       { trackId: "t" },
@@ -252,7 +308,11 @@ describe.skipIf(!HAS_BROWSER)("browser render", () => {
           {
             type: "compressor",
             enabled: true,
-            params: { ...defaultAudioFxParams("compressor"), threshold: -40, ratio: 20 },
+            params: {
+              ...defaultAudioFxParams("compressor"),
+              threshold: -40,
+              ratio: 20,
+            },
           },
         ],
       },
@@ -260,6 +320,31 @@ describe.skipIf(!HAS_BROWSER)("browser render", () => {
       { trackId: "t" },
     );
     expect(db(rms(readWav(outPath).samples))).toBeLessThan(db(rms(readWav(input).samples)) - 3);
+  }, 180_000);
+
+  it("applies clip gain ahead of the chain, so a compressor sees it", async () => {
+    const input = join(dir, "in.wav");
+    tone(input, 0.5, 200);
+    const chain: HfAudioFxChain = {
+      version: 1,
+      nodes: [
+        {
+          type: "compressor",
+          enabled: true,
+          params: { ...defaultAudioFxParams("compressor"), threshold: -40, ratio: 20 },
+        },
+      ],
+    };
+    const levelAt = async (inputGain: number): Promise<number> => {
+      const outPath = join(dir, `gain-${inputGain}.wav`);
+      await applyAudioFxChain(input, chain, outPath, { trackId: "t", inputGain });
+      return db(rms(readWav(outPath).samples));
+    };
+    // After the chain, a quarter gain would land exactly 12.04 dB down; ahead of
+    // it, the compressor takes most of that back.
+    const drop = (await levelAt(1)) - (await levelAt(0.25));
+    expect(drop).toBeGreaterThan(0);
+    expect(drop).toBeLessThan(6);
   }, 180_000);
 
   it("shifts pitch up an octave, matching the preview worklet", async () => {
@@ -274,7 +359,11 @@ describe.skipIf(!HAS_BROWSER)("browser render", () => {
           {
             type: "pitchshift",
             enabled: true,
-            params: { ...defaultAudioFxParams("pitchshift"), semitones: 12, mix: 1 },
+            params: {
+              ...defaultAudioFxParams("pitchshift"),
+              semitones: 12,
+              mix: 1,
+            },
           },
         ],
       },
@@ -289,6 +378,43 @@ describe.skipIf(!HAS_BROWSER)("browser render", () => {
     expect(freq).toBeLessThan(220 * 2.3);
   }, 180_000);
 
+  it("holds a true peak under the ceiling and trims its own lookahead", async () => {
+    // fs/4 at 45 degrees: samples of +-0.707 whose waveform reaches 1.0. Preceded
+    // by a quiet impulse so the output position proves the latency was trimmed.
+    const input = join(dir, "isp-in.wav");
+    const n = Math.floor(SR * 0.4);
+    const samples = new Float32Array(n);
+    samples[100] = 0.1;
+    for (let i = 4800; i < n; i++) samples[i] = Math.sin((Math.PI / 2) * i + Math.PI / 4);
+    writeWav(input, samples, SR, 1, true);
+    const outPath = join(dir, "isp-out.wav");
+    const ceiling = -6;
+    await applyAudioFxChain(
+      input,
+      {
+        version: 1,
+        nodes: [
+          {
+            type: "truepeak",
+            id: "n1",
+            enabled: true,
+            params: { ceiling, lookahead: 3, release: 80 },
+          },
+        ],
+      },
+      outPath,
+      { trackId: "t" },
+    );
+    const out = readWav(outPath).samples;
+    expect(out.length).toBe(n);
+    expect(out[100]).toBeCloseTo(0.1, 3);
+    // Sample peak of the steady part is 0.707 * gain; the gain that holds the
+    // 1.0 true peak at -6 dBTP leaves it at -9 dBFS.
+    let peak = 0;
+    for (let i = 9600; i < n; i++) peak = Math.max(peak, Math.abs(out[i] ?? 0));
+    expect(db(peak)).toBeCloseTo(-9.03, 0);
+  }, 180_000);
+
   it("sweeps a filter across the clip when a lane automates it", async () => {
     // A 2 kHz tone under a lowpass whose cutoff rises from below it to well
     // above: the start should be attenuated and the end should not. This is
@@ -301,7 +427,14 @@ describe.skipIf(!HAS_BROWSER)("browser render", () => {
       input,
       {
         version: 1,
-        nodes: [{ type: "lowpass", id: "n1", enabled: true, params: { frequency: 300, q: 0.707 } }],
+        nodes: [
+          {
+            type: "lowpass",
+            id: "n1",
+            enabled: true,
+            params: { frequency: 300, q: 0.707 },
+          },
+        ],
       },
       outPath,
       {
@@ -355,7 +488,13 @@ describe.skipIf(!HAS_BROWSER)("browser render", () => {
       input,
       {
         version: 1,
-        nodes: [{ type: "peaking", enabled: true, params: { frequency: 440, gain: 6, q: 1 } }],
+        nodes: [
+          {
+            type: "peaking",
+            enabled: true,
+            params: { frequency: 440, gain: 6, q: 1 },
+          },
+        ],
       },
       outPath,
       {
@@ -427,7 +566,13 @@ describe.skipIf(!HAS_BROWSER)("browser render", () => {
       // input and any difference is the transfer's doing.
       {
         version: 1,
-        nodes: [{ type: "peaking", enabled: true, params: { frequency: 1000, gain: 0, q: 1 } }],
+        nodes: [
+          {
+            type: "peaking",
+            enabled: true,
+            params: { frequency: 1000, gain: 0, q: 1 },
+          },
+        ],
       },
       outPath,
       { trackId: "t" },
@@ -492,4 +637,604 @@ describe("an empty track", () => {
     ).resolves.toEqual({ path: input, envelopeBaked: false });
     expect(existsSync(output)).toBe(false);
   });
+});
+
+/** Highest sample level of a file in dBFS, as ffmpeg's volumedetect reports it. */
+function maxVolumeDb(path: string): number {
+  const result = spawnSync(
+    getFfmpegBinary(),
+    ["-nostdin", "-hide_banner", "-i", path, "-af", "volumedetect", "-f", "null", "-"],
+    { encoding: "utf-8" },
+  );
+  const match = result.stderr.match(/max_volume:\s*(-?[\d.]+) dB/);
+  if (!match?.[1]) throw new Error(`Could not measure ${path}: ${result.stderr}`);
+  return Number(match[1]);
+}
+
+const chainJson = (...nodes: Record<string, unknown>[]): string =>
+  JSON.stringify({
+    version: 1,
+    nodes: nodes.map((node, i) => ({
+      id: `n${i + 1}`,
+      enabled: true,
+      ...node,
+    })),
+  });
+
+describe("master bus: reading it", () => {
+  const html = (root: string, inner = ""): string =>
+    `<div ${root}>${inner}<audio id="a" src="a.wav" data-start="0" data-duration="1"></audio></div>`;
+  const CHAIN = '{"version":1,"nodes":[]}';
+  const attr = `data-fx-chain='${CHAIN}'`;
+
+  it("reads the root's chain as the master, not as a clip's own", () => {
+    const doc = html(`data-composition-id="main" ${attr}`);
+    expect(parseMasterFxChain(doc)).toBe(CHAIN);
+    const [a] = parseAudioElements(doc);
+    expect(a?.fxChain).toBeUndefined();
+    expect(a?.groupFxChain).toBeUndefined();
+  });
+
+  it("has none when the root carries none", () => {
+    expect(parseMasterFxChain(html(`data-composition-id="main"`))).toBeUndefined();
+  });
+
+  it("leaves a sub-composition root's chain as it was: not the master, not its clips' chain", () => {
+    const inner = `<div data-composition-id="inner" ${attr}><audio id="b" src="b.wav" data-start="0" data-duration="1"></audio></div>`;
+    const doc = html(`data-composition-id="main"`, inner);
+    expect(parseMasterFxChain(doc)).toBeUndefined();
+    const [a, b] = parseAudioElements(doc);
+    for (const el of [a, b]) {
+      expect(el?.fxChain).toBeUndefined();
+      expect(el?.groupFxChain).toBeUndefined();
+    }
+  });
+
+  it("takes the master from the top-level root when a sub-composition root carries one too", () => {
+    const MASTER = '{"version":1,"nodes":[{"type":"gain","id":"m","params":{"gain":-3}}]}';
+    const inner = `<div data-composition-id="inner" ${attr}></div>`;
+    expect(
+      parseMasterFxChain(html(`data-composition-id="main" data-fx-chain='${MASTER}'`, inner)),
+    ).toBe(MASTER);
+  });
+});
+
+describe.skipIf(!HAS_FFMPEG)("master bus: reporting an unreadable chain", () => {
+  it("fails the mix with a failure instead of throwing", async () => {
+    writeWav(join(dir, "a.wav"), new Float32Array(SR).fill(0.1), SR);
+    const result = await processCompositionAudio(
+      [
+        {
+          id: "a",
+          src: "a.wav",
+          start: 0,
+          end: 1,
+          mediaStart: 0,
+          layer: 0,
+          volume: 1,
+          type: "audio",
+        },
+      ],
+      dir,
+      join(dir, "work"),
+      join(dir, `bad-${MIXED_AUDIO_FILENAME}`),
+      1,
+      undefined,
+      { masterFxChain: "{not json" },
+    );
+    expect(result.success).toBe(false);
+    expect(result.failures?.[0]?.elementId).toBe("master");
+  });
+});
+
+describe.skipIf(!HAS_BROWSER || !HAS_FFMPEG)("master bus: rendering it", () => {
+  const element = (id: string, extra: Record<string, unknown> = {}) => ({
+    id,
+    src: `${id}.wav`,
+    start: 0,
+    end: 1,
+    mediaStart: 0,
+    layer: 0,
+    volume: 1,
+    type: "audio" as const,
+    ...extra,
+  });
+  const steady = (peak: number, freq: number): Float32Array =>
+    Float32Array.from({ length: SR }, (_, i) => peak * Math.sin((2 * Math.PI * freq * i) / SR));
+
+  it("limits the sum of everything that feeds it", async () => {
+    // Two tones at -1 dBFS sum to about +5 dBFS: no clip's own chain can see that.
+    writeWav(join(dir, "a.wav"), steady(0.9, 300), SR, 1, true);
+    writeWav(join(dir, "b.wav"), steady(0.9, 300), SR, 1, true);
+    const master = chainJson({
+      type: "truepeak",
+      params: { ceiling: -6, lookahead: 3, release: 80 },
+    });
+    const out = join(dir, `limited-${MIXED_AUDIO_FILENAME}`);
+    const flat = join(dir, `flat-${MIXED_AUDIO_FILENAME}`);
+    const mix = (path: string, masterFxChain?: string) =>
+      processCompositionAudio(
+        [element("a"), element("b")],
+        dir,
+        join(dir, "work"),
+        path,
+        1,
+        undefined,
+        { masterFxChain },
+      );
+    expect((await mix(flat)).success).toBe(true);
+    expect((await mix(out, master)).success).toBe(true);
+    // The unprocessed sum has nowhere to go but full scale.
+    expect(maxVolumeDb(flat)).toBeGreaterThan(-1);
+    expect(maxVolumeDb(out)).toBeLessThanOrEqual(-5.5);
+  }, 180_000);
+
+  /** Mix `elements` for one second and read the file's highest level in dBFS. */
+  const mixedPeakDb = async (
+    name: string,
+    elements: Parameters<typeof processCompositionAudio>[0],
+    masterFxChain?: string,
+  ): Promise<number> => {
+    const out = join(dir, `${name}-${MIXED_AUDIO_FILENAME}`);
+    const result = await processCompositionAudio(
+      elements,
+      dir,
+      join(dir, "work"),
+      out,
+      1,
+      undefined,
+      { masterFxChain },
+    );
+    expect(result.success).toBe(true);
+    return maxVolumeDb(out);
+  };
+  const writeTone = (id: string, peak: number): void =>
+    writeWav(join(dir, `${id}.wav`), steady(peak, 300), SR, 1, true);
+
+  it("applies the root's data-fx-chain once over the sum, from authored HTML", async () => {
+    // Two in-phase 0.3 tones sum to -4.4 dBFS. A -6 dBTP limiter then a -6 dB gain
+    // land that at -12. Per clip, neither clip reaches the ceiling and the result is
+    // -10.4; applied twice it is -18. A linear chain alone could not tell these apart.
+    writeTone("a", 0.3);
+    writeTone("b", 0.3);
+    const master = chainJson(
+      { type: "truepeak", params: { ceiling: -6, lookahead: 3, release: 80 } },
+      { type: "gain", params: { gain: -6 } },
+    );
+    const clip = (id: string) =>
+      `<audio id="${id}" src="${id}.wav" data-start="0" data-end="1" data-duration="1"></audio>`;
+    const html = `<div data-composition-id="main" data-fx-chain='${master}'>${clip("a")}${clip("b")}</div>`;
+    const elements = parseAudioElements(html);
+    expect(elements).toHaveLength(2);
+    expect(await mixedPeakDb("once", elements, parseMasterFxChain(html))).toBeCloseTo(-12, 0);
+  }, 180_000);
+
+  it("keeps the sum in float until the chain has read it", async () => {
+    // The sum is +5 dBFS. A -6 dB master gain lands it at -1 if the sum is float; a sum
+    // clipped to 16 bits at full scale first would land at -6.
+    writeTone("a", 0.9);
+    writeTone("b", 0.9);
+    const masterFxChain = chainJson({ type: "gain", params: { gain: -6 } });
+    const peak = await mixedPeakDb("float", [element("a"), element("b")], masterFxChain);
+    expect(peak).toBeGreaterThan(-2);
+  }, 180_000);
+
+  it("runs after each group's own chain and fader", async () => {
+    // The group limits its 0.5 tone to -20 dBFS, then its fader takes 6 dB off: -26. A
+    // +12 dB master gain after both lands at -14. A fader ahead of the limiter would
+    // leave -20 and end at -8; a master ahead of the group would be limited away at -26.
+    writeTone("g", 0.5);
+    const group = {
+      groupId: "bus",
+      groupFxChain: chainJson({
+        type: "truepeak",
+        params: { ceiling: -20, lookahead: 3, release: 80 },
+      }),
+      groupVolume: 0.5,
+    };
+    const masterFxChain = chainJson({ type: "gain", params: { gain: 12 } });
+    expect(await mixedPeakDb("ordered", [element("g", group)], masterFxChain)).toBeCloseTo(-14, 0);
+  }, 180_000);
+});
+
+describe("windowed rendering of a long input", () => {
+  const limits = {
+    aboveBytes: 0,
+    segmentSeconds: 1,
+    prerollSeconds: 1,
+    maxPrerollSeconds: 1,
+    postrollSeconds: 0.1,
+  };
+
+  it("tiles the input exactly, each window carrying its pre- and post-roll", () => {
+    const segments = planAudioFxSegments(Math.round(3.5 * SR), SR, limits);
+    expect(segments.map((s) => [s.keepFrom, s.keepTo])).toEqual([
+      [0, SR],
+      [SR, 2 * SR],
+      [2 * SR, 3 * SR],
+      [3 * SR, Math.round(3.5 * SR)],
+    ]);
+    expect(segments.map((s) => s.last)).toEqual([false, false, false, true]);
+    expect(segments[0]).toMatchObject({ readFrom: 0, readTo: SR + SR / 10 });
+    expect(segments[2]).toMatchObject({
+      readFrom: SR,
+      readTo: 3 * SR + SR / 10,
+    });
+    expect(segments[3]?.readTo).toBe(Math.round(3.5 * SR));
+  });
+
+  it("starts every window on a render quantum, so block-level state lines up with a whole render", () => {
+    const odd = { ...limits, prerollSeconds: 0.337 };
+    const segments = planAudioFxSegments(Math.round(3.5 * SR), SR, odd);
+    for (const seg of segments) {
+      expect(seg.readFrom % 128).toBe(0);
+      expect(seg.keepFrom - seg.readFrom).toBeGreaterThanOrEqual(
+        Math.min(seg.keepFrom, Math.round(0.337 * SR)),
+      );
+    }
+  });
+
+  it("reads the head of a file Node cannot read whole", () => {
+    // 2.5 GiB of samples: past the 2 GiB ceiling readFileSync enforces, sparse on disk.
+    const path = join(dir, "huge.wav");
+    writeWav(path, new Float32Array(0), SR, 2, true);
+    const fd = openSync(path, "r+");
+    truncateSync(path, 2.5 * 1024 ** 3);
+    closeSync(fd);
+    expect(() => readWav(path)).toThrow(/greater than 2 GiB/);
+    const header = readWavHeader(path);
+    expect(header).toMatchObject({
+      channels: 2,
+      sampleRate: SR,
+      float: true,
+      dataOffset: 44,
+    });
+  });
+
+  it("reads a data size of 0xFFFFFFFF, or 0, as running to the end of the file", () => {
+    const FIVE_GIB = 5 * 1024 ** 3;
+    expect(resolveDataBytes(0xffffffff, FIVE_GIB)).toBe(FIVE_GIB);
+    expect(resolveDataBytes(0, FIVE_GIB)).toBe(FIVE_GIB);
+    expect(resolveDataBytes(1000, FIVE_GIB)).toBe(1000);
+    expect(resolveDataBytes(2000, 1500)).toBe(1500);
+
+    // The same header as ffmpeg leaves on a stream, on a file small enough to write.
+    const path = join(dir, "stream.wav");
+    writeWav(path, new Float32Array(100), SR, 2, true);
+    const bytes = readFileSync(path);
+    bytes.writeUInt32LE(0xffffffff, 40);
+    writeFileSync(path, bytes);
+    expect(readWavHeader(path)).toMatchObject({
+      dataOffset: 44,
+      dataBytes: 400,
+    });
+  });
+
+  it("names the cause when a file past 2 GiB cannot be streamed", async () => {
+    const path = join(dir, "huge-bad-header.wav");
+    writeFileSync(path, "not a wav");
+    truncateSync(path, 2.5 * 1024 ** 3);
+    await expect(
+      applyAudioFxChain(path, chainOf("gain"), join(dir, "out.wav"), {
+        trackId: "t",
+      }),
+    ).rejects.toThrow(/WAV header of an input over 2 GiB could not be read/);
+  });
+
+  it("reads a data size of 0 or 0xFFFFFFFF as the rest of the file in both readers", () => {
+    for (const declared of [0, 0xffffffff]) {
+      const path = join(dir, `declared-${declared}.wav`);
+      writeWav(path, new Float32Array(200), SR, 2, true);
+      const bytes = readFileSync(path);
+      bytes.writeUInt32LE(declared, 40);
+      writeFileSync(path, bytes);
+      expect(readWav(path).samples.length).toBe(200);
+      expect(readWavHeader(path)?.dataBytes).toBe(800);
+    }
+  });
+
+  it.skipIf(!HAS_BROWSER)(
+    "warns when a chain remembers longer than the pre-roll cap",
+    async () => {
+      const input = join(dir, "warn.wav");
+      writeWav(input, new Float32Array(SR), SR, 1, true);
+      const delay = (feedback: number): HfAudioFxChain => ({
+        version: 1,
+        nodes: [
+          { type: "delay", id: "d", enabled: true, params: { time: 400, feedback, mix: 0.5 } },
+        ],
+      });
+      const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+      try {
+        const streaming = { ...limits, prerollSeconds: 0.5, maxPrerollSeconds: 2 };
+        await applyAudioFxChain(input, delay(0.95), join(dir, "w1.wav"), {
+          trackId: "t1",
+          streaming,
+        });
+        expect(warn).toHaveBeenCalledTimes(1);
+        expect(String(warn.mock.calls[0]?.[0])).toContain("track t1");
+        await applyAudioFxChain(input, delay(0.1), join(dir, "w2.wav"), {
+          trackId: "t2",
+          streaming,
+        });
+        expect(warn).toHaveBeenCalledTimes(1);
+      } finally {
+        warn.mockRestore();
+      }
+    },
+    180_000,
+  );
+
+  it.skipIf(!HAS_BROWSER)(
+    "closes the input when the output cannot be opened",
+    async () => {
+      const input = join(dir, "in.wav");
+      writeWav(input, new Float32Array(SR * 2), SR, 1, true);
+      openedFds.log.length = 0;
+      await expect(
+        applyAudioFxChain(input, chainOf("gain"), join(dir, "no-such-dir", "out.wav"), {
+          trackId: "t",
+          streaming: limits,
+        }),
+      ).rejects.toThrow();
+      const onInput = openedFds.log.filter((entry) => entry.path === input);
+      expect(onInput.length).toBeGreaterThan(0);
+      expect(onInput.every((entry) => entry.closed)).toBe(true);
+    },
+    180_000,
+  );
+
+  it("names the unsupported case when automation meets a file past 2 GiB", async () => {
+    const path = join(dir, "huge-auto.wav");
+    writeWav(path, new Float32Array(0), SR, 2, true);
+    truncateSync(path, 2.5 * 1024 ** 3);
+    await expect(
+      applyAudioFxChain(path, chainOf("gain"), join(dir, "out.wav"), {
+        trackId: "t",
+        automation: { version: 1, lanes: [] },
+      }),
+    ).rejects.toThrow(/parameter automation is not supported on inputs over 2 GiB/);
+  });
+
+  const hot = (seconds: number): Float32Array => {
+    const frames = Math.floor(SR * seconds);
+    const s = new Float32Array(frames * 2);
+    for (let i = 0; i < frames; i++) {
+      const swell = 0.5 + 0.9 * Math.abs(Math.sin((2 * Math.PI * i) / (SR * 1.7)));
+      s[i * 2] = swell * Math.sin((2 * Math.PI * 300 * i) / SR);
+      s[i * 2 + 1] = swell * Math.sin((2 * Math.PI * 450 * i) / SR);
+    }
+    return s;
+  };
+  const limiter: HfAudioFxChain = {
+    version: 1,
+    nodes: [
+      {
+        type: "truepeak",
+        id: "m1",
+        enabled: true,
+        params: { ceiling: -6, lookahead: 3, release: 80 },
+      },
+    ],
+  };
+
+  it.skipIf(!HAS_BROWSER)(
+    "renders a long mix window by window, never reading the file whole, and matches the whole render",
+    async () => {
+      const input = join(dir, "long.wav");
+      writeWav(input, hot(4.4), SR, 2, true);
+      const whole = join(dir, "whole.wav");
+      const windowed = join(dir, "windowed.wav");
+      await applyAudioFxChain(input, limiter, whole, { trackId: "whole" });
+
+      wholeFileReads.paths.length = 0;
+      const result = await applyAudioFxChain(input, limiter, windowed, {
+        trackId: "windowed",
+        streaming: limits,
+      });
+
+      expect(result.path).toBe(windowed);
+      expect(wholeFileReads.paths).not.toContain(input);
+      const a = readWav(whole);
+      const b = readWav(windowed);
+      expect(b).toMatchObject({ channels: 2, sampleRate: SR, float: true });
+      expect(b.samples.length).toBe(a.samples.length);
+      let worst = 0;
+      // The final 10 ms is left out: a lookahead limiter's last frames come back silent or not
+      // depending on the input's length, whole or windowed alike.
+      for (let i = 0; i < a.samples.length - SR / 50; i++) {
+        worst = Math.max(worst, Math.abs((a.samples[i] ?? 0) - (b.samples[i] ?? 0)));
+      }
+      expect(worst).toBeLessThan(0.01);
+    },
+    180_000,
+  );
+
+  /** A tone with a loud burst ending just ahead of each 5 s seam. */
+  const bursts = (seconds: number): Float32Array => {
+    const frames = Math.floor(SR * seconds);
+    const s = new Float32Array(frames * 2);
+    for (let i = 0; i < frames; i++) {
+      const t = i / SR;
+      const loud = t % 5 >= 3.4 && t % 5 < 3.9;
+      const amp = loud ? 0.9 : 0.12;
+      s[i * 2] = amp * Math.sin((2 * Math.PI * 330 * i) / SR);
+      s[i * 2 + 1] = amp * Math.sin((2 * Math.PI * 520 * i) / SR);
+    }
+    return s;
+  };
+  const memoryChain = (): HfAudioFxChain => ({
+    version: 1,
+    nodes: [
+      // A hold of 5 does not divide the windows' 128-aligned starts, so an unseeded counter drifts.
+      { type: "bitcrush", id: "b", enabled: true, params: { bits: 5, samples: 5, mix: 0.7 } },
+      {
+        type: "chorus",
+        id: "c",
+        enabled: true,
+        params: { ...defaultAudioFxParams("chorus"), speed: 0.25 },
+      },
+      {
+        type: "pitchshift",
+        id: "p",
+        enabled: true,
+        params: { semitones: 3, mix: 1 },
+      },
+      {
+        type: "compressor",
+        id: "k",
+        enabled: true,
+        params: {
+          ...defaultAudioFxParams("compressor"),
+          threshold: -30,
+          ratio: 10,
+          makeup: 20,
+          release: 700,
+        },
+      },
+      {
+        type: "delay",
+        id: "d",
+        enabled: true,
+        params: { time: 400, feedback: 0.5, mix: 0.5 },
+      },
+      {
+        type: "reverb",
+        id: "r",
+        enabled: true,
+        params: { size: 0.5, wet: 0.3 },
+      },
+    ],
+  });
+  const memoryLimits = {
+    ...limits,
+    segmentSeconds: 5,
+    prerollSeconds: 0.5,
+    maxPrerollSeconds: 12,
+  };
+
+  const renderBoth = async (
+    streaming: typeof memoryLimits,
+  ): Promise<{ whole: Float32Array; windowed: Float32Array }> => {
+    const input = join(dir, "mem.wav");
+    writeWav(input, bursts(22), SR, 2, true);
+    await applyAudioFxChain(input, memoryChain(), join(dir, "mem-whole.wav"), {
+      trackId: "w",
+    });
+    await applyAudioFxChain(input, memoryChain(), join(dir, "mem-windowed.wav"), {
+      trackId: "s",
+      streaming,
+    });
+    return {
+      whole: readWav(join(dir, "mem-whole.wav")).samples,
+      windowed: readWav(join(dir, "mem-windowed.wav")).samples,
+    };
+  };
+  const worstDifference = (a: Float32Array, b: Float32Array): number => {
+    let worst = 0;
+    for (let i = 0; i < a.length; i++) worst = Math.max(worst, Math.abs((a[i] ?? 0) - (b[i] ?? 0)));
+    return worst;
+  };
+
+  it.skipIf(!HAS_BROWSER)(
+    "carries bitcrush, modulation, delay, reverb and compressor state across window seams",
+    async () => {
+      const { whole, windowed } = await renderBoth(memoryLimits);
+      // The tail of the last window is kept: dropping it would shorten the file.
+      expect(windowed.length).toBe(whole.length);
+      expect(whole.length).toBeGreaterThan(22 * SR * 2);
+      expect(worstDifference(whole, windowed)).toBeLessThan(0.001);
+    },
+    240_000,
+  );
+
+  it.skipIf(!HAS_BROWSER)(
+    "cannot match the whole render without the pre-roll the chain asks for",
+    async () => {
+      const { whole, windowed } = await renderBoth({
+        ...memoryLimits,
+        maxPrerollSeconds: 0.5,
+      });
+      expect(worstDifference(whole, windowed)).toBeGreaterThan(0.05);
+    },
+    240_000,
+  );
+
+  it.skipIf(!HAS_BROWSER)(
+    "a lookahead limiter keeps the last of its input and the file's length",
+    async () => {
+      const input = join(dir, "tp.wav");
+      const frames = Math.round(0.5 * SR);
+      const steady = new Float32Array(frames).fill(0.3);
+      writeWav(input, steady, SR, 1, true);
+      const out = join(dir, "tp-out.wav");
+      await applyAudioFxChain(input, chainOf("truepeak"), out, { trackId: "tp" });
+      const samples = readWav(out).samples;
+      expect(samples.length).toBe(frames);
+      // The lookahead is 7 ms by default; the final 5 ms must still carry the signal.
+      expect(sliceRms(samples, 0.495, 0.5)).toBeGreaterThan(0.25);
+    },
+    120_000,
+  );
+
+  it.skipIf(!HAS_BROWSER)(
+    "a pitch shifter keeps the last 90 ms of its input",
+    async () => {
+      const input = join(dir, "ps.wav");
+      const frames = Math.round(0.4 * SR);
+      writeWav(input, new Float32Array(frames).fill(0.3), SR, 1, true);
+      const out = join(dir, "ps-out.wav");
+      const chain: HfAudioFxChain = {
+        version: 1,
+        nodes: [
+          {
+            type: "pitchshift",
+            id: "p",
+            enabled: true,
+            params: { ...defaultAudioFxParams("pitchshift"), semitones: 7, mix: 1 },
+          },
+        ],
+      };
+      await applyAudioFxChain(input, chain, out, { trackId: "ps" });
+      const samples = readWav(out).samples;
+      // The shifter reads up to a grain behind its write head, so the last 90 ms of the clip comes
+      // out after the input ends. A steady level stays steady, so quiet there is dropped audio.
+      expect(samples.length).toBeGreaterThan(frames);
+      expect(sliceRms(samples, 0.31, 0.4)).toBeGreaterThan(0.2);
+      expect(sliceRms(samples, 0.4, 0.45)).toBeGreaterThan(0.1);
+    },
+    120_000,
+  );
+
+  it.skipIf(!HAS_BROWSER)(
+    "bakes a volume envelope on the file's own clock across window boundaries",
+    async () => {
+      const input = join(dir, "env.wav");
+      writeWav(input, new Float32Array(SR * 3 * 2).fill(0.25), SR, 2, true);
+      const out = join(dir, "env-out.wav");
+      const gain: HfAudioFxChain = {
+        version: 1,
+        nodes: [{ type: "gain", id: "g", enabled: true, params: { gain: 0 } }],
+      };
+      const result = await applyAudioFxChain(input, gain, out, {
+        trackId: "env",
+        streaming: limits,
+        envelope: {
+          keyframes: [
+            { time: 0, volume: 1 },
+            { time: 1.5, volume: 1 },
+            { time: 1.5001, volume: 0.5 },
+            { time: 3, volume: 0.5 },
+          ],
+          trackStart: 0,
+          baseVolume: 1,
+        },
+      });
+      expect(result.envelopeBaked).toBe(true);
+      const samples = readWav(out).samples;
+      expect(samples[Math.floor(1.2 * SR) * 2]).toBeCloseTo(0.25, 2);
+      expect(samples[Math.floor(2.2 * SR) * 2]).toBeCloseTo(0.125, 2);
+    },
+    180_000,
+  );
 });

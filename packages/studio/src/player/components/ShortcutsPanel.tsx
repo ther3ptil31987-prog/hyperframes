@@ -1,10 +1,11 @@
-import { useState, useCallback, useEffect, useId, useRef, memo } from "react";
+import { useState, useCallback, useEffect, useRef, memo } from "react";
 import { formatTime, frameToSeconds } from "../lib/time";
-import { Tooltip } from "../../components/ui";
+import { Popover, Tooltip } from "../../components/ui";
 import { flatActive, flatIdle } from "../../components/timelineToolbarStyles";
-import { useContextMenuDismiss } from "../../hooks/useContextMenuDismiss";
 import { usePlayerStore } from "../store/playerStore";
-import { DEFAULT_SHORTCUT_SECTIONS, type ShortcutSection } from "./studioShortcuts";
+import { useCompositionFps } from "../../utils/linkedClipPreferences";
+import { matchesKey, useShortcutSections, type ShortcutSection } from "./studioShortcuts";
+import { isTypingTarget } from "@hyperframes/core/typing-target";
 
 interface ShortcutsPanelProps {
   disabled: boolean;
@@ -17,6 +18,24 @@ interface ShortcutsPanelProps {
   sections?: readonly ShortcutSection[];
 }
 
+/** Stays above its button, shrinking to the room there, rather than flipping down over the timeline. */
+const STAY_ABOVE = { side: "none", align: "shift", fallbackAxisSide: "none" } as const;
+
+function useShortcutsOpen() {
+  const [open, setOpen] = useState(false);
+  useEffect(() => {
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.defaultPrevented || e.repeat || isTypingTarget(e.target)) return;
+      if (!matchesKey(e, "shortcuts")) return;
+      e.preventDefault();
+      setOpen((wasOpen) => !wasOpen);
+    };
+    document.addEventListener("keydown", onKeyDown);
+    return () => document.removeEventListener("keydown", onKeyDown);
+  }, []);
+  return [open, setOpen] as const;
+}
+
 export const ShortcutsPanel = memo(function ShortcutsPanel({
   disabled,
   duration,
@@ -25,34 +44,21 @@ export const ShortcutsPanel = memo(function ShortcutsPanel({
   setInPoint,
   setOutPoint,
   onSeek,
-  sections = DEFAULT_SHORTCUT_SECTIONS,
+  sections: hostSections,
 }: ShortcutsPanelProps) {
-  const [showShortcuts, setShowShortcuts] = useState(false);
+  const sections = useShortcutSections(hostSections);
+  const [showShortcuts, setShowShortcuts] = useShortcutsOpen();
   const [jumpFrame, setJumpFrame] = useState("");
-  const shortcutsPanelId = useId();
-  const closeShortcuts = useCallback(() => setShowShortcuts(false), []);
-  const shortcutsPanelRef = useContextMenuDismiss(closeShortcuts);
+  const compositionFps = useCompositionFps();
+  // Focus lands on the scrolling body, not the frame input, so keyboard users can scroll and read it.
   const panelBodyRef = useRef<HTMLDivElement>(null);
-  const triggerRef = useRef<HTMLButtonElement>(null);
-
-  // Move focus into the panel on open so keyboard users can scroll and read
-  // it; hand focus back to the trigger on close.
-  // eslint-disable-next-line no-restricted-syntax
-  useEffect(() => {
-    if (!showShortcuts) return;
-    const trigger = triggerRef.current;
-    panelBodyRef.current?.focus();
-    return () => {
-      trigger?.focus();
-    };
-  }, [showShortcuts]);
 
   const commitJumpFrame = useCallback(() => {
     if (disabled) return;
     const frame = Number.parseInt(jumpFrame, 10);
     if (!Number.isFinite(frame) || duration <= 0) return;
-    onSeek(Math.min(duration, frameToSeconds(Math.max(0, frame))));
-  }, [disabled, duration, jumpFrame, onSeek]);
+    onSeek(Math.min(duration, frameToSeconds(Math.max(0, frame), compositionFps)));
+  }, [compositionFps, disabled, duration, jumpFrame, onSeek]);
 
   const handleJumpSubmit = useCallback(
     (e: React.FormEvent) => {
@@ -72,48 +78,40 @@ export const ShortcutsPanel = memo(function ShortcutsPanel({
   );
 
   return (
-    <div ref={shortcutsPanelRef} className="relative shrink-0">
-      <Tooltip label="Shortcuts and tools">
-        <button
-          ref={triggerRef}
-          type="button"
-          onClick={() => setShowShortcuts((v) => !v)}
-          className={showShortcuts ? flatActive : flatIdle}
-          aria-label="Shortcuts and tools"
-          aria-expanded={showShortcuts}
-          aria-controls={shortcutsPanelId}
-        >
-          <svg
-            width="11"
-            height="11"
-            viewBox="0 0 24 24"
-            fill="none"
-            stroke="currentColor"
-            strokeWidth="1.75"
-            strokeLinecap="round"
-            strokeLinejoin="round"
-            aria-hidden="true"
+    <Tooltip label="Shortcuts and tools" disabled={showShortcuts}>
+      <Popover
+        open={showShortcuts}
+        onOpenChange={setShowShortcuts}
+        side="top"
+        align="end"
+        collisionAvoidance={STAY_ABOVE}
+        aria-label="Keyboard shortcuts and tools"
+        initialFocus={panelBodyRef}
+        className="flex max-h-[min(280px,var(--available-height))] min-w-[220px] flex-col border-border bg-raised p-0"
+        trigger={
+          <button
+            type="button"
+            className={`${showShortcuts ? flatActive : flatIdle} shrink-0`}
+            aria-label="Shortcuts and tools"
           >
-            <rect x="2" y="4" width="20" height="16" rx="2" />
-            <path d="M6 8h.01M10 8h.01M14 8h.01M18 8h.01M6 12h.01M10 12h.01M14 12h.01M18 12h.01M8 16h8" />
-          </svg>
-        </button>
-      </Tooltip>
-      {showShortcuts && (
-        <div
-          id={shortcutsPanelId}
-          ref={panelBodyRef}
-          tabIndex={-1}
-          role="dialog"
-          aria-label="Keyboard shortcuts and tools"
-          // Deliberately NOT aria-modal. This is a non-modal disclosure: focus is
-          // not trapped and the rest of the editor stays operable, so claiming
-          // modality would make assistive tech treat the whole app as inert.
-          className="absolute bottom-full right-0 mb-2 z-50 rounded-lg border border-border bg-raised shadow-popover min-w-[220px] overflow-y-auto outline-hidden"
-          style={{
-            maxHeight: "min(280px, calc(100vh - 80px))",
-          }}
-        >
+            <svg
+              width="11"
+              height="11"
+              viewBox="0 0 24 24"
+              fill="none"
+              stroke="currentColor"
+              strokeWidth="1.75"
+              strokeLinecap="round"
+              strokeLinejoin="round"
+              aria-hidden="true"
+            >
+              <rect x="2" y="4" width="20" height="16" rx="2" />
+              <path d="M6 8h.01M10 8h.01M14 8h.01M18 8h.01M6 12h.01M10 12h.01M14 12h.01M18 12h.01M8 16h8" />
+            </svg>
+          </button>
+        }
+      >
+        <div ref={panelBodyRef} tabIndex={-1} className="min-h-0 overflow-y-auto outline-hidden">
           <div className="px-3 pt-3 pb-2.5">
             <p className="text-[9px] font-medium text-neutral-500 uppercase tracking-wider mb-1.5">
               Jump to frame
@@ -182,7 +180,7 @@ export const ShortcutsPanel = memo(function ShortcutsPanel({
                       </Tooltip>
                     </>
                   ) : (
-                    <span className="text-[10px] text-neutral-600">—</span>
+                    <span className="text-[10px] text-neutral-600">Not set</span>
                   )}
                 </div>
               </div>
@@ -220,7 +218,7 @@ export const ShortcutsPanel = memo(function ShortcutsPanel({
                       </Tooltip>
                     </>
                   ) : (
-                    <span className="text-[10px] text-neutral-600">—</span>
+                    <span className="text-[10px] text-neutral-600">Not set</span>
                   )}
                 </div>
               </div>
@@ -247,8 +245,8 @@ export const ShortcutsPanel = memo(function ShortcutsPanel({
             ))}
           </div>
         </div>
-      )}
-    </div>
+      </Popover>
+    </Tooltip>
   );
 });
 

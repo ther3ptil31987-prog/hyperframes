@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { initSandboxRuntimeModular } from "./init";
+import { WebAudioTransport } from "./webAudioTransport";
 import { STUDIO_MANUAL_EDIT_GESTURE_ATTR } from "../editing/draftMarkers";
 import type { RuntimeTimelineLike } from "./types";
 
@@ -167,6 +168,7 @@ describe("parked transport loop", () => {
 
   afterEach(() => {
     window.__hfRuntimeTeardown?.();
+    delete (document as { visibilityState?: DocumentVisibilityState }).visibilityState;
     document.body.innerHTML = "";
     window.__timelines = {} as Record<string, RuntimeTimelineLike>;
     delete window.__player;
@@ -326,6 +328,147 @@ describe("parked transport loop", () => {
       raf.step();
     }
     expect(raf.pending()).toBeGreaterThan(0);
+  });
+
+  /** The host's per-frame tick, as the player posts it on the runtime-bridge path. */
+  const hostTick = () =>
+    window.dispatchEvent(
+      new MessageEvent("message", {
+        source: window.parent,
+        data: { source: "hf-parent", type: "control", action: "tick" },
+      }),
+    );
+
+  const countSeeks = () => {
+    const timeline = window.__timelines!["main"] as RuntimeTimelineLike;
+    const seeks: number[] = [];
+    const originalTotalTime = timeline.totalTime!.bind(timeline);
+    timeline.totalTime = (time?: number, suppress?: boolean) => {
+      if (time !== undefined) seeks.push(time);
+      return originalTotalTime(time, suppress);
+    };
+    return seeks;
+  };
+
+  it("does not seek a timeline time already rendered by its frame loop", () => {
+    vi.spyOn(performance, "now").mockReturnValue(1000);
+    mount();
+    initSandboxRuntimeModular();
+    quiesce();
+    window.__player!.play();
+    frame120Hz();
+    const seeks = countSeeks();
+
+    frame120Hz();
+    const perFrame = seeks.length;
+    hostTick();
+
+    expect(perFrame).toBeGreaterThan(0);
+    expect(seeks.length).toBe(perFrame);
+  });
+
+  it("renders a newer host time after its own frame rendered an earlier time", () => {
+    let nowMs = 1000;
+    vi.spyOn(performance, "now").mockImplementation(() => nowMs);
+    mount();
+    initSandboxRuntimeModular();
+    quiesce();
+    window.__player!.play();
+    nowMs = 1008;
+    frame120Hz();
+    const seeks = countSeeks();
+
+    nowMs = 1024;
+    hostTick();
+
+    expect(seeks).toContain(0.024);
+  });
+
+  it("reapplies an explicit seek even when that timeline time was already rendered", () => {
+    vi.spyOn(performance, "now").mockReturnValue(1000);
+    mount();
+    initSandboxRuntimeModular();
+    quiesce();
+    window.__player!.play();
+    frame120Hz();
+    const timeline = window.__timelines!["main"]!;
+    timeline.totalTime!(1);
+    const seeks = countSeeks();
+
+    window.__player!.seek(0);
+
+    expect(seeks).toContain(0);
+    expect(timeline.totalTime!()).toBe(0);
+  });
+
+  it("refreshes the WebAudio snapshot on host ticks without iframe frames", () => {
+    let audioTime = 0;
+    mount();
+    initSandboxRuntimeModular();
+    quiesce();
+    window.__player!.play();
+    vi.spyOn(WebAudioTransport.prototype, "ownsClock").mockReturnValue(true);
+    vi.spyOn(WebAudioTransport.prototype, "context", "get").mockReturnValue({} as AudioContext);
+    vi.spyOn(WebAudioTransport.prototype, "getTime").mockImplementation(() => audioTime);
+    frame120Hz();
+    const seeks = countSeeks();
+
+    audioTime = 0.024;
+    hostTick();
+    const firstSeekCount = seeks.length;
+    hostTick();
+    expect(seeks.length).toBe(firstSeekCount);
+    audioTime = 0.048;
+    hostTick();
+
+    expect(seeks).toContain(0.024);
+    expect(seeks.at(-1)).toBe(0.048);
+    expect(window.__player!.getTime()).toBe(0.048);
+  });
+
+  it.each([false, true])(
+    "renders the first host tick after play with prior playback %s",
+    (resume) => {
+      let nowMs = 1000;
+      vi.spyOn(performance, "now").mockImplementation(() => nowMs);
+      mount();
+      initSandboxRuntimeModular();
+      quiesce();
+      if (resume) {
+        window.__player!.play();
+        frame120Hz();
+        window.__player!.pause();
+        quiesce();
+      }
+      window.__player!.play();
+      const seeks = countSeeks();
+      nowMs += 8;
+      vi.advanceTimersByTime(8);
+      hostTick();
+      expect(seeks.length).toBeGreaterThan(0);
+    },
+  );
+
+  it("advances on the host's ticks while its own animation frames are throttled", () => {
+    let nowMs = 1000;
+    vi.spyOn(performance, "now").mockImplementation(() => nowMs);
+    mount();
+    initSandboxRuntimeModular();
+    quiesce();
+    window.__player!.play();
+    frame120Hz();
+    hostTick();
+    const seeks = countSeeks();
+
+    for (let i = 0; i < 3; i += 1) {
+      nowMs += 8;
+      vi.advanceTimersByTime(8);
+      hostTick();
+    }
+
+    expect(seeks).toContain(0.008);
+    expect(seeks).toContain(0.016);
+    expect(seeks.at(-1)).toBe(0.024);
   });
 
   it("posts the paused bridge heartbeat on its documented interval while parked", () => {
@@ -592,7 +735,7 @@ describe("parked transport loop", () => {
     expect(posted.filter((m) => m["type"] === "timeline").length - before).toBe(0);
   });
 
-  it("posts a playing clip's new track, label and z-index on the next poll", async () => {
+  it("posts a playing clip's new track, label and z-index once playback stops", async () => {
     mount(
       '<div id="clip" data-start="0" data-duration="5" data-track-index="0" data-timeline-label="Before" style="z-index: 1"></div>',
     );
@@ -605,7 +748,11 @@ describe("parked transport loop", () => {
     clip.setAttribute("data-timeline-label", "After");
     clip.style.zIndex = "9";
     await flushObservers();
+    posted.length = 0;
     for (let i = 0; i < 130; i += 1) frame120Hz();
+    expect(posted.filter((m) => m["type"] === "timeline")).toHaveLength(0);
+    window.__player!.pause();
+    for (let i = 0; i < 10; i += 1) frame120Hz();
     const clips = (posted.filter((m) => m["type"] === "timeline").at(-1)?.["clips"] ?? []) as Array<
       Record<string, unknown>
     >;
@@ -840,5 +987,51 @@ describe("parked transport loop", () => {
     settle();
     expect(window.__player!.isPlaying()).toBe(true);
     expect(media.isPaused()).toBe(true);
+  });
+
+  const setVisibility = (state: DocumentVisibilityState) => {
+    Object.defineProperty(document, "visibilityState", { configurable: true, get: () => state });
+    document.dispatchEvent(new Event("visibilitychange"));
+  };
+
+  it("keeps the transport ticking on a timer while the document is hidden", () => {
+    // A hidden document runs no animation frames but its media keeps playing, so a
+    // transport driven by frames alone never ends a clip at the end of its window.
+    let nowMs = 1000;
+    vi.spyOn(performance, "now").mockImplementation(() => nowMs);
+    mount(`<audio id="a1" data-start="0" data-duration="1"></audio>`);
+    const media = stubMediaPlayback(document.getElementById("a1") as HTMLAudioElement, 10);
+    initSandboxRuntimeModular();
+    quiesce();
+
+    window.__player!.play();
+    settle();
+    expect(media.isPaused()).toBe(false);
+
+    setVisibility("hidden");
+    for (let i = 0; i < 100; i += 1) {
+      nowMs += 16;
+      vi.advanceTimersByTime(16);
+    }
+
+    expect(window.__player!.getTime()).toBeGreaterThan(1);
+    expect(media.isPaused()).toBe(true);
+  });
+
+  it("moves a pending tick between animation frames and a timer as visibility changes", () => {
+    mount();
+    initSandboxRuntimeModular();
+    quiesce();
+    window.__player!.play();
+    expect(raf.pending()).toBe(1);
+
+    setVisibility("hidden");
+    expect(raf.pending()).toBe(0);
+    vi.advanceTimersByTime(16);
+    expect(raf.pending()).toBe(0);
+    expect(window.__player!.isPlaying()).toBe(true);
+
+    setVisibility("visible");
+    expect(raf.pending()).toBe(1);
   });
 });

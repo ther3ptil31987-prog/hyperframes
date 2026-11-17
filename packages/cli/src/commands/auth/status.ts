@@ -15,8 +15,10 @@ import { failCommand, setCommandExitCode } from "../../utils/commandResult.js";
  * place instead of each workflow improvising its own.
  */
 
-import { defineCommand } from "citty";
+import { defineCommand } from "../../utils/defineCommand.js";
 import {
+  ENV_CREDENTIAL_VAR,
+  credentialPath,
   AuthClient,
   isAuthError,
   loadUserInfo,
@@ -27,8 +29,10 @@ import {
   type StoredUserInfo,
   type UserInfo,
 } from "../../auth/index.js";
+import { refreshIfNeeded } from "../../cloud/auth.js";
 import { getSystemMeta } from "../../telemetry/system.js";
 import { c } from "../../ui/colors.js";
+import { MANAGE_LABEL, pageUrl, readPlan, type Plan } from "../../heygen/plan.js";
 import { resolveMusic, resolveVoice } from "../../audio/providers.js";
 import {
   buildUnconfiguredJson,
@@ -36,6 +40,18 @@ import {
   type OfflineEngineLine,
   type UnconfiguredContext,
 } from "./status-guidance.js";
+import { jsonFailure } from "../../utils/jsonError.js";
+import { NetworkFailure } from "../../utils/networkFailure.js";
+import { defaultClientId, resolveClientId } from "../../auth/config.js";
+
+type BillingProduct = "hyperframes" | "heygen" | "unknown";
+
+function billingProduct(credential: ResolvedCredential): BillingProduct {
+  if (credential.type === "api_key") return "heygen";
+  if (isFileSource(credential.source) && resolveClientId() === defaultClientId())
+    return "hyperframes";
+  return "unknown";
+}
 
 interface VerifiedStatus {
   credential: ResolvedCredential;
@@ -48,9 +64,12 @@ interface VerifiedStatus {
    */
   persistedUser: StoredUserInfo | null;
   apiError: string | null;
+  /** The HyperFrames plan and credits, when the server (or the mock) answers. */
+  plan?: Plan | null;
+  planUrl?: string;
 }
 
-/** True for credentials resolved from the shared file (not env). */
+/** True for credentials resolved from the HyperFrames store (not env). */
 function isFileSource(source: ResolvedCredential["source"]): boolean {
   return source === "file_json" || source === "file_legacy";
 }
@@ -79,9 +98,9 @@ export default defineCommand({
       return;
     }
 
-    const status = await verify(credential);
+    const status = await verifyRefreshed(credential);
     if (asJson) printJsonStatus(status);
-    else printHumanStatus(status);
+    else await printHumanStatus(status);
     setCommandExitCode(status.apiError ? 1 : 0);
   },
 });
@@ -93,7 +112,10 @@ export default defineCommand({
  */
 function detectUnconfiguredContext(): UnconfiguredContext {
   const sys = getSystemMeta();
-  return { interactive: !sys.is_ci && (sys.is_tty || sys.agent_runtime !== null) };
+  return {
+    interactive: !sys.is_ci && (sys.is_tty || sys.agent_runtime !== null),
+    agent: !sys.is_ci && sys.agent_runtime !== null,
+  };
 }
 
 /**
@@ -124,19 +146,41 @@ function handleUnconfigured(asJson: boolean): never {
     ? JSON.stringify(buildUnconfiguredJson(ctx, engines))
     : buildUnconfiguredLines(ctx, engines).join("\n");
   console.log(output);
-  failCommand();
+  // Exit 1 is the answer skills read; the cause keeps "not signed in" apart from a failure in cli_error.
+  failCommand(1, new AuthStatusUnavailable("not_signed_in"));
+}
+
+class AuthStatusUnavailable extends Error {
+  constructor(code: string) {
+    super(code);
+    this.name = "AuthStatusUnavailable";
+  }
 }
 
 // fallow-ignore-next-line complexity
 function handleResolveError(err: unknown, asJson: boolean): never {
   if (!isAuthError(err)) throw err;
   if (asJson) {
-    console.log(JSON.stringify({ configured: false, error: err.message, hint: err.hint ?? null }));
+    console.log(
+      JSON.stringify({ configured: false, ...jsonFailure("auth_error", err.message, err.hint) }),
+    );
   } else {
     console.error(c.error(err.message));
     if (err.hint) console.error(c.dim(err.hint));
   }
-  failCommand();
+  failCommand(1, new AuthStatusUnavailable(err.code));
+}
+
+/** An offline refresh says so at once rather than waiting out a second request with the stale token. */
+async function verifyRefreshed(credential: ResolvedCredential): Promise<VerifiedStatus> {
+  let current = credential;
+  try {
+    current = await refreshIfNeeded(credential);
+  } catch (error) {
+    if (error instanceof NetworkFailure)
+      return unreachable(credential, error, await loadPersistedUser(credential));
+  }
+  return await verify(current);
 }
 
 async function verify(credential: ResolvedCredential): Promise<VerifiedStatus> {
@@ -149,8 +193,9 @@ async function verify(credential: ResolvedCredential): Promise<VerifiedStatus> {
   const persistedUser = await loadPersistedUser(credential);
   try {
     const user = await client.getCurrentUser(credential);
-    return { credential, user, persistedUser, apiError: null };
+    return { credential, user, persistedUser, apiError: null, plan: await readPlan() };
   } catch (err) {
+    if (err instanceof NetworkFailure) return unreachable(credential, err, persistedUser);
     if (!isAuthError(err)) throw err;
     return {
       credential,
@@ -159,6 +204,14 @@ async function verify(credential: ResolvedCredential): Promise<VerifiedStatus> {
       apiError: err instanceof Error ? err.message : String(err),
     };
   }
+}
+
+function unreachable(
+  credential: ResolvedCredential,
+  failure: NetworkFailure,
+  persistedUser: StoredUserInfo | null,
+): VerifiedStatus {
+  return { credential, user: null, persistedUser, apiError: `${failure.message} ${failure.hint}` };
 }
 
 /**
@@ -178,18 +231,31 @@ async function loadPersistedUser(credential: ResolvedCredential): Promise<Stored
 }
 
 function printJsonStatus(s: VerifiedStatus): void {
+  const product = billingProduct(s.credential);
   const payload: Record<string, unknown> = {
     configured: true,
     source: s.credential.source,
     type: s.credential.type,
+    billing_product: product,
     user: s.user,
     // The friendly-display block persisted at login (file-sourced creds
     // only). Strictly additive — the live `user` field above is
     // unchanged. Lets callers read identity offline / on an API blip.
     persisted_user: persistedUserJson(s.persistedUser),
     api_error: s.apiError,
+    hyperframes: s.plan ?? null,
   };
   if (s.credential.type === "oauth") {
+    payload["hyperframes_balance"] = null;
+    if (product !== "hyperframes")
+      payload["billing_notice"] =
+        "OAuth billing product is not verified here; user billing fields describe the HeyGen account.";
+    else if (!s.plan)
+      payload["billing_notice"] =
+        "HyperFrames balance is unavailable here; user billing fields describe the HeyGen account.";
+    else
+      payload["billing_notice"] =
+        "`hyperframes` is the HyperFrames plan and credits. user.subscription is the HeyGen app's plan and does not unlock HyperFrames features.";
     payload["expires_at"] = s.credential.expires_at?.toISOString() ?? null;
     payload["refreshable"] = s.credential.refreshable;
     payload["scope"] = s.credential.scope ?? null;
@@ -215,8 +281,11 @@ function persistedUserJson(u: StoredUserInfo | null): Record<string, unknown> | 
   };
 }
 
-function printHumanStatus(s: VerifiedStatus): void {
-  const rows = collectStatusRows(s);
+async function printHumanStatus(s: VerifiedStatus): Promise<void> {
+  const rows = collectStatusRows({
+    ...s,
+    ...(s.plan ? { planUrl: await pageUrl(s.plan.plan === "none" ? "plans" : "manage") } : {}),
+  });
   for (const [label, value] of rows) console.log(`${c.bold(label)} ${value}`);
 }
 
@@ -235,7 +304,18 @@ function collectStatusRows(s: VerifiedStatus): [string, string][] {
     if (cached) rows.push(["Account:", `${cached} ${c.dim("(cached)")}`]);
     return rows;
   }
-  if (s.user) rows.push(...identityRows(s.user));
+  if (s.user) rows.push(...identityRows(s.user, billingProduct(s.credential), !!s.plan));
+  const plan = s.plan;
+  if (plan) {
+    const tag = plan.mock ? ` ${c.dim("(mock)")}` : "";
+    rows.push([
+      "HyperFrames:",
+      plan.plan === "none"
+        ? `Free · Upgrade to Pro: ${s.planUrl}${tag}`
+        : `${plan.plan} plan, ${plan.credits.toLocaleString("en-US")} credits${tag}`,
+    ]);
+    if (plan.plan !== "none" && s.planUrl) rows.push([MANAGE_LABEL, s.planUrl]);
+  }
   return rows;
 }
 
@@ -252,19 +332,42 @@ function oauthRows(credential: Extract<ResolvedCredential, { type: "oauth" }>): 
   return rows;
 }
 
-function identityRows(user: UserInfo): [string, string][] {
+/** `hasPlan`: the HyperFrames line below shows the plan and credits, so no "unavailable" balance above it. */
+function identityRows(
+  user: UserInfo,
+  product: BillingProduct,
+  hasPlan = false,
+): [string, string][] {
   const identity = user.email ?? user.username ?? "(unknown user)";
-  return [["Account:", identity], ...billingRows(user)];
+  const rows: [string, string][] = [["Account:", identity]];
+  if (product === "hyperframes")
+    return [
+      ...rows,
+      ["Billing:", "HyperFrames"],
+      ...(hasPlan
+        ? []
+        : [["Balance:", "HyperFrames balance unavailable here."] as [string, string]]),
+    ];
+  if (product === "unknown")
+    return [
+      ...rows,
+      [
+        "Billing:",
+        "OAuth product not verified; HeyGen account balances are not the active-payer balance.",
+      ],
+    ];
+  return [...rows, ...billingRows(user)];
 }
 
-const SOURCE_LABELS: Record<ResolvedCredential["source"], string> = {
-  env: "env (HEYGEN_API_KEY)",
-  env_alias: "env (HYPERFRAMES_API_KEY)",
-  file_legacy: "file (~/.heygen/credentials — legacy plaintext)",
-  file_json: "file (~/.heygen/credentials)",
+const SOURCE_LABELS = {
+  env: `env (${ENV_CREDENTIAL_VAR.env})`,
+  env_alias: `env (${ENV_CREDENTIAL_VAR.env_alias})`,
+  env_oauth: `env (${ENV_CREDENTIAL_VAR.env_oauth})`,
 };
 
 function describeSource(source: ResolvedCredential["source"]): string {
+  if (source === "file_legacy") return `file (${credentialPath()} — legacy plaintext)`;
+  if (source === "file_json") return `file (${credentialPath()})`;
   return SOURCE_LABELS[source];
 }
 

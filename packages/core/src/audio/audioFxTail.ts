@@ -9,7 +9,13 @@
  */
 
 import { fxAutomationTarget, type HfAutomation } from "../audioAutomation.js";
-import { normalizeAudioFxParams, type HfAudioFxChain, type HfAudioFxNode } from "../audioFx.js";
+import {
+  enabledAudioFxNodes,
+  normalizeAudioFxParams,
+  type HfAudioFxChain,
+  type HfAudioFxNode,
+} from "../audioFx.js";
+import { truePeakLatencySamples } from "./audioFxTruePeak.js";
 
 /**
  * Ceiling on the extension, in seconds.
@@ -50,7 +56,7 @@ function knobMax(node: HfAudioFxNode, key: string, automation?: HfAutomation): n
  * Repeats until a feedback loop falls under the floor, times the gap between
  * them. `feedback` is capped below 1 by the registry, so this terminates.
  */
-function delayTail(time: number, feedback: number): number {
+export function delayTailSeconds(time: number, feedback: number): number {
   const gap = Math.min(5, time / 1000);
   if (gap <= 0) return 0;
   const fb = Math.max(0, Math.min(0.999, feedback));
@@ -60,15 +66,19 @@ function delayTail(time: number, feedback: number): number {
 
 // Exactly the generated impulse's length — see synthesizeReverbImpulse, which
 // is the same expression. A convolution is as long as its impulse.
+export function reverbRoomSeconds(size: number): number {
+  return 0.6 + Math.max(0, Math.min(1, size)) * 2.6;
+}
+
 function reverbTail(node: HfAudioFxNode, automation?: HfAutomation): number {
   return knobMax(node, "wet", automation) > 0
-    ? 0.6 + Math.max(0, Math.min(1, knobMax(node, "size", automation))) * 2.6
+    ? reverbRoomSeconds(knobMax(node, "size", automation))
     : 0;
 }
 
 function delayNodeTail(node: HfAudioFxNode, automation?: HfAutomation): number {
   return knobMax(node, "mix", automation) > 0
-    ? delayTail(knobMax(node, "time", automation), knobMax(node, "feedback", automation))
+    ? delayTailSeconds(knobMax(node, "time", automation), knobMax(node, "feedback", automation))
     : 0;
 }
 
@@ -112,4 +122,14 @@ function nodeTail(node: HfAudioFxNode, automation?: HfAutomation): number {
 export function chainTailSeconds(chain: HfAudioFxChain, automation?: HfAutomation): number {
   const total = chain.nodes.reduce((sum, node) => sum + nodeTail(node, automation), 0);
   return Math.min(MAX_FX_TAIL_SECONDS, total);
+}
+
+/** Samples the offline render trims so a lookahead limiter does not shift a clip. */
+export function chainLatencySamples(chain: HfAudioFxChain, sampleRate: number): number {
+  return enabledAudioFxNodes(chain)
+    .filter((node) => node.type === "truepeak")
+    .reduce((sum, node) => {
+      const { lookahead } = normalizeAudioFxParams(node.type, node.params);
+      return sum + truePeakLatencySamples(Number(lookahead), sampleRate);
+    }, 0);
 }

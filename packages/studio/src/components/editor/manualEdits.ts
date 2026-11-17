@@ -10,7 +10,7 @@ export {
 } from "./manualEditsTypes";
 
 export {
-  mergeFileChangeAffectedCompositions,
+  mergeFileChangePayloads,
   readFileChangeAffectedCompositions,
   readFileChangeAffectsPreview,
   readFileChangeField,
@@ -41,6 +41,7 @@ export {
   restoreStudioBoxSize,
   restoreStudioRotation,
   restoreStudioPathOffset,
+  restoreStudioPathOffsetStyles,
   clearStudioPathOffset,
   clearStudioRotation,
   clearStudioBoxSize,

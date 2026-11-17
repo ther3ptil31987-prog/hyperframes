@@ -131,14 +131,14 @@ export function useTimelineProviderState({
   const timelineSessionEpoch = usePlayerStore((s) => s.timelineSessionEpoch);
   const sessionEpoch = sessionEpochProp ?? timelineSessionEpoch;
   const setFocusedEaseSegment = usePlayerStore((s) => s.setFocusedEaseSegment);
-  const { zoomMode, manualZoomPercent, setZoomMode, setManualZoomPercent } = useTimelineZoom();
+  const { zoomMode, manualZoomPercent } = useTimelineZoom();
   const playheadRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const activeTool = usePlayerStore((s) => s.activeTool);
   const [hoveredClip, setHoveredClip] = useState<string | null>(null);
   const isDragging = useRef(false);
-  const shiftHeld = useTimelineShiftModifier();
+  useTimelineShiftModifier(containerRef);
   const [showPopover, setShowPopover] = useState(false);
   const [kfContextMenu, setKfContextMenu] = useState<KeyframeDiamondContextMenuState | null>(null);
   const [clipContextMenu, setClipContextMenu] = useState<ClipContextMenuState | null>(null);
@@ -258,22 +258,21 @@ export function useTimelineProviderState({
       timelineElements.length,
       displayLayout.totalH,
     ]);
-  const { pps, fitPps, displayContentWidth, displayDuration, zoomModeRef, manualZoomPercentRef } =
-    useTimelineGeometry({
-      viewportWidth: viewport.clientWidth,
-      effectiveDuration,
-      zoomMode,
-      manualZoomPercent,
-      ppsRef,
-      fitPpsRef,
-      draggedClip,
-      resizingClip,
-      expandedElements: timelineElements,
-      isDragging,
-      scrollRef,
-      lastScrollLeftRef,
-      contentOrigin,
-    });
+  const { pps, fitPps, displayContentWidth, displayDuration, zoomModeRef } = useTimelineGeometry({
+    viewportWidth: viewport.clientWidth,
+    effectiveDuration,
+    zoomMode,
+    manualZoomPercent,
+    ppsRef,
+    fitPpsRef,
+    draggedClip,
+    resizingClip,
+    expandedElements: timelineElements,
+    isDragging,
+    scrollRef,
+    lastScrollLeftRef,
+    contentOrigin,
+  });
   const timelineFocus = useTimelineLogicalFocus({
     scrollRef,
     tracks,
@@ -337,22 +336,19 @@ export function useTimelineProviderState({
   const { seekFromX, autoScrollDuringDrag, dragScrollRaf } = useTimelinePlayhead({
     playheadRef,
     scrollRef,
+    syncScrollViewport,
     ppsRef,
     durationRef,
     isDragging,
     currentTime,
     zoomMode,
-    manualZoomPercent,
     zoomModeRef,
-    manualZoomPercentRef,
     fitPps,
     fitPpsRef,
     effectiveDuration,
     pps,
     timelineReady,
     elementsLength: timelineElements.length,
-    setZoomMode,
-    setManualZoomPercent,
     onSeek,
     contentOrigin,
   });
@@ -448,7 +444,7 @@ export function useTimelineProviderState({
     dragActive: draggedClip?.started === true || resizingClip != null,
     displayDuration,
   });
-  const { major, minor, majorTickInterval } = useTimelineTicks(
+  const { major, minor, majorTickInterval, frameRate } = useTimelineTicks(
     displayDuration,
     pps,
     timeDisplayMode,
@@ -464,6 +460,7 @@ export function useTimelineProviderState({
     totalH: displayLayout.totalH,
     effectiveDuration,
     majorTickInterval,
+    tickFrameRate: frameRate,
     rangeSelection,
     marqueeRect,
     laneGapStrips,
@@ -567,7 +564,6 @@ export function useTimelineProviderState({
     focusProps: timelineFocus.timelineFocusProps,
     elementCount: timelineElements.length,
     activeTool,
-    shiftHeld,
     labelMode,
     contentOrigin,
     zoomMode,

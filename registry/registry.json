@@ -4,6 +4,42 @@
   "homepage": "https://hyperframes.heygen.com",
   "items": [
     {
+      "name": "decision-tree",
+      "type": "hyperframes:example"
+    },
+    {
+      "name": "kinetic-type",
+      "type": "hyperframes:example"
+    },
+    {
+      "name": "nyt-graph",
+      "type": "hyperframes:example"
+    },
+    {
+      "name": "play-mode",
+      "type": "hyperframes:example"
+    },
+    {
+      "name": "product-promo",
+      "type": "hyperframes:example"
+    },
+    {
+      "name": "swiss-grid",
+      "type": "hyperframes:example"
+    },
+    {
+      "name": "vignelli",
+      "type": "hyperframes:example"
+    },
+    {
+      "name": "warm-grain",
+      "type": "hyperframes:example"
+    },
+    {
+      "name": "ai-answer-rank",
+      "type": "hyperframes:block"
+    },
+    {
       "name": "ai-chat-reveal",
       "type": "hyperframes:block"
     },
@@ -16,11 +52,19 @@
       "type": "hyperframes:block"
     },
     {
+      "name": "aurora",
+      "type": "hyperframes:block"
+    },
+    {
       "name": "bar-chart-race",
       "type": "hyperframes:block"
     },
     {
       "name": "beat-freeze-cut",
+      "type": "hyperframes:block"
+    },
+    {
+      "name": "blob",
       "type": "hyperframes:block"
     },
     {
@@ -148,6 +192,14 @@
       "type": "hyperframes:block"
     },
     {
+      "name": "chrome-orb",
+      "type": "hyperframes:block"
+    },
+    {
+      "name": "cinemagraph",
+      "type": "hyperframes:block"
+    },
+    {
       "name": "cinematic-zoom",
       "type": "hyperframes:block"
     },
@@ -204,6 +256,10 @@
       "type": "hyperframes:block"
     },
     {
+      "name": "color-wheel",
+      "type": "hyperframes:block"
+    },
+    {
       "name": "cosmic-orb",
       "type": "hyperframes:block"
     },
@@ -228,6 +284,18 @@
       "type": "hyperframes:block"
     },
     {
+      "name": "exploded-stack",
+      "type": "hyperframes:block"
+    },
+    {
+      "name": "extruded-logo",
+      "type": "hyperframes:block"
+    },
+    {
+      "name": "falling-lines",
+      "type": "hyperframes:block"
+    },
+    {
       "name": "flash-through-white",
       "type": "hyperframes:block"
     },
@@ -240,7 +308,19 @@
       "type": "hyperframes:block"
     },
     {
+      "name": "flowing-gradient",
+      "type": "hyperframes:block"
+    },
+    {
+      "name": "fractal-noise",
+      "type": "hyperframes:block"
+    },
+    {
       "name": "freeze-frame-dressing",
+      "type": "hyperframes:block"
+    },
+    {
+      "name": "frost",
       "type": "hyperframes:block"
     },
     {
@@ -248,7 +328,15 @@
       "type": "hyperframes:block"
     },
     {
+      "name": "gabor-noise",
+      "type": "hyperframes:block"
+    },
+    {
       "name": "gallery-tunnel",
+      "type": "hyperframes:block"
+    },
+    {
+      "name": "glass-hero",
       "type": "hyperframes:block"
     },
     {
@@ -260,6 +348,18 @@
       "type": "hyperframes:block"
     },
     {
+      "name": "godrays",
+      "type": "hyperframes:block"
+    },
+    {
+      "name": "goo",
+      "type": "hyperframes:block"
+    },
+    {
+      "name": "gooey-split",
+      "type": "hyperframes:block"
+    },
+    {
       "name": "gravitational-lens",
       "type": "hyperframes:block"
     },
@@ -268,7 +368,19 @@
       "type": "hyperframes:block"
     },
     {
+      "name": "heatmap",
+      "type": "hyperframes:block"
+    },
+    {
       "name": "heygen-avatar-promo-card",
+      "type": "hyperframes:block"
+    },
+    {
+      "name": "hologram",
+      "type": "hyperframes:block"
+    },
+    {
+      "name": "holographic",
       "type": "hyperframes:block"
     },
     {
@@ -308,6 +420,14 @@
       "type": "hyperframes:block"
     },
     {
+      "name": "lens-flare",
+      "type": "hyperframes:block"
+    },
+    {
+      "name": "light-edge",
+      "type": "hyperframes:block"
+    },
+    {
       "name": "light-leak",
       "type": "hyperframes:block"
     },
@@ -317,6 +437,10 @@
     },
     {
       "name": "liquid-glass-widgets",
+      "type": "hyperframes:block"
+    },
+    {
+      "name": "liquid-metal",
       "type": "hyperframes:block"
     },
     {
@@ -384,6 +508,14 @@
       "type": "hyperframes:block"
     },
     {
+      "name": "marble",
+      "type": "hyperframes:block"
+    },
+    {
+      "name": "mesh-gradient",
+      "type": "hyperframes:block"
+    },
+    {
       "name": "message-thread-reveal",
       "type": "hyperframes:block"
     },
@@ -416,6 +548,10 @@
       "type": "hyperframes:block"
     },
     {
+      "name": "nebula",
+      "type": "hyperframes:block"
+    },
+    {
       "name": "news-ticker",
       "type": "hyperframes:block"
     },
@@ -436,6 +572,10 @@
       "type": "hyperframes:block"
     },
     {
+      "name": "obsidian",
+      "type": "hyperframes:block"
+    },
+    {
       "name": "orbit-card",
       "type": "hyperframes:block"
     },
@@ -445,6 +585,22 @@
     },
     {
       "name": "oscilloscope-trace",
+      "type": "hyperframes:block"
+    },
+    {
+      "name": "plasma",
+      "type": "hyperframes:block"
+    },
+    {
+      "name": "plastic",
+      "type": "hyperframes:block"
+    },
+    {
+      "name": "prism",
+      "type": "hyperframes:block"
+    },
+    {
+      "name": "product-turntable",
       "type": "hyperframes:block"
     },
     {
@@ -464,6 +620,10 @@
       "type": "hyperframes:block"
     },
     {
+      "name": "ripples",
+      "type": "hyperframes:block"
+    },
+    {
       "name": "sdf-iris",
       "type": "hyperframes:block"
     },
@@ -472,11 +632,23 @@
       "type": "hyperframes:block"
     },
     {
+      "name": "sine-wave",
+      "type": "hyperframes:block"
+    },
+    {
       "name": "slack-notification-ad",
       "type": "hyperframes:block"
     },
     {
+      "name": "snow",
+      "type": "hyperframes:block"
+    },
+    {
       "name": "spain-map",
+      "type": "hyperframes:block"
+    },
+    {
+      "name": "spiral",
       "type": "hyperframes:block"
     },
     {
@@ -492,11 +664,35 @@
       "type": "hyperframes:block"
     },
     {
+      "name": "starfield",
+      "type": "hyperframes:block"
+    },
+    {
+      "name": "strands",
+      "type": "hyperframes:block"
+    },
+    {
+      "name": "stripes",
+      "type": "hyperframes:block"
+    },
+    {
+      "name": "sun-burst",
+      "type": "hyperframes:block"
+    },
+    {
+      "name": "swirl",
+      "type": "hyperframes:block"
+    },
+    {
       "name": "swirl-vortex",
       "type": "hyperframes:block"
     },
     {
       "name": "thermal-distortion",
+      "type": "hyperframes:block"
+    },
+    {
+      "name": "thin-film",
       "type": "hyperframes:block"
     },
     {
@@ -612,7 +808,23 @@
       "type": "hyperframes:block"
     },
     {
+      "name": "voronoi",
+      "type": "hyperframes:block"
+    },
+    {
       "name": "vpn-youtube-spot",
+      "type": "hyperframes:block"
+    },
+    {
+      "name": "water",
+      "type": "hyperframes:block"
+    },
+    {
+      "name": "waveform",
+      "type": "hyperframes:block"
+    },
+    {
+      "name": "week-in-merges",
       "type": "hyperframes:block"
     },
     {
@@ -629,6 +841,10 @@
     },
     {
       "name": "world-map",
+      "type": "hyperframes:block"
+    },
+    {
+      "name": "worley-noise",
       "type": "hyperframes:block"
     },
     {
@@ -658,6 +874,10 @@
     {
       "name": "yt-vertical-fill",
       "type": "hyperframes:block"
+    },
+    {
+      "name": "agent-cursor",
+      "type": "hyperframes:component"
     },
     {
       "name": "animated-bar-chart",
@@ -808,6 +1028,10 @@
       "type": "hyperframes:component"
     },
     {
+      "name": "caret-swap",
+      "type": "hyperframes:component"
+    },
+    {
       "name": "char-slam-explode",
       "type": "hyperframes:component"
     },
@@ -864,11 +1088,43 @@
       "type": "hyperframes:component"
     },
     {
+      "name": "cursor-annotate",
+      "type": "hyperframes:component"
+    },
+    {
+      "name": "cursor-context-menu",
+      "type": "hyperframes:component"
+    },
+    {
+      "name": "cursor-drag-drop",
+      "type": "hyperframes:component"
+    },
+    {
       "name": "cursor-glyph-trail",
       "type": "hyperframes:component"
     },
     {
+      "name": "cursor-marquee-select",
+      "type": "hyperframes:component"
+    },
+    {
+      "name": "cursor-text-select",
+      "type": "hyperframes:component"
+    },
+    {
+      "name": "cursor-zoom-follow",
+      "type": "hyperframes:component"
+    },
+    {
+      "name": "curtain-reveal",
+      "type": "hyperframes:component"
+    },
+    {
       "name": "cut-the-curve",
+      "type": "hyperframes:component"
+    },
+    {
+      "name": "dart-cursor",
       "type": "hyperframes:component"
     },
     {
@@ -892,6 +1148,10 @@
       "type": "hyperframes:component"
     },
     {
+      "name": "echo-smear",
+      "type": "hyperframes:component"
+    },
+    {
       "name": "echo-trail",
       "type": "hyperframes:component"
     },
@@ -905,6 +1165,10 @@
     },
     {
       "name": "fade-through",
+      "type": "hyperframes:component"
+    },
+    {
+      "name": "filmed-screen",
       "type": "hyperframes:component"
     },
     {
@@ -1040,6 +1304,10 @@
       "type": "hyperframes:component"
     },
     {
+      "name": "magnetic-cursor",
+      "type": "hyperframes:component"
+    },
+    {
       "name": "marker-checklist-card",
       "type": "hyperframes:component"
     },
@@ -1160,6 +1428,10 @@
       "type": "hyperframes:component"
     },
     {
+      "name": "paper-collage-reveal",
+      "type": "hyperframes:component"
+    },
+    {
       "name": "parallax-device-dive",
       "type": "hyperframes:component"
     },
@@ -1177,6 +1449,10 @@
     },
     {
       "name": "particle-text-dissolve",
+      "type": "hyperframes:component"
+    },
+    {
+      "name": "pendulum-swing",
       "type": "hyperframes:component"
     },
     {
@@ -1452,6 +1728,10 @@
       "type": "hyperframes:component"
     },
     {
+      "name": "torn-paper-rip",
+      "type": "hyperframes:component"
+    },
+    {
       "name": "touch-indicator",
       "type": "hyperframes:component"
     },
@@ -1546,41 +1826,9 @@
     {
       "name": "zoom-through-transition",
       "type": "hyperframes:component"
-    },
-    {
-      "name": "decision-tree",
-      "type": "hyperframes:example"
-    },
-    {
-      "name": "kinetic-type",
-      "type": "hyperframes:example"
-    },
-    {
-      "name": "nyt-graph",
-      "type": "hyperframes:example"
-    },
-    {
-      "name": "play-mode",
-      "type": "hyperframes:example"
-    },
-    {
-      "name": "product-promo",
-      "type": "hyperframes:example"
-    },
-    {
-      "name": "swiss-grid",
-      "type": "hyperframes:example"
-    },
-    {
-      "name": "vignelli",
-      "type": "hyperframes:example"
-    },
-    {
-      "name": "warm-grain",
-      "type": "hyperframes:example"
     }
   ],
   "catalogArtifact": {
-    "revision": "973eda0eef98aed0e928080d20a64acacd8054e83611df7ed8b30ea96b25bf5b"
+    "revision": "c7135c14ef25e7d5f1be39c15ffcf730e4bd7a4488ac01d59b9ecda894b09dcb"
   }
 }

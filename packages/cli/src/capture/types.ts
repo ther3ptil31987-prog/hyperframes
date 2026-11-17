@@ -20,6 +20,8 @@ export type CapturePhase =
   | "scaffold"
   | "complete";
 
+export const DEFAULT_MAX_SCREENSHOTS = 21;
+
 export const CAPTURE_PHASE_SCHEMA = "hyperframes.capture.phase.v1" as const;
 
 export interface CapturePhaseProgress {
@@ -40,8 +42,10 @@ export interface CapturePhaseProgress {
 }
 
 export interface CaptureOptions {
-  /** URL to capture */
+  /** Public http(s) URL to capture. With `localFile`, the result reports the file's `file://` URL instead. */
   url: string;
+  localFile?: string;
+  localRoot?: string;
   /** Output directory */
   outputDir: string;
   /** Viewport width (default: 1920) */
@@ -52,7 +56,7 @@ export interface CaptureOptions {
   timeout?: number;
   /** Extra wait after load for JS to settle (default: 3000) */
   settleTime?: number;
-  /** Maximum screenshots to take (default: 24) */
+  /** Maximum screenshot files including the full-page plate (default: 21) */
   maxScreenshots?: number;
   /** Skip asset downloads */
   skipAssets?: boolean;

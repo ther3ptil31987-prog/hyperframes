@@ -17,10 +17,15 @@ import { AudibleVideoClipContent } from "../player/components/AudibleVideoClipCo
 import { ClipPeakMarks } from "../player/components/ClipPeakMarks";
 import { clipPeaksUrl, clipSourceWindow } from "../player/components/clipPeakMap";
 import { clipHasSound } from "../player/components/clipMenuNormalize";
-import { encodePreviewPath, resolveMediaPreviewUrl } from "../player/components/thumbnailUtils";
+import {
+  authoredSrcPath,
+  encodePreviewPath,
+  resolveMediaPreviewUrl,
+} from "../player/components/thumbnailUtils";
 import { usePlayerStore } from "../player/store/playerStore";
 import { thumbnailRevisionOf } from "../player/store/thumbnailSlice";
 import { effectiveThumbnailMode } from "../player/lib/thumbnailPolicy";
+import { fitsBeatAnalysis } from "../utils/timelineInspector";
 
 export function normalizeCompositionSrc(
   compSrc: string,
@@ -64,10 +69,13 @@ function renderAudioClip(
   sessionEpoch: number,
   labelColor: string,
   context: TimelineClipRenderContext,
-  elements: readonly TimelineElement[],
   labelInset?: number,
 ): ReactNode {
-  const audioUrl = resolveMediaPreviewUrl(el.src ?? "", pid, window.location.origin);
+  const audioUrl = resolveMediaPreviewUrl(
+    authoredSrcPath(el.src ?? ""),
+    pid,
+    window.location.origin,
+  );
   const srcRelative = resolvePreviewRelative(audioUrl, pid, window.location.origin);
   // Encode each path segment (spaces, parens, U+202F, unicode) so the URL matches
   // what the assets panel loads — a raw segment 404s. resolvePreviewRelative
@@ -77,8 +85,9 @@ function renderAudioClip(
     ? buildProjectApiPath(pid, `/waveform/${encodedRelative}`)
     : undefined;
   const { start, end } = trimFractions(el);
+  const serverPeaksOrShortFile = waveformUrl !== undefined || fitsBeatAnalysis(el);
   const waveform = createElement(AudioWaveform, {
-    audioUrl,
+    audioUrl: serverPeaksOrShortFile ? audioUrl : "",
     waveformUrl,
     label: "",
     labelColor,
@@ -88,7 +97,7 @@ function renderAudioClip(
     sessionEpoch,
     priority: context.priority,
     labelInset,
-    ...audioPillFlags(el, elements),
+    ...audioPillFlags(el),
   });
   return createElement(
     ClipPeakMarks,
@@ -128,7 +137,6 @@ export function useRenderClipContent({
   const effectiveMode = effectiveThumbnailMode(thumbnailMode);
   const sessionEpoch = usePlayerStore((s) => s.timelineSessionEpoch);
   const thumbnailRevisions = usePlayerStore((s) => s.thumbnailRevisions);
-  const elements = usePlayerStore((s) => s.elements);
   return useCallback(
     // Pre-existing clip-content dispatcher; reduced by extracting renderAudioClip.
     // fallow-ignore-next-line complexity
@@ -143,7 +151,7 @@ export function useRenderClipContent({
       // Thumbnail generation disabled (perf) -> plain clip bars. Audio still shows
       // its waveform (cheap, not a frame thumbnail). Toggle: timeline toolbar.
       const waveform = (labelInset?: number) =>
-        renderAudioClip(el, pid, sessionEpoch, style.label, context, elements, labelInset);
+        renderAudioClip(el, pid, sessionEpoch, style.label, context, labelInset);
       if (effectiveMode === "hidden") {
         return rendersWaveform(el) ? waveform() : withSoundStrip(el, null, waveform);
       }
@@ -182,7 +190,7 @@ export function useRenderClipContent({
       // activePreviewUrl thumbnail branch; audio rows need waveform data, not a
       // captured frame from the currently drilled composition preview.
       if (rendersWaveform(el)) {
-        return renderAudioClip(el, pid, sessionEpoch, style.label, context, elements);
+        return renderAudioClip(el, pid, sessionEpoch, style.label, context);
       }
 
       if (el.text) return createElement(TextClipContent, { text: el.text });
@@ -213,7 +221,11 @@ export function useRenderClipContent({
       const htmlPreviewEligible = el.duration > 0 && effectiveTimelineDuration > 0;
 
       if ((el.tag === "video" || el.tag === "img") && el.src) {
-        const mediaSrc = resolveMediaPreviewUrl(el.src, pid, window.location.origin);
+        const mediaSrc = resolveMediaPreviewUrl(
+          authoredSrcPath(el.src),
+          pid,
+          window.location.origin,
+        );
         // Still images can't be decoded by VideoThumbnail's <video> extractor
         // (the error event fires and the shimmer never resolves) — render the
         // image itself as the strip.
@@ -270,7 +282,6 @@ export function useRenderClipContent({
       effectiveMode,
       sessionEpoch,
       thumbnailRevisions,
-      elements,
     ],
   );
 }

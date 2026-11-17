@@ -4,13 +4,20 @@ import React, { act, createRef } from "react";
 import { createRoot } from "react-dom/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { useTimelinePlayer } from "../../player/hooks/useTimelinePlayer";
-import { NLEPreview, getPreviewPlayerKey, resolvePreviewStageSize } from "./NLEPreview";
+import { NLEPreview, getPreviewPlayerKey } from "./NLEPreview";
+import { resolvePreviewStageSize } from "./previewStage";
 import { readPreviewComplexity } from "../../player/hooks/usePreviewFirstFrameTelemetry";
 
 globalThis.IS_REACT_ACT_ENVIRONMENT = true;
 
 const playerMounts: string[] = [];
 let livePlayerProps: { onReadyToShowChange?: (ready: boolean) => void } = {};
+
+const measured = vi.hoisted(() => ({ size: null as { width: number; height: number } | null }));
+vi.mock("../../utils/previewCompositionSize", async (original) => ({
+  ...(await original<typeof import("../../utils/previewCompositionSize")>()),
+  readPreviewCompositionSize: () => measured.size,
+}));
 
 vi.mock("../../player", async () => {
   const React = await import("react");
@@ -22,6 +29,7 @@ vi.mock("../../player", async () => {
         onReadyToShowChange?: (ready: boolean) => void;
         suppressLoadingOverlay?: boolean;
         style?: React.CSSProperties;
+        sandboxOrigin?: "opaque";
       },
       ref: React.ForwardedRef<HTMLIFrameElement>,
     ) {
@@ -34,6 +42,7 @@ vi.mock("../../player", async () => {
       return React.createElement("div", {
         ref: ref as React.ForwardedRef<HTMLDivElement>,
         "data-testid": "mock-player",
+        "data-sandbox-origin": props.sandboxOrigin,
         style: props.style,
       });
     }),
@@ -47,10 +56,9 @@ class MockResizeObserver {
   constructor(cb: ResizeObserverCallback) {
     this.cb = cb;
   }
+  // A browser calls back at its next frame, never inside observe(); renderPreview fires them.
   observe() {
-    const fire = () => this.cb([], this as unknown as ResizeObserver);
-    resizeCallbacks.push(fire);
-    fire();
+    resizeCallbacks.push(() => this.cb([], this as unknown as ResizeObserver));
   }
   disconnect() {}
 }
@@ -58,6 +66,8 @@ class MockResizeObserver {
 const originalResizeObserver = globalThis.ResizeObserver;
 
 function setRect(node: Element, rect: { width: number; height: number }) {
+  Object.defineProperty(node, "clientWidth", { configurable: true, value: rect.width });
+  Object.defineProperty(node, "clientHeight", { configurable: true, value: rect.height });
   Object.defineProperty(node, "getBoundingClientRect", {
     configurable: true,
     value: () => ({
@@ -81,7 +91,14 @@ function renderPreview(
   {
     box = { width: 800, height: 600 },
     fillBox,
-  }: { box?: { width: number; height: number }; fillBox?: boolean } = {},
+    compositionSizeHint,
+    sandboxOrigin,
+  }: {
+    box?: { width: number; height: number };
+    fillBox?: boolean;
+    compositionSizeHint?: { width: number; height: number };
+    sandboxOrigin?: "opaque";
+  } = {},
 ) {
   resizeCallbacks = [];
   const host = document.createElement("div");
@@ -103,6 +120,8 @@ function renderPreview(
           setShadowIframeNode: () => {},
           resetPreviewSlots: () => {},
           fillBox,
+          compositionSizeHint,
+          sandboxOrigin,
         }),
       );
     });
@@ -201,6 +220,15 @@ describe("NLEPreview", () => {
 
   afterEach(() => {
     globalThis.ResizeObserver = originalResizeObserver;
+  });
+
+  it("draws the canvas boundary on the preview stage", () => {
+    const view = renderPreview();
+
+    expect(view.stage.className).toContain(
+      "shadow-[0_0_0_1px_rgba(255,255,255,0.08),0_4px_32px_rgba(0,0,0,0.7)]",
+    );
+    view.cleanup();
   });
 
   it("pans the preview with middle mouse drag", () => {
@@ -332,6 +360,22 @@ describe("NLEPreview", () => {
       view.cleanup();
     });
 
+    it("tells the preview how large it shows once a zoom settles, which the player cannot see", () => {
+      const view = renderPreview();
+      const frame = view.host.querySelector<HTMLElement>('[data-testid="mock-player"]')!;
+      const postMessage = vi.fn();
+      Object.defineProperty(frame, "contentWindow", { value: { postMessage } });
+      Object.defineProperty(frame, "offsetWidth", { value: 800 });
+      frame.getBoundingClientRect = () => ({ width: 1600 }) as DOMRect;
+
+      pinchIn(view, 10);
+      expect(postMessage).toHaveBeenLastCalledWith(
+        expect.objectContaining({ action: "set-display-scale", scale: 2 }),
+        "*",
+      );
+      view.cleanup();
+    });
+
     it("says how far it is zoomed, shows where in the frame, and Fit puts it back", () => {
       const view = renderPreview();
       expect([chip(view), navigator(view)]).toEqual([null, null]);
@@ -349,6 +393,78 @@ describe("NLEPreview", () => {
       act(() => vi.advanceTimersByTime(300));
       expect(view.stage.style.transform).toContain("scale(1)");
       expect([chip(view), navigator(view)]).toEqual([null, null]);
+      view.cleanup();
+    });
+
+    /** Opens the zoom readout's input, types `text` into it and presses `key`. */
+    function typeZoom(view: ReturnType<typeof renderPreview>, text: string, key: string) {
+      act(() => {
+        view.host.querySelector<HTMLButtonElement>('[data-testid="preview-zoom-readout"]')!.click();
+      });
+      const input = view.host.querySelector<HTMLInputElement>(
+        '[data-testid="preview-zoom-input"]',
+      )!;
+      act(() => {
+        Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, "value")!.set!.call(
+          input,
+          text,
+        );
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+      });
+      act(() => {
+        input.dispatchEvent(new KeyboardEvent("keydown", { key, bubbles: true }));
+      });
+      act(() => vi.advanceTimersByTime(300));
+    }
+    const pixelGrid = (view: ReturnType<typeof renderPreview>) =>
+      view.host.querySelector<HTMLElement>('[data-testid="preview-pixel-grid"]');
+
+    it("applies a typed zoom on Enter, clamped to the zoom limit, and closes the input", () => {
+      const view = renderPreview();
+      pinchIn(view, 10);
+      typeZoom(view, "350%", "Enter");
+      expect(view.stage.style.transform).toContain("scale(3.5)");
+      expect(chip(view)?.textContent).toBe("Zoomed 350%·Fit");
+
+      typeZoom(view, "99999", "Enter");
+      expect(view.stage.style.transform).toContain("scale(16)");
+      expect(view.host.querySelector('[data-testid="preview-zoom-input"]')).toBeNull();
+      view.cleanup();
+    });
+
+    it("keeps the zoom when the typed value is cancelled with Esc or is not a number", () => {
+      const view = renderPreview();
+      pinchIn(view, 10);
+      const before = view.stage.style.transform;
+
+      typeZoom(view, "500", "Escape");
+      expect(view.stage.style.transform).toBe(before);
+      expect(view.host.querySelector('[data-testid="preview-zoom-input"]')).toBeNull();
+
+      typeZoom(view, "abc", "Enter");
+      expect(view.stage.style.transform).toBe(before);
+      view.cleanup();
+    });
+
+    it("draws a one-pixel grid above 800% over the stage, one cell per composition pixel", () => {
+      const view = renderPreview(undefined, { compositionSizeHint: { width: 1920, height: 1080 } });
+      pinchIn(view, 10);
+      typeZoom(view, "800", "Enter");
+      expect(pixelGrid(view)?.hidden).toBe(true);
+
+      typeZoom(view, "1000", "Enter");
+      const grid = pixelGrid(view)!;
+      expect(grid.hidden).toBe(false);
+      expect(view.stage.contains(grid)).toBe(false);
+      const stageWidth = parseFloat(view.stage.style.width);
+      expect(parseFloat(grid.style.width)).toBeCloseTo(stageWidth * 10, 2);
+      expect(parseFloat(grid.style.backgroundSize)).toBeCloseTo((stageWidth * 10) / 1920, 3);
+
+      act(() => {
+        view.host.querySelector<HTMLButtonElement>('[data-testid="preview-zoom-fit"]')!.click();
+      });
+      act(() => vi.advanceTimersByTime(300));
+      expect(pixelGrid(view)).toBeNull();
       view.cleanup();
     });
 
@@ -378,6 +494,68 @@ describe("NLEPreview", () => {
     filled.cleanup();
   });
 
+  it("sizes the stage within the resize callback, so the frame painted after a resize is never at the old size", () => {
+    const view = renderPreview(undefined, { box: { width: 640, height: 360 }, fillBox: true });
+    setRect(view.viewport, { width: 1920, height: 1080 });
+    // Outside act: the browser paints right after this callback returns.
+    for (const fire of resizeCallbacks) fire();
+    expect([view.stage.style.width, view.stage.style.height]).toEqual(["1920px", "1080px"]);
+    view.cleanup();
+  });
+
+  it("sizes the stage from the box's own size while a host scales the box on screen", () => {
+    const view = renderPreview(undefined, { box: { width: 640, height: 360 }, fillBox: true });
+    setRect(view.viewport, { width: 1920, height: 1080 });
+    // A host growing the preview from a quarter of its size: on screen the box is 480 x 270 for now.
+    Object.defineProperty(view.viewport, "getBoundingClientRect", {
+      configurable: true,
+      value: () => ({
+        x: 0,
+        y: 0,
+        left: 0,
+        top: 0,
+        right: 480,
+        bottom: 270,
+        width: 480,
+        height: 270,
+      }),
+    });
+    for (const fire of resizeCallbacks) fire();
+    expect([view.stage.style.width, view.stage.style.height]).toEqual(["1920px", "1080px"]);
+    view.cleanup();
+  });
+
+  it("takes the host's composition size as the stage's shape until the preview measures its own", () => {
+    const box = { width: 800, height: 600 };
+    const plain = renderPreview(undefined, { box });
+    expect([plain.stage.style.width, plain.stage.style.height]).toEqual(["784px", "441px"]);
+    plain.cleanup();
+
+    const hinted = renderPreview(undefined, {
+      box,
+      compositionSizeHint: { width: 1276, height: 1078 },
+    });
+    const shape = parseFloat(hinted.stage.style.width) / parseFloat(hinted.stage.style.height);
+    expect(shape).toBeCloseTo(1276 / 1078, 3);
+    expect(hinted.stage.style.height).toBe("584px");
+    hinted.cleanup();
+  });
+
+  it("lets the size the preview measures win over the host's hint", () => {
+    measured.size = { width: 1920, height: 1080 };
+    try {
+      const box = { width: 800, height: 600 };
+      const hinted = renderPreview(undefined, {
+        box,
+        compositionSizeHint: { width: 1276, height: 1078 },
+      });
+      expect([hinted.stage.style.width, hinted.stage.style.height]).toEqual(["784px", "441px"]);
+      hinted.cleanup();
+    } finally {
+      measured.size = null;
+    }
+  });
+
   it("clips a shadow reload so its own loading overlay cannot paint over the live frame", () => {
     const view = renderPreview([
       { gen: 0, role: "live" },
@@ -391,6 +569,50 @@ describe("NLEPreview", () => {
     expect(players[1].style.pointerEvents).toBe("none");
     view.cleanup();
   });
+
+  it.each([["opaque" as const], [undefined]])(
+    "gives every player it draws the host's sandbox origin (%s)",
+    (sandboxOrigin) => {
+      const view = renderPreview(
+        [
+          { gen: 0, role: "live" },
+          { gen: 1, role: "shadow", url: "/api/projects/p/preview?_t=1" },
+        ],
+        { sandboxOrigin },
+      );
+      view.render("/api/projects/p/preview/components/card.html", "p");
+      const players = [...view.stage.querySelectorAll('[data-testid="mock-player"]')];
+      expect(players).toHaveLength(3);
+      for (const player of players) {
+        expect(player.getAttribute("data-sandbox-origin")).toBe(sandboxOrigin ?? null);
+      }
+      view.cleanup();
+    },
+  );
+
+  // Chrome stops rendering a hidden or clipped cross-origin frame, and a sealed one is cross-origin.
+  it.each([
+    ["opaque" as const, ["opacity: 0"], ["visibility", "clip-path", "z-index"]],
+    [undefined, ["visibility: hidden", "clip-path: inset(100%)"], ["opacity"]],
+  ])(
+    "keeps a reload's preview out of sight, and a sealed one rendering (%s)",
+    (sandboxOrigin, present, absent) => {
+      const view = renderPreview(
+        [
+          { gen: 0, role: "live" },
+          { gen: 1, role: "shadow", url: "/api/projects/p/preview?_t=1" },
+        ],
+        { sandboxOrigin },
+      );
+      const shadow = [...view.stage.querySelectorAll('[data-testid="mock-player"]')]
+        .map((player) => player.getAttribute("style") ?? "")
+        .filter((style) => style.includes("pointer-events: none"));
+      expect(shadow).toHaveLength(1);
+      for (const rule of present) expect(shadow[0]).toContain(rule);
+      for (const rule of absent) expect(shadow[0]).not.toContain(rule);
+      view.cleanup();
+    },
+  );
 
   it("covers the live preview with the cached frame-0 poster until it is ready to show", () => {
     const view = renderPreview();

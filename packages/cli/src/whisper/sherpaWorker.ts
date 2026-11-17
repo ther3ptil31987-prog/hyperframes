@@ -1,3 +1,5 @@
+import "../utils/hideChildConsoles.js";
+import "../utils/windowsExeSearch.js";
 import { createRequire } from "node:module";
 import {
   droppedSpeechGaps,
@@ -5,8 +7,10 @@ import {
   spliceGap,
   SHERPA_ERROR_PREFIX,
   SHERPA_RESULT_PREFIX,
+  SHERPA_WINDOW_PREFIX,
   type SherpaWindow,
 } from "./parakeet.js";
+import { readWav } from "./wav.js";
 
 interface Wave {
   samples: Float32Array;
@@ -14,7 +18,6 @@ interface Wave {
 }
 
 interface SherpaOnnx {
-  readWave(path: string): Wave;
   OfflineRecognizer: new (config: object) => {
     createStream(): { acceptWaveform(wave: Wave): void };
     decode(stream: unknown): void;
@@ -48,7 +51,7 @@ function decodeWindow(
 try {
   const sherpa = createRequire(import.meta.url)(runtimePath) as SherpaOnnx;
   const recognizer = new sherpa.OfflineRecognizer(config);
-  const wave = sherpa.readWave(wavPath);
+  const wave = readWav(wavPath);
   const cuts = silenceCuts(wave.samples, wave.sampleRate);
   const windows: SherpaWindow[] = [];
   for (let k = 0; k + 1 < cuts.length; k++) {
@@ -77,7 +80,10 @@ try {
       const retry = decodeWindow(recognizer, slice, RETRY_PAD_SECONDS);
       if (retry.tokens.length > decoded.tokens.length) decoded = retry;
     }
-    windows.push({ offset: cuts[k]! / wave.sampleRate, ...decoded });
+    const window = { offset: cuts[k]! / wave.sampleRate, ...decoded };
+    windows.push(window);
+    const through = cuts[k + 1]! / wave.sampleRate;
+    process.stdout.write(`${SHERPA_WINDOW_PREFIX}${JSON.stringify({ window, through })}\n`);
   }
   process.stdout.write(`${SHERPA_RESULT_PREFIX}${JSON.stringify(windows)}\n`);
 } catch (err) {

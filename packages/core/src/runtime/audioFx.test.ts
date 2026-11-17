@@ -1,6 +1,6 @@
 // @vitest-environment happy-dom
 import { describe, expect, it } from "vitest";
-import { attachElementFxChain } from "./audioFx.js";
+import { attachElementFxChain, type FxAttributes } from "./audioFx.js";
 import { defaultAudioFxParams, HF_AUDIO_FX, HF_AUDIO_FX_ATTR } from "../audioFx.js";
 
 /**
@@ -435,7 +435,7 @@ describe("attachElementFxChain", () => {
       ],
     });
 
-    const build = () => {
+    const build = (attrs?: FxAttributes) => {
       const clock = { currentTime: 0 };
       const made: { frequency: TimedParam }[] = [];
       class TimedNode extends Node {
@@ -461,6 +461,7 @@ describe("attachElementFxChain", () => {
         new Node() as never,
         new Node() as never,
         { scheduledAt: 0, elapsed: 0, rate: 1 },
+        attrs,
       );
       return { clock, node, handle, param: () => made[0]?.frequency as unknown as TimedParam };
     };
@@ -493,6 +494,14 @@ describe("attachElementFxChain", () => {
       node.setAttribute("data-automation", lane);
       await new Promise((r) => setTimeout(r, 0));
       expect(param().last()).toEqual({ time: 4, duration: 1 });
+    });
+
+    it("books no lane for a chain told its element carries none (the master bus)", () => {
+      // The root's `data-automation` belongs to the composition, not to the bus.
+      const { param } = build({ automation: null });
+      expect(param().last()).toBeUndefined();
+      const { param: ownParam } = build();
+      expect(ownParam().last()).toEqual({ time: 0, duration: 8 });
     });
 
     it("ignores a rate that is not a rate", () => {
@@ -642,6 +651,38 @@ describe("attachElementFxChain", () => {
         const filter = worklets.biquads[0];
         expect(filter, "the carve's filter was never built").toBeTruthy();
         expect(filter!.gain.scheduled).toBe(true);
+      } finally {
+        (globalThis as { AudioWorkletNode?: unknown }).AudioWorkletNode = original;
+      }
+    });
+
+    it("clears a limiter's state for a new pass, not when the same pass is re-timed", async () => {
+      const messages: unknown[] = [];
+      class RecordingWorkletStub extends WorkletNodeStub {
+        override port = { postMessage: (...sent: unknown[]) => void messages.push(...sent) };
+      }
+      const original = (globalThis as { AudioWorkletNode?: unknown }).AudioWorkletNode;
+      (globalThis as { AudioWorkletNode?: unknown }).AudioWorkletNode = RecordingWorkletStub;
+      try {
+        const node = document.createElement("audio");
+        node.setAttribute(
+          "data-fx-chain",
+          JSON.stringify({ version: 1, nodes: [{ type: "truepeak", id: "n1", params: {} }] }),
+        );
+        document.body.append(node);
+        const timing = { scheduledAt: 0, elapsed: 0, rate: 1 };
+        const fx = attachElementFxChain(
+          new WorkletCtx() as unknown as BaseAudioContext,
+          node,
+          new Node() as never,
+          new Node() as never,
+          timing,
+        );
+        await settle();
+        fx?.retime({ scheduledAt: 1, elapsed: 0.9, rate: 1.03 });
+        expect(messages).not.toContainEqual({ __hfReset: true });
+        fx?.reanchor(timing);
+        expect(messages).toContainEqual({ __hfReset: true });
       } finally {
         (globalThis as { AudioWorkletNode?: unknown }).AudioWorkletNode = original;
       }

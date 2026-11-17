@@ -1,4 +1,4 @@
-import { defineCommand } from "citty";
+import { defineCommand } from "../utils/defineCommand.js";
 import {
   writeConfigWithResult,
   readConfigFresh,
@@ -7,7 +7,7 @@ import {
 } from "../telemetry/config.js";
 import { effectiveTelemetryStatus, type TelemetryStatusSource } from "../telemetry/policy.js";
 import { c } from "../ui/colors.js";
-import { failCommand } from "../utils/commandResult.js";
+import { CliUsageError, failCommand, failUsage } from "../utils/commandResult.js";
 import type { Example } from "./_examples.js";
 
 export const examples: Example[] = [
@@ -53,9 +53,24 @@ function setTelemetryEnabled(enabled: boolean): void {
   console.log();
 }
 
-function runStatus(): void {
+function runStatus(json: boolean): void {
   const config = readConfigFresh();
   const effective = effectiveTelemetryStatus(config.telemetryEnabled);
+  if (json) {
+    console.log(
+      JSON.stringify(
+        {
+          ...effective,
+          configPath: CONFIG_PATH,
+          statePath: STATE_PATH,
+          commandCount: config.commandCount,
+        },
+        null,
+        2,
+      ),
+    );
+    return;
+  }
   const status = effective.enabled ? c.success("enabled") : c.dim("disabled");
   console.log();
   console.log(`  ${c.dim("Status:")}     ${status}`);
@@ -74,8 +89,9 @@ function runStatus(): void {
 }
 
 export default defineCommand({
-  meta: { name: "telemetry", description: "Manage anonymous usage telemetry" },
+  meta: { name: "telemetry", description: "Manage usage telemetry" },
   args: {
+    json: { type: "boolean", description: "Output status as JSON", default: false },
     subcommand: {
       type: "positional",
       description: "Subcommand: enable, disable, status",
@@ -84,28 +100,32 @@ export default defineCommand({
   },
   async run({ args }) {
     const subcommand = args.subcommand;
+    if (args.json && subcommand !== "status") {
+      throw new CliUsageError("--json is only supported for telemetry status");
+    }
 
     if (!subcommand || subcommand === "") {
       console.log(`
 ${c.bold("hyperframes telemetry")} ${c.dim("<subcommand>")}
 
-Manage anonymous usage data collection.
+Manage usage data collection (anonymous until you sign in to HeyGen).
 
 ${c.bold("SUBCOMMANDS:")}
   ${c.accent("status")}    ${c.dim("Show current telemetry status")}
-  ${c.accent("enable")}    ${c.dim("Enable anonymous telemetry")}
-  ${c.accent("disable")}   ${c.dim("Disable anonymous telemetry")}
+  ${c.accent("enable")}    ${c.dim("Enable usage telemetry")}
+  ${c.accent("disable")}   ${c.dim("Disable usage telemetry")}
 
 ${c.bold("WHAT WE COLLECT:")}
   ${c.dim("\u2022")} Command names (init, render, preview, etc.)
   ${c.dim("\u2022")} Render performance (duration, fps, quality)
   ${c.dim("\u2022")} Template choices
   ${c.dim("\u2022")} OS, architecture, Node.js version, CLI version
+  ${c.dim("\u2022")} Once you sign in to HeyGen: your account email and username
 
 ${c.bold("WHAT WE DON'T COLLECT:")}
   ${c.dim("\u2022")} File paths, project names, or video content
   ${c.dim("\u2022")} IP addresses (discarded by our analytics provider)
-  ${c.dim("\u2022")} Any personally identifiable information
+  ${c.dim("\u2022")} Anything that identifies you before you sign in
 
 ${c.dim("You can also set")} ${c.accent("HYPERFRAMES_NO_TELEMETRY=1")} ${c.dim("or")} ${c.accent("DO_NOT_TRACK=1")} ${c.dim("to disable.")}
 `);
@@ -118,12 +138,12 @@ ${c.dim("You can also set")} ${c.accent("HYPERFRAMES_NO_TELEMETRY=1")} ${c.dim("
       case "disable":
         return setTelemetryEnabled(false);
       case "status":
-        return runStatus();
+        return runStatus(args.json);
       default:
         console.error(
           `${c.error("Unknown subcommand:")} ${subcommand}\n\nRun ${c.accent("hyperframes telemetry --help")} for usage.`,
         );
-        failCommand();
+        failUsage();
     }
   },
 });

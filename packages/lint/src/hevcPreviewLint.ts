@@ -3,7 +3,7 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import { rewriteAssetPath } from "@hyperframes/parsers/asset-paths";
 import { parseNumeric } from "@hyperframes/parsers/composition-contract";
-import { findFfBinary } from "@hyperframes/parsers/ff-binaries";
+import { findFfBinary, mediaInputFormatArgs } from "@hyperframes/parsers/ff-binaries";
 import {
   cleanAssetUrl,
   isRemoteOrInlineUrl,
@@ -13,7 +13,7 @@ import {
 } from "@hyperframes/parsers/asset-resolution";
 import { parseHTML } from "linkedom";
 import type { HyperframeLintFinding } from "./types.js";
-import { mediaSrcTagRe } from "./utils";
+import { mediaSrcOf, mediaSrcTagRe } from "./utils";
 
 /** Structurally compatible with `project.ts`'s (unexported) `HtmlSource` —
  * duplicated as a shape, not imported, to avoid a circular import between
@@ -88,6 +88,7 @@ async function probeIsHevc(ffprobePath: string, filePath: string): Promise<boole
     const stdout = await execFileAsync(ffprobePath, [
       "-v",
       "error",
+      ...mediaInputFormatArgs(ffprobePath, filePath),
       "-select_streams",
       "v:0",
       "-show_entries",
@@ -126,7 +127,7 @@ export function collectLocalVideoCandidates(
     const re = new RegExp(videoSrcRe.source, videoSrcRe.flags);
     let match: RegExpExecArray | null;
     while ((match = re.exec(scannable)) !== null) {
-      const rawSrc = match[2] ?? "";
+      const rawSrc = mediaSrcOf(match);
       const reference = resolveLocalVideoReference(projectDir, rawSrc, compSrcPath);
       if (!reference || candidates.has(reference.resolved)) continue;
       candidates.set(reference.resolved, reference.src);
@@ -244,6 +245,7 @@ async function probePlayableVideoDuration(
       await execFileAsync(ffprobePath, [
         "-v",
         "error",
+        ...mediaInputFormatArgs(ffprobePath, filePath),
         "-select_streams",
         "v:0",
         "-show_entries",

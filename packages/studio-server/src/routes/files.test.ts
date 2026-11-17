@@ -114,7 +114,6 @@ function postCutBatch(
       elementDuration: number;
       playbackStart?: number;
       playbackRate?: number;
-      isComposition?: boolean;
     }>;
   }>,
 ): Promise<Response> {
@@ -1371,6 +1370,38 @@ describe("registerFileRoutes", () => {
     expect(readFileSync(join(projectDir, "b.html"), "utf-8")).toBe(beforeB);
   });
 
+  it.each([
+    ["a missing clip", { id: "ghost" }, 2, 4, "Cut target was not found in index.html"],
+    [
+      "a cut past the clip's end",
+      { id: "a" },
+      9,
+      4,
+      "Cut point was outside the clip's start and end in index.html",
+    ],
+  ])(
+    "says which way a cut was refused: %s",
+    async (_name, target, splitTime, elementDuration, said) => {
+      const projectDir = createProjectDir();
+      const before = '<div id="a" data-start="0" data-duration="4">A</div><div id="bare">B</div>';
+      writeFileSync(join(projectDir, "index.html"), before);
+      const app = new Hono();
+      registerFileRoutes(app, createAdapter(projectDir));
+
+      const response = await postCutBatch(app, [
+        {
+          path: "index.html",
+          expectedVersion: fileContentVersion(before),
+          targets: [{ target, originalId: target.id, splitTime, elementStart: 0, elementDuration }],
+        },
+      ]);
+
+      expect(response.status).toBe(400);
+      expect(((await response.json()) as { error: string }).error).toBe(said);
+      expect(readFileSync(join(projectDir, "index.html"), "utf-8")).toBe(before);
+    },
+  );
+
   it("serializes rapid cuts so a stale successor cannot fragment the first result", async () => {
     const projectDir = createProjectDir();
     const before = '<div id="clip" data-start="0" data-duration="4">Clip</div>';
@@ -1819,6 +1850,30 @@ const tl = gsap.timeline({ paused: true });
       error: "raw JavaScript expressions are not accepted",
     });
     expect(readFileSync(join(projectDir, "comp.html"), "utf8")).toBe(FROMTO_COMP);
+  });
+
+  it("keeps a saved ease that holds a script end tag inside the script", async () => {
+    const projectDir = createProjectDir();
+    writeHtml(projectDir, "comp.html", FROMTO_COMP);
+    const app = new Hono();
+    registerFileRoutes(app, createAdapter(projectDir));
+    const animation = await getFirstAnimation(app, "comp.html");
+    const scriptsBefore = parseHTML(FROMTO_COMP).document.querySelectorAll("script").length;
+
+    const response = await app.request("http://localhost/projects/demo/gsap-mutations/comp.html", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        type: "update-meta",
+        animationId: animation.id,
+        updates: { ease: "none</script><script>window.injected = 1</script>" },
+      }),
+    });
+
+    expect(response.status).toBe(200);
+    const saved = readFileSync(join(projectDir, "comp.html"), "utf8");
+    expect(saved).not.toContain("</script><script>window.injected");
+    expect(parseHTML(saved).document.querySelectorAll("script")).toHaveLength(scriptsBefore);
   });
 
   it("update-from-property updates a fromTo start value in place", async () => {
@@ -2828,6 +2883,30 @@ ${authored}
     expect(result.after).toContain("(function () {");
     // The variable target was not flattened to a string-literal selector
     expect(result.after).toContain("tl.to(kicker,");
+  });
+
+  it.each([
+    ["#b", false],
+    ["#p", true],
+  ])("shifting %s pins #p before its first key: %s", async (targetSelector, held) => {
+    const dir = createProjectDir();
+    writeHtml(
+      dir,
+      "index.html",
+      `<!DOCTYPE html><html><body><script data-hyperframes-gsap>
+const tl = gsap.timeline({ paused: true });
+tl.to("#p", { keyframes: { "0%": { x: -150 }, "100%": { x: 0 } }, duration: 2 }, 1.2);
+tl.to("#b", { duration: 1, x: 200 }, 2);
+</script></body></html>`,
+    );
+    const app = new Hono();
+    registerFileRoutes(app, createAdapter(dir));
+    const res = await app.request("http://localhost/projects/demo/gsap-mutations/index.html", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ type: "shift-positions", targetSelector, delta: 1 }),
+    });
+    expect(((await res.json()) as { after: string }).after.includes("hf-hold")).toBe(held);
   });
 
   it("shift-positions-batch equals sequential single shifts (atomic multi-clip)", async () => {

@@ -412,6 +412,35 @@ describe("levels and per-channel state", () => {
     expect(other.update(phaser({ speed: 2 }))).toBe(true);
   });
 
+  it("builds the true-peak limiter on its own processor and rebuilds when the lookahead moves", () => {
+    workletNodes.length = 0;
+    const limiter = (params: Record<string, number>): HfAudioFxChain => ({
+      version: 1,
+      nodes: [
+        {
+          type: "truepeak",
+          enabled: true,
+          params: { ...defaultAudioFxParams("truepeak"), ...params },
+        },
+      ],
+    });
+    const built = buildFxChain(asCtx(ctx()), limiter({}));
+    expect(workletNodes.map((w) => w.name)).toEqual(["hf-truepeak"]);
+    expect(built.update(limiter({ ceiling: -3, release: 200 }))).toBe(true);
+    // The delay line is sized from the lookahead when the processor is built.
+    expect(built.update(limiter({ lookahead: 6 }))).toBe(false);
+  });
+
+  it("resets only the effects that carry signal history", () => {
+    workletNodes.length = 0;
+    const built = buildFxChain(asCtx(ctx()), chain("truepeak", "compressor"));
+    built.reset();
+    expect(workletNodes.map((w) => [w.name, w.messages])).toEqual([
+      ["hf-truepeak", [{ __hfReset: true }]],
+      ["hf-compressor", []],
+    ]);
+  });
+
   /**
    * An LFO's phase is the whole reason it is a looping buffer rather than an
    * OscillatorNode, whose phase is zero at `start()` and cannot be set.

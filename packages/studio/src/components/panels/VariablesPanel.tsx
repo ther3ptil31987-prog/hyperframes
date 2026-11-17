@@ -24,11 +24,8 @@ import { PreviewValueControl } from "./VariablesValueControls";
 import { copyTextToClipboard } from "../../utils/clipboard";
 import { resolveMasterCompositionPath } from "../../utils/studioUrlState";
 import { isScalarVariableValue as isScalar } from "@hyperframes/core/variables";
-
-/** POSIX single-quote escaping so the copied command survives quotes in values. */
-function shellSingleQuote(value: string): string {
-  return `'${value.replace(/'/g, `'\\''`)}'`;
-}
+import { RENDER_VARIABLES_FILE } from "@hyperframes/core/project-folders";
+import { renderHandoffCommand, saveRenderVariables } from "./renderHandoff";
 
 export interface StudioEditPersistenceProps {
   sdkSession: Composition | null;
@@ -195,34 +192,45 @@ function PreviewModeHeader({
 }
 
 /**
- * Developer/agent handoff: copy the effective values as JSON or as a
- * ready-to-run render command mirroring exactly what the preview shows.
+ * Developer/agent handoff: copy the effective values as JSON, or a render
+ * command that reads them from the file Studio writes when it is copied.
  */
 function HandoffFooter({
   effectiveValues,
   compPath,
   onCopy,
+  onCopyCommand,
 }: {
   effectiveValues: Record<string, unknown>;
   compPath: string;
   onCopy: (text: string, what: string) => void;
+  onCopyCommand: (command: string) => void;
 }) {
   const json = JSON.stringify(effectiveValues);
-  const command = `npx hyperframes render ${shellSingleQuote(compPath)} --variables ${shellSingleQuote(json)}`;
+  const command = renderHandoffCommand(compPath);
   return (
     <div className="space-y-1.5 rounded-lg border border-neutral-800/70 bg-neutral-900/40 p-2">
       <p className="text-[9px] font-medium uppercase tracking-wider text-neutral-500">
         Use this template
       </p>
-      <code className="block truncate font-mono text-[9px] text-neutral-500" title={command}>
-        {command}
-      </code>
+      {command ? (
+        <code className="block truncate font-mono text-[9px] text-neutral-500" title={command}>
+          {command}
+        </code>
+      ) : (
+        <p className="text-[9px] leading-relaxed text-neutral-500">
+          Rename this composition to letters, digits, <code className="font-mono">_ . / -</code> to
+          copy a render command. A shell would read other characters in its name as syntax.
+        </p>
+      )}
       <div className="flex items-center gap-2">
-        <RowAction
-          label="Copy render command"
-          title="CLI command rendering exactly what the preview shows"
-          onClick={() => onCopy(command, "Render command")}
-        />
+        {command && (
+          <RowAction
+            label="Copy render command"
+            title={`Saves what the preview shows to ${RENDER_VARIABLES_FILE}. Run the command from the project folder.`}
+            onClick={() => onCopyCommand(command)}
+          />
+        )}
         <RowAction
           label="Copy values JSON"
           title="Effective values (defaults merged with preview overrides)"
@@ -235,7 +243,7 @@ function HandoffFooter({
 
 const EMPTY_STATE = (
   <p className="text-[10px] leading-relaxed text-neutral-500">
-    No variables declared. Variables make parts of this composition dynamic — declare them here (or
+    No variables declared. Variables make parts of this composition dynamic. Declare them here (or
     in <code className="font-mono">data-composition-variables</code>), read them with{" "}
     <code className="font-mono">getVariables()</code>, and pass values at render time with{" "}
     <code className="font-mono">--variables</code>.
@@ -250,7 +258,7 @@ export const VariablesPanel = memo(function VariablesPanel({
   reloadPreview,
   recordEdit,
 }: VariablesPanelProps) {
-  const { activeCompPath, showToast } = useStudioShellContext();
+  const { projectId, activeCompPath, showToast } = useStudioShellContext();
   const { refreshKey } = useStudioPlaybackContext();
   const { readProjectFile, writeProjectFile, compositions } = useFileManagerContext();
   const { domEditSelection } = useDomEditContext();
@@ -315,6 +323,21 @@ export const VariablesPanel = memo(function VariablesPanel({
       );
     },
     [showToast],
+  );
+
+  const copyRenderCommand = useCallback(
+    (command: string) => {
+      // Both start inside the click: a clipboard write after an await loses the user activation Safari requires.
+      const copied = copyTextToClipboard(command);
+      const saved = saveRenderVariables(projectId, effectiveValues);
+      void Promise.all([saved, copied]).then(([wasSaved, wasCopied]) => {
+        if (!wasCopied) showToast("Couldn't copy render command", "error");
+        else if (!wasSaved)
+          showToast(`Couldn't save the values to ${RENDER_VARIABLES_FILE}`, "error");
+        else showToast("Render command copied", "info");
+      });
+    },
+    [projectId, effectiveValues, showToast],
   );
 
   const dropPreviewOverride = useCallback(
@@ -437,7 +460,7 @@ export const VariablesPanel = memo(function VariablesPanel({
       const wanted = action.declaration(id).type;
       if (existing && existing.type !== wanted) {
         showToast(
-          `"${id}" is already a ${existing.type} variable — pick another id for this ${wanted} binding`,
+          `"${id}" is already a ${existing.type} variable. Pick another id for this ${wanted} binding`,
           "error",
         );
         return;
@@ -508,7 +531,7 @@ export const VariablesPanel = memo(function VariablesPanel({
         />
         {usage?.scanIncomplete && (
           <p className="text-[9px] text-neutral-600">
-            Scripts access variables dynamically — usage info may be incomplete.
+            Scripts access variables dynamically, so usage info may be incomplete.
           </p>
         )}
         {declarations.length > 0 && (
@@ -516,6 +539,7 @@ export const VariablesPanel = memo(function VariablesPanel({
             effectiveValues={effectiveValues}
             compPath={effectiveCompPath ?? "index.html"}
             onCopy={copyToClipboard}
+            onCopyCommand={copyRenderCommand}
           />
         )}
         {addOpen ? (

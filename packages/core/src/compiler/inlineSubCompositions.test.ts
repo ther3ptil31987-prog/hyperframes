@@ -264,12 +264,63 @@ describe("inlineSubCompositions – #ID selector scoping divergence", () => {
       flattenInnerRoot,
     });
 
+    expect(host.hasAttribute("data-composition-id")).toBe(false);
     const wrapper = host.querySelector("[data-hf-inner-root]");
     expect(wrapper?.getAttribute("data-composition-id")).toBe("scoped-text");
 
     const scopedCss = result.styles.map((style) => style.css).join("\n");
     expect(scopedCss).toContain("display: flex");
   });
+
+  it.each([
+    [
+      "a named host",
+      '<div id="h" data-composition-id="scene" data-composition-src="scene.html" data-start="0" data-duration="3"></div>',
+    ],
+    [
+      "an anonymous host",
+      '<div id="h" data-composition-src="scene.html" data-start="0" data-duration="3"></div>',
+    ],
+  ])(
+    "styles the preserved root written as #root[data-composition-id] for %s",
+    (_name, hostHtml) => {
+      const { document } = parseHTML(
+        `<!DOCTYPE html><html><body><div data-composition-id="main">${hostHtml}</div></body></html>`,
+      );
+      const host = document.querySelector("#h")!;
+      const sceneHtml = `<template id="scene-template">
+  <div id="root" data-composition-id="scene" data-width="640" data-height="360" data-duration="3">
+    <h1 class="title">Hi</h1>
+    <style>#root[data-composition-id="scene"] { background: red; } #root[data-composition-id="scene"] .title { color: blue; } #root[data-composition-id="scene"]::before { content: "x"; }</style>
+  </div>
+</template>`;
+      const flattenInnerRoot = (innerRoot: Element): Element => {
+        const clone = innerRoot.cloneNode(true) as Element;
+        clone.removeAttribute("data-composition-id");
+        clone.removeAttribute("id");
+        clone.setAttribute("data-hf-authored-id", "root");
+        clone.setAttribute("data-hf-inner-root", "true");
+        return clone;
+      };
+
+      const result = inlineSubCompositions(document, [host], {
+        resolveHtml: () => sceneHtml,
+        parseHtml: (html) => parseHTML(html).document,
+        flattenInnerRoot,
+      });
+
+      const page = new JSDOM(document.documentElement.outerHTML).window.document;
+      const selectors = result.styles.flatMap((style) =>
+        [...style.css.matchAll(/([^{}]+)\{/g)].map((match) => match[1]!.trim()),
+      );
+      const [box, title, before] = selectors.map(
+        (selector) => page.querySelectorAll(selector.replaceAll("::before", "")).length,
+      );
+      expect(box).toBe(1);
+      expect(title).toBe(1);
+      expect(before).toBe(1);
+    },
+  );
 
   it("extracts <link> elements from sub-composition <head> with original rel and crossorigin", () => {
     const subCompWithLinks = `<!doctype html>
@@ -411,6 +462,25 @@ describe("inlineSubCompositions – #ID selector scoping divergence", () => {
     expect(host.hasAttribute("data-timeline-locked")).toBe(true);
   });
 
+  it("propagates data-no-timeline from inner root to host element", () => {
+    const stillSubComp = `<!doctype html>
+<html><head></head><body>
+  <div id="captions" data-composition-id="captions" data-no-timeline data-width="1920" data-height="1080">
+    <span>Hello</span>
+  </div>
+</body></html>`;
+
+    const document = makeHostDocument("captions");
+    const host = document.querySelector('[data-composition-src="intro.html"]')!;
+
+    inlineSubCompositions(document, [host], {
+      resolveHtml: () => stillSubComp,
+      parseHtml: (html) => parseHTML(html).document,
+    });
+
+    expect(host.hasAttribute("data-no-timeline")).toBe(true);
+  });
+
   it("producer path propagates data-hf-authored-id to host when inner root has id", () => {
     const document = makeHostDocument("intro");
     const host = document.querySelector('[data-composition-src="intro.html"]')!;
@@ -505,6 +575,50 @@ describe("inlineSubCompositions – variable defaults on a template sub-comp roo
     });
     expect(result.variablesByComp["card"]).toMatchObject({ headline: "Overridden" });
   });
+
+  it("keys an anonymous host's values by the sub-composition's own id, which its wrapper and scripts use", () => {
+    const { document } = parseHTML(`<!DOCTYPE html><html><body>
+      <div data-composition-id="main">
+        <div data-composition-src="card.html" data-start="0" data-duration="4" data-track-index="0"></div>
+      </div></body></html>`);
+    const host = document.querySelector('[data-composition-src="card.html"]')!;
+    const result = inlineSubCompositions(document, [host], {
+      resolveHtml: () => SUB_COMP_WITH_VAR,
+      parseHtml: (h) => parseHTML(h).document,
+      readVariableDefaults: readDeclaredDefaults,
+      parseHostVariables: parseHostVariableValues,
+    });
+    expect(result.variablesByComp["card"]).toMatchObject({ headline: "Hi there" });
+    // The host stays anonymous; the preserved wrapper is what carries the id.
+    expect(host.hasAttribute("data-composition-id")).toBe(false);
+    expect(host.querySelector('[data-composition-id="card"]')).not.toBeNull();
+  });
+
+  it.each([
+    ["named first", ["named", "anonymous"]],
+    ["anonymous first", ["anonymous", "named"]],
+  ] as const)(
+    "keeps a named mount's values when an anonymous mount of the same file shares its scope (%s)",
+    (_order, order) => {
+      // Both mounts resolve through `[data-composition-id="card"]`: the named
+      // host carries it, the anonymous wrapper keeps it. The explicit instance
+      // values on the named host must win whichever mount is inlined first.
+      const { document } = parseHTML(`<!DOCTYPE html><html><body>
+      <div data-composition-id="main">
+        <div id="named" data-composition-id="card" data-composition-src="card.html" data-variable-values='{"headline":"Custom"}' data-start="0" data-duration="4" data-track-index="0"></div>
+        <div id="anonymous" data-composition-src="card.html" data-start="0" data-duration="4" data-track-index="1"></div>
+      </div></body></html>`);
+      const hosts = order.map((id) => document.querySelector(`#${id}`)!);
+      const result = inlineSubCompositions(document, hosts, {
+        resolveHtml: () => SUB_COMP_WITH_VAR,
+        parseHtml: (h) => parseHTML(h).document,
+        readVariableDefaults: readDeclaredDefaults,
+        parseHostVariables: parseHostVariableValues,
+      });
+      expect(result.variablesByComp).toEqual({ card: { headline: "Custom" } });
+      expect(document.querySelector("#anonymous")!.hasAttribute("data-composition-id")).toBe(false);
+    },
+  );
 });
 
 describe("inlineSubCompositions – recursive host discovery", () => {
@@ -877,6 +991,58 @@ describe("inlineSubCompositions – #3490 nested SVG id collisions", () => {
     const authoredMatch = sceneBRoot.querySelector('[data-hf-authored-id="shape"]');
     expect(authoredMatch).toBeTruthy();
     expect(authoredMatch).toBe(sceneBRoot.querySelector("symbol"));
+  });
+});
+
+describe("inlineSubCompositions – SVG ids in top-level scene clips", () => {
+  const portrait = (color: string) =>
+    `<svg><defs><linearGradient id="skin"><stop stop-color="${color}"/></linearGradient>` +
+    `<symbol id="portrait"><rect fill="${color}"/></symbol></defs>` +
+    `<rect class="face" fill="url(#skin)" clip-path="url(#shared)"/><use class="piece" href="#portrait"/></svg>`;
+  const compile = (clips: string) => {
+    const { document } = parseHTML(`<!DOCTYPE html><html><body>
+      <svg width="0" height="0"><clipPath id="shared"><circle r="40"/></clipPath></svg>
+      <div data-composition-id="main" data-start="0" data-duration="20">${clips}</div></body></html>`);
+    inlineSubCompositions(document, [], {
+      resolveHtml: () => null,
+      parseHtml: (html) => parseHTML(html).document,
+      hostIdentityMap: assignTestRuntimeCompositionIds([]),
+    });
+    return document;
+  };
+  // The first element with an id is what the browser resolves `url(#id)` and `href="#id"` to.
+  const resolved = (document: Document, value: string | null) =>
+    document.getElementById(value!.replace(/^url\(#|\)$|^#/g, ""));
+
+  // fails without the fix: the second scene's gradient and <use> resolved to the first scene's portrait.
+  it("gives each scene clip its own portrait when two scenes reuse the same SVG ids", () => {
+    const document = compile(
+      `<div class="scene" data-start="0" data-duration="10">${portrait("red")}</div>` +
+        `<div class="scene" data-start="10" data-duration="10">${portrait("blue")}</div>`,
+    );
+    const [first, second] = [...document.querySelectorAll(".scene")];
+    for (const scene of [first!, second!]) {
+      expect(
+        scene.contains(resolved(document, scene.querySelector(".face")!.getAttribute("fill"))),
+      ).toBe(true);
+      expect(
+        scene.contains(resolved(document, scene.querySelector(".piece")!.getAttribute("href"))),
+      ).toBe(true);
+    }
+    expect(first!.querySelector("linearGradient")!.id).toBe("skin");
+    expect(first!.querySelector("symbol")!.id).toBe("portrait");
+  });
+
+  it("leaves a page-level definition the scenes share where it is", () => {
+    const document = compile(
+      `<div class="scene" data-start="0" data-duration="10">${portrait("red")}</div>` +
+        `<div class="scene" data-start="10" data-duration="10">${portrait("blue")}</div>`,
+    );
+    const shared = document.getElementById("shared")!;
+    expect(shared.closest(".scene")).toBeNull();
+    for (const face of document.querySelectorAll(".face")) {
+      expect(face.getAttribute("clip-path")).toBe("url(#shared)");
+    }
   });
 });
 

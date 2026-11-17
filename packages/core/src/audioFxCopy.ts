@@ -63,7 +63,7 @@ export const EFFECT_COPY: Record<string, EffectCopy> = {
   },
   highpass: {
     title: "Remove Rumble",
-    does: "Cuts the very bottom — traffic, footsteps, air conditioning, hands on the mic.",
+    does: "Cuts the very bottom: traffic, footsteps, air conditioning, hands on the mic.",
     reachFor: "There's a low hum or thump under everything.",
     primary: "frequency",
     primaryEnds: { low: "Only the deepest", high: "Thins it out" },
@@ -94,7 +94,7 @@ export const EFFECT_COPY: Record<string, EffectCopy> = {
   peaking: {
     title: "Shape One Range",
     does: "Lifts or lowers one part of the sound and leaves the rest alone.",
-    reachFor: "One quality is wrong — boomy, boxy, harsh — but the rest is fine.",
+    reachFor: "One quality is wrong (boomy, boxy, harsh) but the rest is fine.",
     primary: "gain",
     primaryEnds: { low: "Take it out", high: "Bring it forward" },
     band: [20, 20000],
@@ -152,13 +152,13 @@ export const EFFECT_COPY: Record<string, EffectCopy> = {
   },
   limiter: {
     title: "Peak Ceiling",
-    does: "Nothing gets louder than this, ever. A safety net at the end of the chain.",
-    reachFor: "You want to be sure it never clips or spikes.",
+    does: "Pulls the loudest moments down toward this ceiling. It reacts to what it hears, so a fast peak can still get past, and Level after is applied on top of it.",
+    reachFor: "You want peaks held down and can accept a small overshoot.",
     primary: "limit",
     primaryEnds: { low: "A lot of headroom", high: "Right up to the edge" },
     params: {
       limit: {
-        label: "Never exceed",
+        label: "Ceiling",
         ends: { low: "A lot of headroom", high: "Right up to the edge" },
       },
       attack: { label: "How fast it catches" },
@@ -166,9 +166,25 @@ export const EFFECT_COPY: Record<string, EffectCopy> = {
       level_out: { label: "Level after" },
     },
   },
+  truepeak: {
+    title: "True-Peak Ceiling",
+    does: "Pulls the loudest moments, including the ones between samples, down toward a target ceiling.",
+    reachFor: "Peaks need to stay under a delivery limit.",
+    primary: "ceiling",
+    primaryEnds: { low: "A lot of headroom", high: "Little headroom" },
+    params: {
+      ceiling: {
+        label: "Target ceiling",
+        hint: "Measured with a 4x estimate. Dense full-band sound can end up to about 1.7 dB above it, so leave headroom: -3 for a -1 dBTP limit.",
+        ends: { low: "A lot of headroom", high: "Little headroom" },
+      },
+      lookahead: { label: "How far ahead it looks" },
+      release: { label: "How fast it recovers" },
+    },
+  },
   gate: {
     title: "Silence the Gaps",
-    does: "Mutes the pauses. Whatever sits underneath stays — this closes the gaps, it does not remove noise.",
+    does: "Mutes the pauses. Whatever sits underneath stays: this closes the gaps, it does not remove noise.",
     reachFor: "You can hear the room in the gaps.",
     primary: "strength",
     primaryEnds: { low: "Only true silence", high: "Cuts quiet parts too" },
@@ -176,7 +192,7 @@ export const EFFECT_COPY: Record<string, EffectCopy> = {
       threshold: { label: "Quieter than this is a gap" },
       range: {
         label: "How far to duck the gaps",
-        hint: "Not all the way down, usually — total silence sounds broken.",
+        hint: "Not all the way down, usually. Total silence sounds broken.",
       },
       ratio: { label: "How hard" },
       attack: { label: "How fast it opens" },
@@ -394,8 +410,9 @@ export const SUMMARY: Record<string, (p: P) => string> = {
       ? "Doing nothing yet"
       : `${n(p.gain) > 0 ? "More" : "Less"} sparkle above ${hz(p.frequency)}`,
   compressor: (p) =>
-    `Evening out — ${strength(Math.min(1, (n(p.ratio, 3) - 1) / 7), ["gentle", "moderate", "firm"])}`,
-  limiter: (p) => `Nothing louder than ${n(p.limit, -1)} dB`,
+    `Evening out, ${strength(Math.min(1, (n(p.ratio, 3) - 1) / 7), ["gentle", "moderate", "firm"])}`,
+  limiter: (p) => `Peaks pulled down toward ${n(p.limit, -1)} dB`,
+  truepeak: (p) => `Peaks pulled down toward ${n(p.ceiling, -1)} dBTP`,
   gate: (p) => `Closing gaps quieter than ${n(p.threshold, -45)} dB`,
   saturate: (p) =>
     `${strength(Math.min(1, Math.abs(n(p.threshold, -6)) / 30), ["A little", "Some", "Heavy"])} warmth`,

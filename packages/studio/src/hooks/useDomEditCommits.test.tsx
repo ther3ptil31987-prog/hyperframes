@@ -350,6 +350,11 @@ describe("useDomEditCommits z-index reorder persistence", () => {
           // round-trip that separates them.
           coalesceMs: Number.POSITIVE_INFINITY,
           files: { "index.html": { before: original, after } },
+          targets: [
+            { file: "index.html", id: "a", hfId: "hf-card" },
+            { file: "index.html", id: "b" },
+            { file: "index.html", id: "c" },
+          ],
         });
         // FIX: a z-only reorder must NOT remount the preview iframe ("the blink").
         // The live DOM + store already hold the final state and the server matched

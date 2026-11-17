@@ -212,6 +212,51 @@ describe("createRuntimeStartTimeResolver", () => {
       expect(resolver.resolveStartForElement(wrapper)).toBe(4.619);
     });
 
+    describe.each([
+      ['data-composition-src="child.html"'],
+      ['data-composition-id="host"'],
+      ['data-composition-file="compositions/child.html"'],
+    ])("an inner root under a %s host", (marker) => {
+      it.each([0, 1, 2])("takes the host's start through %i neutral wrappers", (wrappers) => {
+        const open = "<section>".repeat(wrappers);
+        const close = "</section>".repeat(wrappers);
+        document.body.innerHTML = `
+          <div data-composition-id="root" data-start="0">
+            <div ${marker} data-start="5">
+              ${open}<div id="inner" data-composition-id="child"></div>${close}
+            </div>
+          </div>`;
+        const inner = document.getElementById("inner")!;
+        expect(createRuntimeStartTimeResolver({}).resolveStartForElement(inner)).toBe(5);
+      });
+    });
+
+    it("takes the nearest host, not an outer one, across a wrapper", () => {
+      document.body.innerHTML = `
+        <div data-composition-src="outer.html" data-start="2">
+          <div data-composition-id="outer">
+            <div data-composition-src="inner.html" data-start="3">
+              <canvas><div id="inner" data-composition-id="inner"></div></canvas>
+            </div>
+          </div>
+        </div>`;
+      const inner = document.getElementById("inner")!;
+      // The inner host's 3 s is local to the outer composition, which starts at 2 s.
+      expect(createRuntimeStartTimeResolver({}).resolveStartForElement(inner)).toBe(5);
+    });
+
+    it("takes a timed wrapper's start over its host's", () => {
+      document.body.innerHTML = `
+        <div data-composition-id="root" data-start="0">
+          <div data-composition-id="scene" data-start="5">
+            <section data-start="2"><div id="inner" data-composition-id="child"></div></section>
+          </div>
+        </div>`;
+      const inner = document.getElementById("inner")!;
+      // The wrapper shows the inner composition from 2 s into the scene; its clock starts then.
+      expect(createRuntimeStartTimeResolver({}).resolveStartForElement(inner)).toBe(7);
+    });
+
     it("keeps nested references in the host composition timeline", () => {
       const host = document.createElement("div");
       host.id = "slide-5";
@@ -273,6 +318,35 @@ describe("createRuntimeStartTimeResolver", () => {
       expect(resolver.resolveStartForElement(slide2)).toBe(14);
       expect(resolver.resolveStartForElement(slide3)).toBe(26);
       expect(resolver.resolveStartForElement(video)).toBe(26);
+    });
+
+    it("resolves a reference inside the referencing clip's own composition", () => {
+      const mount = (hostId: string, start: string) => {
+        const host = document.createElement("div");
+        host.id = hostId;
+        host.setAttribute("data-composition-id", "card");
+        host.setAttribute("data-start", start);
+        host.setAttribute("data-duration", "2");
+        document.body.appendChild(host);
+
+        const first = document.createElement("div");
+        first.id = "first";
+        first.setAttribute("data-start", "0");
+        first.setAttribute("data-duration", "1");
+        host.appendChild(first);
+
+        const second = document.createElement("div");
+        second.setAttribute("data-start", "first");
+        second.setAttribute("data-duration", "1");
+        host.appendChild(second);
+        return second;
+      };
+      const secondInA = mount("card-a", "0");
+      const secondInB = mount("card-b", "2");
+
+      const resolver = createRuntimeStartTimeResolver({});
+      expect(resolver.resolveStartForElement(secondInA)).toBe(1);
+      expect(resolver.resolveStartForElement(secondInB)).toBe(3);
     });
 
     it("returns fallback when reference target not found", () => {
@@ -438,6 +512,21 @@ describe("documentRef", () => {
     expect(resolver.resolveStartForElement(outro)).toBe(6);
   });
 
+  it("resolves a composition reference without the browser CSS namespace", () => {
+    const doc = document.implementation.createHTMLDocument("t");
+    doc.body.innerHTML =
+      '<div data-composition-id="intro" data-start="1" data-duration="4"></div>' +
+      '<div id="outro" data-start="intro + 2"></div>';
+    const css = globalThis.CSS;
+    Reflect.deleteProperty(globalThis, "CSS");
+    try {
+      const resolver = createRuntimeStartTimeResolver({ documentRef: doc });
+      expect(resolver.resolveStartForElement(doc.getElementById("outro")!)).toBe(7);
+    } finally {
+      globalThis.CSS = css;
+    }
+  });
+
   it("defaults to the global document when documentRef is omitted", () => {
     const el = document.createElement("div");
     el.id = "ref-a";
@@ -450,5 +539,48 @@ describe("documentRef", () => {
 
     const resolver = createRuntimeStartTimeResolver({});
     expect(resolver.resolveStartForElement(dependent)).toBe(2);
+  });
+});
+
+describe("a host's in-point", () => {
+  afterEach(() => {
+    document.body.innerHTML = "";
+  });
+
+  it("shifts what a host holds by the host's in-point, through nested hosts", () => {
+    document.body.innerHTML =
+      `<div data-composition-id="main">` +
+      `<div id="half" data-composition-id="scene" data-start="5" data-duration="4" data-playback-start="5">` +
+      `<video id="v2" data-start="4"></video><video id="v3" data-start="8"></video></div>` +
+      `<div data-composition-id="early" data-start="2" data-duration="4" data-playback-start="5">` +
+      `<video id="legacy" data-start="3" data-hf-media-start-basis="global"></video></div>` +
+      `<div data-composition-id="outer" data-start="5" data-duration="10" data-playback-start="1">` +
+      `<div id="inner" data-composition-id="inner" data-start="2" data-duration="5">` +
+      `<video id="deep" data-start="0"></video></div></div></div>`;
+    const resolver = createRuntimeStartTimeResolver({});
+    const media = (id: string) =>
+      resolver.resolveMediaStartForElement(document.getElementById(id)!);
+
+    // The half starts at 5 with in-point 5: local t plays at 5 + t - 5.
+    expect([media("v2"), media("v3")]).toEqual([4, 8]);
+    expect(resolver.resolveHostStartForElement(document.getElementById("v2")!)).toBe(0);
+    // Root-time media keeps its authored time, even where the in-point puts local 0 before 0.
+    expect(media("legacy")).toBe(3);
+    // Outer at 5 with in-point 1 puts the inner host at 5 - 1 + 2 = 6.
+    expect(resolver.resolveStartForElement(document.getElementById("inner")!)).toBe(6);
+    expect(media("deep")).toBe(6);
+  });
+
+  it("places a relative start where the same local time written as a number lands", () => {
+    // A host at 0 with in-point 5 puts local 0 at -5.
+    document.body.innerHTML =
+      `<div data-composition-id="main"><div data-composition-id="half" data-start="0" data-duration="7" data-playback-start="5">` +
+      `<div id="x" data-start="0" data-duration="1"></div>` +
+      `<video id="relative" data-start="x + 3"></video><video id="numeric" data-start="4"></video></div></div>`;
+    const resolver = createRuntimeStartTimeResolver({});
+    const media = (id: string) =>
+      resolver.resolveMediaStartForElement(document.getElementById(id)!);
+
+    expect([media("relative"), media("numeric")]).toEqual([-1, -1]);
   });
 });

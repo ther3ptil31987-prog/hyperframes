@@ -2,6 +2,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { basename, join } from "node:path";
 import { runCommand } from "citty";
+import { parseHTML } from "linkedom";
 import { describe, expect, it, vi } from "vitest";
 import {
   HF_COLOR_GRADING_ACTIVE_EFFECT_KEYS,
@@ -14,9 +15,38 @@ import {
   mediaTreatmentCommand,
   resolveMediaTreatmentSource,
 } from "./media-treatment.js";
-import { CliRuntimeError } from "../utils/commandResult.js";
+import { CliRuntimeError, CliUsageError } from "../utils/commandResult.js";
+import {
+  COLOR_GRADING_TOP_LEVEL_KEYS,
+  validateColorGradingContract,
+} from "@hyperframes/parsers/color-grading-contract";
 
 const VIDEO = `<!doctype html><html><body><video id="hero" src="hero.mp4"></video></body></html>`;
+const SEGMENTS = `<!doctype html><html><body><video class="seg" src="a.mp4"></video><video class="seg" src="b.mp4"></video></body></html>`;
+
+function gradingsOf(html: string): Array<string | null> {
+  return Array.from(parseHTML(html).document.querySelectorAll("video"), (video) =>
+    video.getAttribute("data-color-grading"),
+  );
+}
+
+describe("media-treatment capabilities", () => {
+  it("name every catalog section after the payload key it documents, and carry a valid example", () => {
+    const catalog = getHfColorGradingCapabilities() as Record<string, unknown>;
+    const payloadKeys: readonly string[] = COLOR_GRADING_TOP_LEVEL_KEYS;
+    const describedSections = Object.keys(catalog).filter((key) =>
+      ["adjust", "adjustments", "details", "finishing"].includes(key),
+    );
+    expect(describedSections.every((key) => payloadKeys.includes(key))).toBe(true);
+
+    const overview = getMediaTreatmentCapabilityOverview() as { example?: unknown };
+    const correction = getMediaTreatmentCapabilityDetail("correction") as { apply?: unknown };
+    for (const payload of [catalog.example, overview.example, correction.apply]) {
+      expect(payload).toBeDefined();
+      expect(validateColorGradingContract(payload)).toEqual([]);
+    }
+  });
+});
 
 describe("applyMediaTreatmentToHtml", () => {
   it("provides a concise first-hop overview of the complete treatment surface", () => {
@@ -116,6 +146,16 @@ describe("applyMediaTreatmentToHtml", () => {
     });
   });
 
+  it("warns that an animated property overrides the payload, instead of asking for an inline start", () => {
+    const detail = getMediaTreatmentCapabilityDetail("blur");
+    expect(detail).toMatchObject({
+      animation: {
+        rules: expect.arrayContaining([expect.stringContaining("overrides the payload's value")]),
+      },
+    });
+    expect(JSON.stringify(detail)).not.toContain("Author the initial value inline");
+  });
+
   it("rejects unknown capability lookups", () => {
     expect(() => getMediaTreatmentCapabilityDetail("make-it-cinematic")).toThrow(
       /Unknown media-treatment capability/,
@@ -123,6 +163,37 @@ describe("applyMediaTreatmentToHtml", () => {
     expect(() => getMediaTreatmentCapabilityDetail("__proto__")).toThrow(
       /Unknown media-treatment capability/,
     );
+  });
+
+  it("resolves every name the overview prints for an area to that area", () => {
+    const correction = getMediaTreatmentCapabilityDetail("correction");
+    expect(correction).toMatchObject({ id: "correction" });
+    expect(getMediaTreatmentCapabilityDetail("Adjust")).toEqual(correction);
+    expect(getMediaTreatmentCapabilityDetail("adjust")).toEqual(correction);
+    expect(getMediaTreatmentCapabilityDetail("Color Grading")).toMatchObject({ id: "grading" });
+    expect(() => getMediaTreatmentCapabilityDetail("adjustments")).toThrow(
+      /Unknown media-treatment capability/,
+    );
+  });
+
+  it("takes the payload key an agent copies from --grading as the area name", () => {
+    expect(getMediaTreatmentCapabilityDetail("preset")).toEqual(
+      getMediaTreatmentCapabilityDetail("presets"),
+    );
+  });
+
+  it("lists the area ids the lookup accepts when a capability is unknown", () => {
+    let message = "";
+    try {
+      getMediaTreatmentCapabilityDetail("adjustments");
+    } catch (error) {
+      message = error instanceof Error ? error.message : String(error);
+    }
+    const listed = /Available areas: ([^.]+)\./.exec(message)?.[1]?.split(", ") ?? [];
+    const entryPoints = getMediaTreatmentCapabilityOverview().families.map(({ id }) => id);
+
+    expect(listed).toEqual(expect.arrayContaining(entryPoints));
+    for (const id of listed) expect(() => getMediaTreatmentCapabilityDetail(id)).not.toThrow();
   });
 
   it("exposes enough canonical metadata to assemble a custom treatment", () => {
@@ -149,6 +220,172 @@ describe("applyMediaTreatmentToHtml", () => {
     expect(result.value).toContain('"preset":"warm-daylight"');
     expect(result.value).toContain('"intensity":0.8');
     expect(result.html).toContain("data-color-grading=");
+  });
+
+  it("says what media the file has when the selector matches none", () => {
+    expect(() => applyMediaTreatmentToHtml(VIDEO, { selector: "#prepared", grading: {} })).toThrow(
+      "Selector did not match: #prepared. Media in the file: video#hero.",
+    );
+    expect(() =>
+      applyMediaTreatmentToHtml(SEGMENTS, { selector: "#prepared", grading: {} }),
+    ).toThrow('video[src="a.mp4"], video[src="b.mp4"].');
+  });
+
+  it("says the file has no media yet when preparation added none", () => {
+    expect(() =>
+      applyMediaTreatmentToHtml("<!doctype html><html><body></body></html>", {
+        selector: "#prepared",
+        grading: {},
+      }),
+    ).toThrow("Selector did not match: #prepared. The file has no <video>, <img> or <canvas> yet.");
+  });
+
+  it("treats every video a selector matches alike", () => {
+    const result = applyMediaTreatmentToHtml(SEGMENTS, {
+      selector: "video",
+      grading: { preset: "warm-daylight" },
+    });
+
+    const [first, second] = gradingsOf(result.html);
+    expect(result.targets).toHaveLength(2);
+    expect(result.html).toContain("data-hf-id=");
+    expect(first).toContain('"preset":"warm-daylight"');
+    expect(second).toBe(first);
+  });
+
+  it("merges the patch into each match's own grading", () => {
+    const warm = applyMediaTreatmentToHtml(SEGMENTS, {
+      selector: "video",
+      selectorIndex: 1,
+      grading: { preset: "warm-daylight" },
+    }).html;
+
+    const result = applyMediaTreatmentToHtml(warm, {
+      selector: "video",
+      grading: { intensity: 0.5 },
+    });
+
+    expect(result.targets.map(({ before }) => before)).toEqual([
+      null,
+      expect.objectContaining({ preset: "warm-daylight" }),
+    ]);
+    expect(result.targets[1]?.value).toContain('"preset":"warm-daylight"');
+    expect(result.targets[0]?.value ?? "").not.toContain("warm-daylight");
+  });
+
+  it("clears every match even when the selector depends on the cleared attribute", () => {
+    const graded = applyMediaTreatmentToHtml(SEGMENTS, {
+      selector: "video",
+      grading: { preset: "warm-daylight" },
+    }).html;
+
+    const result = applyMediaTreatmentToHtml(graded, {
+      selector: "video[data-color-grading]",
+      clear: true,
+    });
+
+    expect(gradingsOf(result.html)).toEqual([null, null]);
+  });
+
+  it("patches the matched element even when a write changes which elements a selector matches", () => {
+    const four = SEGMENTS.replace(
+      "</body>",
+      '<video src="c.mp4"></video><video src="d.mp4"></video></body>',
+    );
+    const graded = applyMediaTreatmentToHtml(four, {
+      selector: "video",
+      grading: { preset: "warm-daylight" },
+    }).html;
+
+    const result = applyMediaTreatmentToHtml(graded, {
+      selector: "video:has(+ video[data-color-grading])",
+      clear: true,
+    });
+
+    expect(result.targets).toHaveLength(3);
+    expect(gradingsOf(result.html).map((value) => value === null)).toEqual([
+      true,
+      true,
+      true,
+      false,
+    ]);
+  });
+
+  it("refuses a video inside svg instead of writing a tag that swallows what follows it", () => {
+    const html = `<svg><foreignObject><video src="a.mp4"></video><p>caption</p></foreignObject></svg>`;
+
+    expect(() =>
+      applyMediaTreatmentToHtml(html, { selector: "video", grading: { preset: "warm-daylight" } }),
+    ).toThrow("inside <svg>");
+  });
+
+  it("patches the matched element when ids in the file are duplicated", () => {
+    const html = `<img data-hf-id="hf-x1" src="a.png"><video data-hf-id="hf-x1" src="b.mp4"></video>`;
+
+    const result = applyMediaTreatmentToHtml(html, {
+      selector: "video",
+      grading: { preset: "warm-daylight" },
+    });
+
+    const { document } = parseHTML(`<!doctype html><html><body>${result.html}</body></html>`);
+    expect(document.querySelector("img")?.getAttribute("data-color-grading")).toBeNull();
+    expect(document.querySelector("video")?.getAttribute("data-color-grading")).toContain(
+      "warm-daylight",
+    );
+  });
+
+  it("clears exactly the matches inside a template when a write changes the match set", () => {
+    const videos = '<video src="a.mp4"></video>'.repeat(4);
+    const graded = applyMediaTreatmentToHtml(`<template>${videos}</template>`, {
+      selector: "video",
+      grading: { preset: "warm-daylight" },
+    }).html;
+
+    const result = applyMediaTreatmentToHtml(graded, {
+      selector: "video:has(+ video[data-color-grading])",
+      clear: true,
+    });
+
+    const cleared = (result.html.match(/<video(?![^>]*data-color-grading)/g) ?? []).length;
+    expect(result.targets).toHaveLength(3);
+    expect(cleared).toBe(3);
+  });
+
+  it("writes a later match's change when the first match is already graded", () => {
+    const firstGraded = applyMediaTreatmentToHtml(SEGMENTS, {
+      selector: "video",
+      selectorIndex: 0,
+      grading: { preset: "warm-daylight" },
+    }).html;
+
+    const result = applyMediaTreatmentToHtml(firstGraded, {
+      selector: "video",
+      grading: { preset: "warm-daylight" },
+    });
+
+    expect(result.targets.map(({ changed }) => changed)).toEqual([false, true]);
+    expect(result.changed).toBe(true);
+    expect(gradingsOf(result.html)[1]).toContain("warm-daylight");
+  });
+
+  it("treats only the --selector-index match when one is given", () => {
+    const result = applyMediaTreatmentToHtml(SEGMENTS, {
+      selector: "video",
+      selectorIndex: 1,
+      grading: { preset: "warm-daylight" },
+    });
+
+    const [first, second] = gradingsOf(result.html);
+    expect(first).toBeNull();
+    expect(second).toContain('"preset":"warm-daylight"');
+  });
+
+  it("rejects a selector that also matches something other than an image or video", () => {
+    const html = SEGMENTS.replace("</body>", '<div class="seg"></div></body>');
+
+    expect(() =>
+      applyMediaTreatmentToHtml(html, { selector: ".seg", grading: { preset: "warm-daylight" } }),
+    ).toThrow("selector matched <div>");
   });
 
   it("normalizes and persists advanced grading on real media", () => {
@@ -294,6 +531,51 @@ describe("applyMediaTreatmentToHtml", () => {
     expect(repeated.after).toEqual(repeated.before);
   });
 
+  it("applies over a grading an earlier version wrote with empty hue curves, and writes it valid", () => {
+    const broken = JSON.stringify({
+      hueCurves: {
+        hueVsHue: [
+          [0, 0],
+          [120, 20],
+          [240, 0],
+        ],
+        hueVsSaturation: [],
+        hueVsLuma: [],
+      },
+    });
+    const html = VIDEO.replace('id="hero"', `id="hero" data-color-grading='${broken}'`);
+
+    const patched = applyMediaTreatmentToHtml(html, {
+      selector: "#hero",
+      grading: { adjust: { exposure: 0.1 } },
+    });
+
+    expect(patched.after).toMatchObject({
+      adjust: { exposure: 0.1 },
+      hueCurves: {
+        hueVsHue: [
+          [0, 0],
+          [120, 20],
+          [240, 0],
+        ],
+      },
+    });
+    expect(patched.after).not.toHaveProperty("hueCurves.hueVsSaturation");
+  });
+
+  it("rejects unknown empty hue curves instead of healing them", () => {
+    const html = VIDEO.replace(
+      'id="hero"',
+      `id="hero" data-color-grading='{"hueCurves":{"bogus":[]}}'`,
+    );
+    expect(() =>
+      applyMediaTreatmentToHtml(html, {
+        selector: "#hero",
+        grading: { adjust: { exposure: 0.1 } },
+      }),
+    ).toThrow(/hueCurves.*unsupported key.*bogus/);
+  });
+
   it("preserves unresolved variable references for runtime resolution", () => {
     const wholeGrade = applyMediaTreatmentToHtml(VIDEO, {
       selector: "#hero",
@@ -318,11 +600,13 @@ describe("applyMediaTreatmentToHtml", () => {
     ).toThrow(/Cannot merge.*unresolved whole-grade variable/);
   });
 
-  it("requires an unambiguous media target", () => {
+  it("grades every matched image unless --selector-index picks one", () => {
     const source = `<img class="media" src="a.png"><img class="media" src="b.png">`;
-    expect(() =>
-      applyMediaTreatmentToHtml(source, { selector: ".media", grading: { preset: "neutral" } }),
-    ).toThrow(/matched 2 elements/);
+    const all = applyMediaTreatmentToHtml(source, {
+      selector: ".media",
+      grading: { preset: "warm-daylight" },
+    });
+    expect((all.html.match(/data-color-grading/g) ?? []).length).toBe(2);
 
     const result = applyMediaTreatmentToHtml(source, {
       selector: ".media",
@@ -349,7 +633,20 @@ describe("applyMediaTreatmentToHtml", () => {
         selector: "#hero",
         grading: { preset: "warm-daylight" },
       }),
-    ).toThrow(/requires an <img> or <video>/);
+    ).toThrow(/requires a <video>, <img> or <canvas>/);
+  });
+
+  it("grades a canvas", () => {
+    const result = applyMediaTreatmentToHtml(
+      `<canvas id="drawn" width="640" height="360"></canvas>`,
+      {
+        selector: "#drawn",
+        grading: { preset: "warm-daylight" },
+      },
+    );
+
+    expect(result.tag).toBe("canvas");
+    expect(result.html).toContain("data-color-grading=");
   });
 
   it("rejects unknown keys instead of silently dropping agent mistakes", () => {
@@ -368,6 +665,299 @@ describe("applyMediaTreatmentToHtml", () => {
     ).toThrow(/effects.*dithering/i);
   });
 
+  it("previews the exact grading attribute and lint verdict without --apply or writes", async () => {
+    const project = mkdtempSync(join(tmpdir(), "hf-media-dry-run-"));
+    const file = join(project, "index.html");
+    const grading = '{"preset":"warm-daylight","intensity":0.8}';
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    writeFileSync(file, VIDEO);
+    const args = ["--project", project, "--selector", "#hero", "--grading", grading, "--json"];
+    try {
+      await runCommand(mediaTreatmentCommand, { rawArgs: [...args, "--dry-run"] });
+      const preview = JSON.parse(String(log.mock.calls.at(-1)?.[0]));
+      expect(preview).toMatchObject({
+        ok: true,
+        dryRun: true,
+        changed: true,
+        attribute: "data-color-grading",
+        lint: { ok: true, findings: [] },
+      });
+      expect(readFileSync(file, "utf8")).toBe(VIDEO);
+      await runCommand(mediaTreatmentCommand, { rawArgs: [...args, "--apply"] });
+      const applied = JSON.parse(String(log.mock.calls.at(-1)?.[0]));
+      const written = parseHTML(readFileSync(file, "utf8"))
+        .document.querySelector("#hero")
+        ?.getAttribute("data-color-grading");
+      expect(preview.value).toBe(written);
+      expect(preview.value).toBe(applied.value);
+      expect(preview.lint).toEqual(applied.lint);
+    } finally {
+      log.mockRestore();
+      rmSync(project, { recursive: true, force: true });
+    }
+  });
+
+  it("takes --grading from a file, and tells a quote-stripped value to use one", async () => {
+    const project = mkdtempSync(join(tmpdir(), "hf-media-grading-file-"));
+    writeFileSync(join(project, "index.html"), VIDEO);
+    writeFileSync(join(project, "g.json"), '{"preset":"warm-daylight","intensity":0.8}');
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const run = (grading: string) =>
+      runCommand(mediaTreatmentCommand, {
+        rawArgs: [
+          "--project",
+          project,
+          "--selector",
+          "#hero",
+          "--grading",
+          grading,
+          "--dry-run",
+          "--json",
+        ],
+      });
+    try {
+      await run(join(project, "g.json"));
+      expect(JSON.parse(String(log.mock.calls.at(-1)?.[0]))).toMatchObject({
+        ok: true,
+        changed: true,
+      });
+      await expect(run("{preset:warm-daylight,intensity:0.8}")).rejects.toThrow(CliRuntimeError);
+      expect(JSON.stringify([...error.mock.calls, ...log.mock.calls])).toContain(
+        "--grading payload.json",
+      );
+    } finally {
+      log.mockRestore();
+      error.mockRestore();
+      rmSync(project, { recursive: true, force: true });
+    }
+  });
+
+  it("reads a relative --grading file from the project, not from where the command runs", async () => {
+    const project = mkdtempSync(join(tmpdir(), "hf-media-grading-rel-"));
+    mkdirSync(join(project, "assets"));
+    writeFileSync(join(project, "index.html"), VIDEO);
+    writeFileSync(join(project, "assets", "g.json"), '{"preset":"warm-daylight"}');
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    try {
+      await runCommand(mediaTreatmentCommand, {
+        rawArgs: [
+          "--project",
+          project,
+          "--selector",
+          "#hero",
+          "--grading",
+          "assets/g.json",
+          "--dry-run",
+          "--json",
+        ],
+      });
+      expect(JSON.parse(String(log.mock.calls.at(-1)?.[0]))).toMatchObject({
+        ok: true,
+        changed: true,
+      });
+    } finally {
+      log.mockRestore();
+      rmSync(project, { recursive: true, force: true });
+    }
+  });
+
+  it("finds a clip inside a mounted scene and edits it in its own file", async () => {
+    const project = mkdtempSync(join(tmpdir(), "hf-media-scene-"));
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const root = `<!doctype html><html><body><div data-composition-id="main"><div data-composition-id="intro" data-composition-src="compositions/intro.html"></div></div></body></html>`;
+    mkdirSync(join(project, "compositions"));
+    writeFileSync(join(project, "index.html"), root);
+    writeFileSync(join(project, "compositions", "intro.html"), VIDEO);
+    try {
+      await runCommand(mediaTreatmentCommand, {
+        rawArgs: [
+          "--project",
+          project,
+          "--selector",
+          "#hero",
+          "--grading",
+          '{"preset":"warm-daylight"}',
+          "--apply",
+          "--json",
+        ],
+      });
+      expect(JSON.parse(String(log.mock.calls.at(-1)?.[0]))).toMatchObject({
+        ok: true,
+        file: "compositions/intro.html",
+      });
+      expect(
+        gradingsOf(readFileSync(join(project, "compositions", "intro.html"), "utf8")),
+      ).not.toEqual([null]);
+      expect(readFileSync(join(project, "index.html"), "utf8")).toBe(root);
+    } finally {
+      log.mockRestore();
+      rmSync(project, { recursive: true, force: true });
+    }
+  });
+
+  it("previews and grades a clip in a nested template scene without changing its parents", async () => {
+    const project = mkdtempSync(join(tmpdir(), "hf-media-nested-scene-"));
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const root = '<div data-composition-src="compositions/outer.html"></div>';
+    const outer = '<template><div data-composition-src="compositions/inner.html"></div></template>';
+    const inner = '<template><video id="hero" src="hero.mp4"></video></template>';
+    mkdirSync(join(project, "compositions"));
+    writeFileSync(join(project, "index.html"), root);
+    writeFileSync(join(project, "compositions/outer.html"), outer);
+    writeFileSync(join(project, "compositions/inner.html"), inner);
+    const args = [
+      "--project",
+      project,
+      "--selector",
+      "#hero",
+      "--grading",
+      '{"preset":"warm-daylight"}',
+      "--json",
+    ];
+    try {
+      await runCommand(mediaTreatmentCommand, { rawArgs: [...args, "--dry-run"] });
+      expect(JSON.parse(String(log.mock.calls.at(-1)?.[0]))).toMatchObject({
+        ok: true,
+        file: "compositions/inner.html",
+        dryRun: true,
+        changed: true,
+      });
+      expect(readFileSync(join(project, "compositions/inner.html"), "utf8")).toBe(inner);
+
+      await runCommand(mediaTreatmentCommand, { rawArgs: [...args, "--apply"] });
+      expect(JSON.parse(String(log.mock.calls.at(-1)?.[0]))).toMatchObject({
+        ok: true,
+        file: "compositions/inner.html",
+        changed: true,
+      });
+      expect(readFileSync(join(project, "compositions/inner.html"), "utf8")).toContain(
+        "data-color-grading=",
+      );
+      expect(readFileSync(join(project, "index.html"), "utf8")).toBe(root);
+      expect(readFileSync(join(project, "compositions/outer.html"), "utf8")).toBe(outer);
+    } finally {
+      log.mockRestore();
+      rmSync(project, { recursive: true, force: true });
+    }
+  });
+
+  it("requires --file for a selector shared by the root and a nested template scene", async () => {
+    const project = mkdtempSync(join(tmpdir(), "hf-media-nested-ambiguous-"));
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    const root =
+      '<video id="hero" src="root.mp4"></video><div data-composition-src="outer.html"></div>';
+    const outer = '<template><div data-composition-src="inner.html"></div></template>';
+    const inner = '<template><video id="hero" src="inner.mp4"></video></template>';
+    for (const [file, html] of Object.entries({
+      "index.html": root,
+      "outer.html": outer,
+      "inner.html": inner,
+    })) {
+      writeFileSync(join(project, file), html);
+    }
+    const args = [
+      "--project",
+      project,
+      "--selector",
+      "#hero",
+      "--grading",
+      '{"preset":"warm-daylight"}',
+      "--apply",
+      "--json",
+    ];
+    try {
+      await expect(runCommand(mediaTreatmentCommand, { rawArgs: args })).rejects.toThrow(
+        CliRuntimeError,
+      );
+      expect(JSON.parse(String(log.mock.calls.at(-1)?.[0]))).toMatchObject({
+        ok: false,
+        error: { message: expect.stringContaining("index.html, inner.html; pass --file") },
+      });
+      expect(readFileSync(join(project, "index.html"), "utf8")).toBe(root);
+      expect(readFileSync(join(project, "outer.html"), "utf8")).toBe(outer);
+      expect(readFileSync(join(project, "inner.html"), "utf8")).toBe(inner);
+
+      await runCommand(mediaTreatmentCommand, { rawArgs: [...args, "--file", "inner.html"] });
+      expect(JSON.parse(String(log.mock.calls.at(-1)?.[0]))).toMatchObject({
+        ok: true,
+        file: "inner.html",
+      });
+      expect(readFileSync(join(project, "inner.html"), "utf8")).toContain("data-color-grading=");
+      expect(readFileSync(join(project, "index.html"), "utf8")).toBe(root);
+    } finally {
+      log.mockRestore();
+      rmSync(project, { recursive: true, force: true });
+    }
+  });
+
+  it("reports how many elements an --apply treated", async () => {
+    const project = mkdtempSync(join(tmpdir(), "hf-media-all-"));
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    writeFileSync(join(project, "index.html"), SEGMENTS);
+    try {
+      await runCommand(mediaTreatmentCommand, {
+        rawArgs: [
+          "--project",
+          project,
+          "--selector",
+          "video",
+          "--grading",
+          '{"preset":"warm-daylight"}',
+          "--apply",
+          "--json",
+        ],
+      });
+
+      const applied = JSON.parse(String(log.mock.calls.at(-1)?.[0]));
+      expect(applied).toMatchObject({ ok: true, count: 2, changed: true });
+      expect(
+        applied.targets.map(({ selectorIndex }: { selectorIndex: number }) => selectorIndex),
+      ).toEqual([0, 1]);
+      expect(gradingsOf(readFileSync(join(project, "index.html"), "utf8"))[1]).toContain(
+        "warm-daylight",
+      );
+    } finally {
+      log.mockRestore();
+      rmSync(project, { recursive: true, force: true });
+    }
+  });
+
+  it("reports apply when any match keeps a grading after the patch", async () => {
+    const project = mkdtempSync(join(tmpdir(), "hf-media-action-"));
+    const html = applyMediaTreatmentToHtml(SEGMENTS, {
+      selector: "video",
+      selectorIndex: 1,
+      grading: { wheels: { shadows: { hue: 205, amount: 0.08, level: 0.02 } } },
+    }).html;
+    const log = vi.spyOn(console, "log").mockImplementation(() => undefined);
+    writeFileSync(join(project, "index.html"), html);
+    try {
+      await runCommand(mediaTreatmentCommand, {
+        rawArgs: [
+          "--project",
+          project,
+          "--selector",
+          "video",
+          "--grading",
+          '{"preset":"neutral"}',
+          "--apply",
+          "--json",
+        ],
+      });
+
+      const applied = JSON.parse(String(log.mock.calls.at(-1)?.[0]));
+      expect(applied.targets.map(({ value }: { value: string | null }) => value === null)).toEqual([
+        true,
+        false,
+      ]);
+      expect(applied.action).toBe("apply");
+    } finally {
+      log.mockRestore();
+      rmSync(project, { recursive: true, force: true });
+    }
+  });
+
   it("requires --apply for --grading while keeping --clear explicit", async () => {
     const project = mkdtempSync(join(tmpdir(), "hf-media-treatment-"));
     const file = join(project, "index.html");
@@ -381,7 +971,7 @@ describe("applyMediaTreatmentToHtml", () => {
         runCommand(mediaTreatmentCommand, {
           rawArgs: ["--project", project, "--selector", "#hero", "--grading", grading],
         }),
-      ).rejects.toThrow(CliRuntimeError);
+      ).rejects.toThrow(CliUsageError);
       expect(error).toHaveBeenLastCalledWith(expect.stringContaining("--grading requires --apply"));
       expect(readFileSync(file, "utf8")).toBe(VIDEO);
 

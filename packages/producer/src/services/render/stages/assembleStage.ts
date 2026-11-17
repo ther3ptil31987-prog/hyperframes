@@ -27,7 +27,7 @@ import { AAC_DELIVERY_TRUE_PEAK_DBFS, padOrTrimAudioToVideoFrameCount } from "..
 import { encoderFailureError } from "../encoderInterruption.js";
 import { DEFAULT_HLS_SEGMENT_SECONDS } from "../hlsConfig.js";
 import type { RenderOutputFormat } from "../renderFormat.js";
-import { updateJobStatus } from "../shared.js";
+import { reportAssembleProgress, updateJobStatus } from "../shared.js";
 import { defaultLogger } from "../../../logger.js";
 
 export interface AssembleStageInput {
@@ -36,6 +36,7 @@ export interface AssembleStageInput {
   videoOnlyPath: string;
   /** Mixed audio path (only read when `hasAudio` is true). */
   audioOutputPath: string;
+  audioPcmPath?: string;
   /** Final on-disk output. A directory when `format` is `"hls"`. */
   outputPath: string;
   hasAudio: boolean;
@@ -46,6 +47,7 @@ export interface AssembleStageInput {
   format?: RenderOutputFormat;
   /** Segment length for `format: "hls"`. Defaults to {@link DEFAULT_HLS_SEGMENT_SECONDS}. */
   hlsSegmentSeconds?: number;
+  ffmpegProcessTimeout: number;
   abortSignal: AbortSignal | undefined;
   assertNotAborted: () => void;
   onProgress?: ProgressCallback;
@@ -56,7 +58,7 @@ export interface AssembleStageResult {
   assembleMs: number;
 }
 
-function recordLimiterAttenuation(job: RenderJob, audioLoweredDb: number | undefined): void {
+export function recordLimiterAttenuation(job: RenderJob, audioLoweredDb: number | undefined): void {
   if (audioLoweredDb === undefined) return;
   job.audioLoweredDb = audioLoweredDb;
   const ceiling = `−${Math.abs(AAC_DELIVERY_TRUE_PEAK_DBFS)} dBTP`;
@@ -66,7 +68,31 @@ function recordLimiterAttenuation(job: RenderJob, audioLoweredDb: number | undef
   );
 }
 
+function startAssembleProgress(
+  job: AssembleStageInput["job"],
+  seconds: number,
+  onProgress: AssembleStageInput["onProgress"],
+): ((secondsWritten: number) => void) | undefined {
+  updateJobStatus(job, "assembling", "Assembling final video", 90, onProgress, {
+    code: "assemble",
+    ...(seconds > 0 && { done: 0, total: seconds }),
+  });
+  if (seconds <= 0) return undefined;
+  return (done) => reportAssembleProgress(job, done, seconds, onProgress);
+}
+
 export async function runAssembleStage(input: AssembleStageInput): Promise<AssembleStageResult> {
+  const { job, onProgress } = input;
+  const seconds = job.duration ?? 0;
+  const result = await assembleOutput(input, startAssembleProgress(job, seconds, onProgress));
+  reportAssembleProgress(job, seconds, seconds, onProgress);
+  return result;
+}
+
+async function assembleOutput(
+  input: AssembleStageInput,
+  onSecondsWritten: ((secondsWritten: number) => void) | undefined,
+): Promise<AssembleStageResult> {
   const {
     job,
     videoOnlyPath,
@@ -74,14 +100,13 @@ export async function runAssembleStage(input: AssembleStageInput): Promise<Assem
     outputPath,
     hasAudio,
     format,
+    ffmpegProcessTimeout,
     abortSignal,
     assertNotAborted,
-    onProgress,
   } = input;
   const isHls = format === "hls";
 
   const stage6Start = Date.now();
-  updateJobStatus(job, "assembling", "Assembling final video", 90, onProgress);
 
   if (hasAudio) {
     const audioExtension = extname(audioOutputPath);
@@ -92,8 +117,10 @@ export async function runAssembleStage(input: AssembleStageInput): Promise<Assem
     const normalizeResult = await padOrTrimAudioToVideoFrameCount({
       videoPath: videoOnlyPath,
       audioPath: audioOutputPath,
+      sourcePath: input.audioPcmPath,
       outputPath: normalizedAudioPath,
       signal: abortSignal,
+      timeoutMs: ffmpegProcessTimeout,
     });
     assertNotAborted();
     if (!normalizeResult.success) {
@@ -110,8 +137,10 @@ export async function runAssembleStage(input: AssembleStageInput): Promise<Assem
         abortSignal,
         {
           audioCodec: "aac",
+          ffmpegProcessTimeout,
         },
         job.config.fps,
+        onSecondsWritten,
       );
       assertNotAborted();
       if (!muxResult.success) {
@@ -125,8 +154,9 @@ export async function runAssembleStage(input: AssembleStageInput): Promise<Assem
       videoOnlyPath,
       outputPath,
       abortSignal,
-      undefined,
+      { ffmpegProcessTimeout },
       job.config.fps,
+      onSecondsWritten,
     );
     assertNotAborted();
     if (!faststartResult.success) {
@@ -153,6 +183,7 @@ async function runHlsPackaging(
     {
       segmentSeconds: input.hlsSegmentSeconds ?? DEFAULT_HLS_SEGMENT_SECONDS,
       signal: input.abortSignal,
+      ffmpegProcessTimeout: input.ffmpegProcessTimeout,
     },
   );
   input.assertNotAborted();

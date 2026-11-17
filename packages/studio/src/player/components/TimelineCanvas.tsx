@@ -116,6 +116,7 @@ export const TimelineCanvas = memo(function TimelineCanvas() {
         return visibleIntervals.map((gap) => (
           <div
             key={`gap-${strip.kind}-${strip.track}-${gap.start}`}
+            data-timeline-zoom-scale={-gap.start * props.pps}
             className="pointer-events-none absolute"
             style={{
               top: props.rowGeometry.getRowTop(rowIndex) + CLIP_Y,
@@ -225,18 +226,26 @@ export const TimelineCanvas = memo(function TimelineCanvas() {
       />
 
       {/* Marquee (rubber-band) multi-select rectangle — mirrors the canvas
-          MarqueeOverlay look: semi-transparent accent fill + dashed border. */}
+          MarqueeOverlay look: dashed accent border, danger-coloured while subtracting. */}
       {props.marqueeRect && (
         <div
           aria-hidden="true"
+          data-marquee-mode={props.marqueeRect.mode}
           className="absolute pointer-events-none"
           style={{
             left: props.marqueeRect.left,
             top: props.marqueeRect.top,
             width: props.marqueeRect.width,
             height: props.marqueeRect.height,
-            background: "var(--timeline-accent-fill)",
-            border: "1px dashed var(--timeline-accent-border)",
+            ...(props.marqueeRect.mode === "subtract"
+              ? {
+                  background: "var(--timeline-danger-fill)",
+                  border: "1px dashed var(--timeline-danger)",
+                }
+              : {
+                  background: "var(--timeline-accent-fill)",
+                  border: "1px dashed var(--timeline-accent-border)",
+                }),
             borderRadius: 2,
             zIndex: 70,
           }}
@@ -246,6 +255,9 @@ export const TimelineCanvas = memo(function TimelineCanvas() {
       {/* Range highlight */}
       {props.rangeSelection && (
         <div
+          data-timeline-zoom-scale={
+            -Math.min(props.rangeSelection.start, props.rangeSelection.end) * props.pps
+          }
           className="absolute pointer-events-none"
           style={{
             left:

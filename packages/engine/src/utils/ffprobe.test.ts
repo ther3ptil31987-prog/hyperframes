@@ -1,15 +1,15 @@
 // fallow-ignore-file code-duplication
 import { EventEmitter } from "events";
 import { spawnSync } from "child_process";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "fs";
+import { mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from "fs";
 import { tmpdir } from "os";
-import { basename, resolve } from "path";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { basename, join, resolve } from "path";
+import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   extractMediaMetadata,
   extractPngMetadataFromBuffer,
+  formatFfmpegSeconds,
   parseFrameRate,
-  pixelFormatHasAlpha,
 } from "./ffprobe.js";
 
 function crc32(buf: Buffer): number {
@@ -77,9 +77,98 @@ describe("extractMediaMetadata", () => {
   });
 });
 
+describe("a phone clip's display size", () => {
+  afterEach(() => {
+    vi.resetModules();
+  });
+
+  async function probed(stream: Record<string, unknown>) {
+    const { spawn } = createSpawnSpy([
+      {
+        kind: "exit",
+        code: 0,
+        stdout: JSON.stringify({
+          streams: [
+            {
+              codec_type: "video",
+              codec_name: "hevc",
+              width: 1920,
+              height: 1080,
+              r_frame_rate: "30/1",
+              avg_frame_rate: "30/1",
+              ...stream,
+            },
+          ],
+          format: { duration: "3" },
+        }),
+      },
+    ]);
+    vi.resetModules();
+    vi.doMock("child_process", () => ({ spawn }));
+    const { extractMediaMetadata: mocked, displaySize } = await import("./ffprobe.js");
+    const dir = mkdtempSync(`${tmpdir()}/hf-turned-`);
+    try {
+      writeFileSync(`${dir}/clip.mov`, "");
+      return displaySize(await mocked(`${dir}/clip.mov`));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }
+
+  it("is portrait for an iPhone clip stored landscape with a -90 display matrix", async () => {
+    const shown = await probed({ side_data_list: [{ rotation: -90 }] });
+    expect(shown).toEqual({ width: 1080, height: 1920 });
+  });
+
+  it("reads an older muxer's rotate tag, and keeps a half turn's size", async () => {
+    expect(await probed({ tags: { rotate: "270" } })).toEqual({ width: 1080, height: 1920 });
+    expect(await probed({ side_data_list: [{ rotation: 180 }] })).toEqual({
+      width: 1920,
+      height: 1080,
+    });
+  });
+
+  it("widens anamorphic pixels, then turns, as Chrome lays the element out", async () => {
+    const shown = await probed({ sample_aspect_ratio: "4:3", side_data_list: [{ rotation: 90 }] });
+    expect(shown).toEqual({ width: 1080, height: 2560 });
+  });
+});
+
 describe("extractMediaMetadata nb_frames duration cross-check", () => {
   afterEach(() => {
     vi.resetModules();
+  });
+
+  it("never reads a non-PNG video's bytes looking for PNG colour metadata", async () => {
+    const { spawn } = createSpawnSpy([
+      {
+        kind: "exit",
+        code: 0,
+        stdout: JSON.stringify({
+          streams: [
+            {
+              codec_type: "video",
+              codec_name: "h264",
+              width: 16,
+              height: 16,
+              r_frame_rate: "30/1",
+              avg_frame_rate: "30/1",
+            },
+          ],
+          format: { duration: "1" },
+        }),
+      },
+    ]);
+    vi.resetModules();
+    vi.doMock("child_process", () => ({ spawn }));
+    const { extractMediaMetadata: mocked } = await import("./ffprobe.js");
+    // Bytes that carry PNG cICP, reported by ffprobe as an untagged H.264 stream.
+    const dir = mkdtempSync(`${tmpdir()}/hf-not-png-`);
+    const path = `${dir}/clip.mp4`;
+    writeFileSync(path, buildMinimalPng());
+    const meta = await mocked(path);
+    rmSync(dir, { recursive: true, force: true });
+    expect(meta.colorSpace).toBeNull();
   });
 
   it("uses nb_frames to bound video duration when stream duration is absent and audio is longer", async () => {
@@ -260,6 +349,56 @@ describe("probeMediaProfile", () => {
     vi.doUnmock("child_process");
   });
 
+  it.each([
+    { format_name: "tty", codec_name: "ansi" },
+    { format_name: "bin", codec_name: "bintext" },
+    { format_name: "xbin", codec_name: "xbin" },
+    { format_name: "idf", codec_name: "idf" },
+    { format_name: "tty", codec_name: undefined },
+  ])(
+    "refuses a text file ffmpeg reads as $format_name video",
+    async ({ format_name, codec_name }) => {
+      const outcome = {
+        kind: "exit" as const,
+        code: 0,
+        stdout: JSON.stringify({
+          streams: [{ codec_type: "video", codec_name }],
+          format: { format_name },
+        }),
+      };
+      const { spawn } = createSpawnSpy([outcome, outcome]);
+      vi.resetModules();
+      vi.doMock("child_process", () => ({ spawn }));
+      const { probeMediaProfile, extractMediaMetadata } = await import("./ffprobe.js");
+      const { NotMediaPayloadError } = await import("./notMediaPayload.js");
+
+      await expect(probeMediaProfile("/tmp/notes-profile")).rejects.toBeInstanceOf(
+        NotMediaPayloadError,
+      );
+      await expect(extractMediaMetadata("/tmp/notes-meta")).rejects.toThrow(/text file/);
+    },
+  );
+
+  it.skipIf(spawnSync("ffprobe", ["-version"]).status !== 0)(
+    "refuses a real .asc or .nfo text file named as media",
+    async () => {
+      vi.resetModules();
+      vi.doUnmock("child_process");
+      const dir = mkdtempSync(resolve(tmpdir(), "hf-text-art-"));
+      const { probeMediaProfile, extractMediaMetadata } = await import("./ffprobe.js");
+      try {
+        for (const name of ["notes.asc", "notes.nfo"]) {
+          const path = resolve(dir, name);
+          writeFileSync(path, "API_TOKEN=not-for-the-frame\nhello\n");
+          await expect(probeMediaProfile(path)).rejects.toThrow(/text file/);
+          await expect(extractMediaMetadata(path)).rejects.toThrow(/text file/);
+        }
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+
   it("classifies still, moving, audio-only, and mixed streams from probe data", async () => {
     const { spawn } = createSpawnSpy([
       {
@@ -290,7 +429,7 @@ describe("probeMediaProfile", () => {
         kind: "exit",
         code: 0,
         stdout: JSON.stringify({
-          streams: [{ codec_type: "video" }, { codec_type: "audio" }],
+          streams: [{ codec_type: "video" }, { codec_type: "audio", codec_name: "opus" }],
           format: { format_name: "matroska,webm" },
         }),
       },
@@ -333,7 +472,7 @@ describe("probeMediaProfile", () => {
         stdout: JSON.stringify({
           streams: [
             { codec_type: "video", disposition: { attached_pic: 1 } },
-            { codec_type: "audio" },
+            { codec_type: "audio", codec_name: "mp3" },
           ],
           format: { format_name: "mp3" },
         }),
@@ -467,7 +606,7 @@ describe("probeMediaProfile", () => {
           streams: [
             { codec_type: "video", disposition: { attached_pic: 1 } },
             { codec_type: "video", codec_name: "h264" },
-            { codec_type: "audio" },
+            { codec_type: "audio", codec_name: "mp3" },
           ],
           format: { format_name: "mov,mp4,m4a,3gp,3g2,mj2" },
         }),
@@ -552,6 +691,9 @@ type SpawnOutcome =
       stdoutChunks?: Buffer[];
     };
 
+const NO_DECODED_FRAMES: SpawnOutcome = { kind: "exit", code: 0, stdout: "" };
+const metadataProbes = (calls: SpawnCall[]) => calls.filter((c) => c.args.includes("-show_format"));
+
 function createSpawnSpy(outcomes: SpawnOutcome[]): {
   spawn: (command: string, args: readonly string[]) => FakeProc;
   calls: SpawnCall[];
@@ -592,6 +734,264 @@ function createSpawnSpy(outcomes: SpawnOutcome[]): {
   };
   return { spawn, calls };
 }
+
+describe("media metadata cache invalidation", () => {
+  afterEach(() => {
+    vi.resetModules();
+    vi.doUnmock("child_process");
+  });
+
+  it("refreshes video metadata after an in-place file change", async () => {
+    const dir = mkdtempSync(resolve(tmpdir(), "hf-video-metadata-change-"));
+    const file = resolve(dir, "video.mp4");
+    writeFileSync(file, "original file");
+    const { spawn, calls } = createSpawnSpy([
+      {
+        kind: "exit",
+        code: 0,
+        stdout: JSON.stringify({
+          streams: [
+            { codec_type: "video", width: 32, height: 24, avg_frame_rate: "10/1", duration: "1" },
+          ],
+          format: { duration: "1" },
+        }),
+      },
+      {
+        kind: "exit",
+        code: 0,
+        stdout: JSON.stringify({
+          streams: [
+            { codec_type: "video", width: 64, height: 48, avg_frame_rate: "24/1", duration: "2" },
+          ],
+          format: { duration: "2" },
+        }),
+      },
+    ]);
+    vi.resetModules();
+    vi.doMock("child_process", () => ({ spawn }));
+    const { extractMediaMetadata } = await import("./ffprobe.js");
+    try {
+      expect(await extractMediaMetadata(file)).toMatchObject({ width: 32, durationSeconds: 1 });
+      writeFileSync(file, "updated file with different dimensions");
+      const refreshed = await extractMediaMetadata(file);
+      expect(refreshed).toMatchObject({ width: 64, height: 48, fps: 24, durationSeconds: 2 });
+      expect(await extractMediaMetadata(file)).toBe(refreshed);
+      expect(calls).toHaveLength(2);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("refreshes audio metadata after an atomic same-size file replacement", async () => {
+    const dir = mkdtempSync(resolve(tmpdir(), "hf-audio-metadata-change-"));
+    const file = resolve(dir, "audio.wav");
+    const replacement = resolve(dir, "replacement.wav");
+    writeFileSync(file, "first");
+    const { spawn, calls } = createSpawnSpy([
+      {
+        kind: "exit",
+        code: 0,
+        stdout: JSON.stringify({
+          streams: [
+            { codec_type: "audio", codec_name: "pcm_s16le", sample_rate: "22050", channels: 1 },
+          ],
+          format: { duration: "1" },
+        }),
+      },
+      NO_DECODED_FRAMES,
+      NO_DECODED_FRAMES,
+      {
+        kind: "exit",
+        code: 0,
+        stdout: JSON.stringify({
+          streams: [
+            { codec_type: "audio", codec_name: "pcm_s16le", sample_rate: "44100", channels: 2 },
+          ],
+          format: { duration: "2" },
+        }),
+      },
+      NO_DECODED_FRAMES,
+    ]);
+    vi.resetModules();
+    vi.doMock("child_process", () => ({ spawn }));
+    const { extractAudioMetadata } = await import("./ffprobe.js");
+    try {
+      expect(await extractAudioMetadata(file)).toMatchObject({
+        durationSeconds: 1,
+        sampleRate: 22050,
+      });
+      writeFileSync(replacement, "other");
+      renameSync(replacement, file);
+      const refreshed = await extractAudioMetadata(file);
+      expect(refreshed).toMatchObject({ durationSeconds: 2, sampleRate: 44100, channels: 2 });
+      expect(await extractAudioMetadata(file)).toBe(refreshed);
+      expect(metadataProbes(calls)).toHaveLength(2);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it.each([false, true])(
+    "refreshes final-frame timestamps in signal scope %s",
+    async (useSignal) => {
+      const dir = mkdtempSync(resolve(tmpdir(), "hf-final-frame-change-"));
+      const file = resolve(dir, "video.mp4");
+      writeFileSync(file, "original file");
+      const { spawn, calls } = createSpawnSpy([
+        { kind: "exit", code: 0, stdout: "1.900000\n" },
+        { kind: "exit", code: 0, stdout: "1.950000\n" },
+      ]);
+      vi.resetModules();
+      vi.doMock("child_process", () => ({ spawn }));
+      const { extractFinalVideoFrameTimestamp } = await import("./ffprobe.js");
+      const metadata = { videoStreamDurationSeconds: 2, videoStreamStartSeconds: 0 };
+      const signal = useSignal ? new AbortController().signal : undefined;
+      try {
+        expect(await extractFinalVideoFrameTimestamp(file, metadata, signal)).toBe(1.9);
+        writeFileSync(file, "updated file with a different frame rate");
+        expect(await extractFinalVideoFrameTimestamp(file, metadata, signal)).toBe(1.95);
+        expect(await extractFinalVideoFrameTimestamp(file, metadata, signal)).toBe(1.95);
+        expect(calls).toHaveLength(2);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+    },
+  );
+
+  it("does not return successful cached metadata after the file disappears", async () => {
+    const dir = mkdtempSync(resolve(tmpdir(), "hf-metadata-removed-"));
+    const file = resolve(dir, "video.mp4");
+    writeFileSync(file, "original file");
+    const { spawn, calls } = createSpawnSpy([
+      {
+        kind: "exit",
+        code: 0,
+        stdout: JSON.stringify({
+          streams: [{ codec_type: "video", width: 32, height: 24 }],
+          format: { duration: "1" },
+        }),
+      },
+      { kind: "exit", code: 1, stderr: "input missing" },
+    ]);
+    vi.resetModules();
+    vi.doMock("child_process", () => ({ spawn }));
+    const { extractMediaMetadata } = await import("./ffprobe.js");
+    try {
+      await extractMediaMetadata(file);
+      rmSync(file);
+      await expect(extractMediaMetadata(file)).rejects.toThrow(/input missing/);
+      expect(calls).toHaveLength(2);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("does not retain completed metadata when file identity is unavailable", async () => {
+    const dir = mkdtempSync(resolve(tmpdir(), "hf-metadata-no-identity-"));
+    const file = resolve(dir, "missing.wav");
+    const { spawn, calls } = createSpawnSpy([
+      {
+        kind: "exit",
+        code: 0,
+        stdout: JSON.stringify({
+          streams: [{ codec_type: "audio", codec_name: "mp3" }],
+          format: { duration: "1" },
+        }),
+      },
+      NO_DECODED_FRAMES,
+      NO_DECODED_FRAMES,
+      {
+        kind: "exit",
+        code: 0,
+        stdout: JSON.stringify({
+          streams: [{ codec_type: "audio", codec_name: "mp3" }],
+          format: { duration: "2" },
+        }),
+      },
+      NO_DECODED_FRAMES,
+    ]);
+    vi.resetModules();
+    vi.doMock("child_process", () => ({ spawn }));
+    const { extractAudioMetadata } = await import("./ffprobe.js");
+    try {
+      expect(await extractAudioMetadata(file)).toMatchObject({ durationSeconds: 1 });
+      expect(await extractAudioMetadata(file)).toMatchObject({ durationSeconds: 2 });
+      expect(metadataProbes(calls)).toHaveLength(2);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps the replacement probe cached when an older probe fails", async () => {
+    const dir = mkdtempSync(resolve(tmpdir(), "hf-metadata-probe-race-"));
+    const file = resolve(dir, "video.mp4");
+    writeFileSync(file, "original file");
+    const factory = createSpawnSpy([]);
+    const processes: FakeProc[] = [];
+    vi.resetModules();
+    vi.doMock("child_process", () => ({
+      spawn: (command: string, args: readonly string[]) => {
+        const proc = factory.spawn(command, args);
+        processes.push(proc);
+        return proc;
+      },
+    }));
+    const { extractMediaMetadata } = await import("./ffprobe.js");
+    try {
+      const failed = expect(extractMediaMetadata(file)).rejects.toThrow(/code 1/);
+      writeFileSync(file, "updated file with different dimensions");
+      const replacement = extractMediaMetadata(file);
+      processes[0]?.emit("close", 1);
+      await failed;
+      const shared = extractMediaMetadata(file);
+      expect(factory.calls).toHaveLength(2);
+      processes[1]?.stdout.emit(
+        "data",
+        Buffer.from(
+          JSON.stringify({
+            streams: [{ codec_type: "video", width: 64, height: 48 }],
+            format: { duration: "2" },
+          }),
+        ),
+      );
+      processes[1]?.emit("close", 0);
+      const [first, second] = await Promise.all([replacement, shared]);
+      expect(second).toBe(first);
+      expect(first).toMatchObject({ width: 64, durationSeconds: 2 });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("still shares an unchanged file probe between concurrent callers", async () => {
+    const dir = mkdtempSync(resolve(tmpdir(), "hf-metadata-shared-"));
+    const file = resolve(dir, "video.mp4");
+    writeFileSync(file, "unchanged file");
+    const { spawn, calls } = createSpawnSpy([
+      {
+        kind: "exit",
+        code: 0,
+        stdout: JSON.stringify({
+          streams: [{ codec_type: "video", width: 32, height: 24 }],
+          format: { duration: "1" },
+        }),
+      },
+    ]);
+    vi.resetModules();
+    vi.doMock("child_process", () => ({ spawn }));
+    const { extractMediaMetadata } = await import("./ffprobe.js");
+    try {
+      const [first, second] = await Promise.all([
+        extractMediaMetadata(file),
+        extractMediaMetadata(file),
+      ]);
+      expect(second).toBe(first);
+      expect(calls).toHaveLength(1);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
 
 describe("ffprobe missing-binary fallback", () => {
   const originalFfprobePath = process.env.HYPERFRAMES_FFPROBE_PATH;
@@ -653,98 +1053,135 @@ describe("ffprobe missing-binary fallback", () => {
     }
   });
 
-  // `profile` matters now: the packet refinement is an allowlist on AAC-LC,
-  // because the 1024-sample formula is wrong for LD/ELD/HE and unverified for
-  // the rest. An unprofiled "aac" stream deliberately keeps its container
-  // duration rather than being refined on an assumption.
+  // The container always reports 1.25s; each case varies what the decode probe finds.
+  // `spawns` says whether the probe ran (no-frames also runs the full-scan fallback).
   it.each([
     {
-      name: "non-AAC metadata",
-      codec: "mp3",
-      profile: undefined,
-      packets: undefined,
-      expected: 1.25,
-      calls: 1,
+      name: "non-AAC codec, decoded duration well beyond the container summary",
+      codec: "flac",
+      sampleRate: "48000",
+      lastFrame: { best_effort_timestamp_time: "3.9", nb_samples: 4800 },
+      expected: 4.0, // 3.9 + 4800/48000
+      spawns: 2,
     },
     {
-      name: "unprofiled AAC",
+      name: "decoded duration within probe-precision margin of the summary — kept as-is",
       codec: "aac",
-      profile: undefined,
-      packets: "783",
+      sampleRate: "48000",
+      // 1.2 + 3840/48000 = 1.28, only 0.03s over the 1.25s summary — under
+      // the margin, so the summary (edit-list-corrected) duration wins.
+      lastFrame: { best_effort_timestamp_time: "1.2", nb_samples: 3840 },
       expected: 1.25,
-      calls: 1,
+      spawns: 2,
     },
     {
-      name: "valid AAC-LC packet count",
-      codec: "aac",
-      profile: "LC",
-      packets: "783",
-      expected: 16.704,
-      calls: 2,
+      name: "no decodable frames — keeps the container duration",
+      codec: "opus",
+      sampleRate: "48000",
+      lastFrame: undefined,
+      expected: 1.25,
+      // An empty tail read falls back to a full scan, which also finds
+      // nothing (the mock's last outcome — the empty stdout — repeats).
+      spawns: 3,
     },
     {
-      name: "missing AAC packet count",
+      name: "zero sample rate — skips the decode probe entirely",
       codec: "aac",
-      profile: "LC",
-      packets: undefined,
+      sampleRate: "0",
+      // Would have won on any other row; the probe is never spawned to see it.
+      lastFrame: { best_effort_timestamp_time: "10", nb_samples: 999_999 },
       expected: 1.25,
-      calls: 2,
-    },
-    {
-      name: "zero AAC packet count",
-      codec: "aac",
-      profile: "LC",
-      packets: "0",
-      expected: 1.25,
-      calls: 2,
-    },
-    {
-      name: "invalid AAC packet count",
-      codec: "aac",
-      profile: "LC",
-      packets: "invalid",
-      expected: 1.25,
-      calls: 2,
+      spawns: 1,
     },
   ])(
     "derives audio duration for $name",
-    async ({ codec, profile, packets, expected, calls: expectedCalls }) => {
-      const outcomes: SpawnOutcome[] = [
+    async ({ codec, sampleRate, lastFrame, expected, spawns }) => {
+      const { spawn, calls } = createSpawnSpy([
         {
           kind: "exit",
           code: 0,
           stdout: JSON.stringify({
             streams: [
-              {
-                codec_type: "audio",
-                codec_name: codec,
-                sample_rate: "48000",
-                channels: 2,
-                profile,
-              },
+              { codec_type: "audio", codec_name: codec, sample_rate: sampleRate, channels: 2 },
             ],
             format: { duration: "1.25", bit_rate: "128000" },
           }),
         },
-      ];
-      if (codec === "aac" && profile === "LC") {
-        outcomes.push({
+        {
           kind: "exit",
           code: 0,
-          stdout: JSON.stringify({ streams: [{ nb_read_packets: packets }], format: {} }),
-        });
-      }
-      const { spawn, calls } = createSpawnSpy(outcomes);
+          stdout: lastFrame
+            ? `${lastFrame.best_effort_timestamp_time},${lastFrame.nb_samples}\n`
+            : "",
+        },
+      ]);
       vi.resetModules();
       vi.doMock("child_process", () => ({ spawn }));
 
       const { extractAudioMetadata } = await import("./ffprobe.js");
-      const meta = await extractAudioMetadata(`/tmp/${codec}-${packets ?? "none"}.audio`);
+      const meta = await extractAudioMetadata(`/tmp/${codec}-${sampleRate}.audio`);
 
       expect(meta.durationSeconds).toBeCloseTo(expected, 6);
-      expect(calls).toHaveLength(expectedCalls);
+      expect(calls).toHaveLength(spawns);
     },
   );
+
+  // A bad seek index can make the tail read find nothing past a real final frame.
+  it("falls back to a full decode when the tail-seeked read finds no frames", async () => {
+    const { spawn, calls } = createSpawnSpy([
+      {
+        kind: "exit",
+        code: 0,
+        stdout: JSON.stringify({
+          streams: [{ codec_type: "audio", codec_name: "opus", sample_rate: "48000", channels: 2 }],
+          format: { duration: "1.25" },
+        }),
+      },
+      { kind: "exit", code: 0, stdout: "" }, // tail-seeked read: nothing found
+      { kind: "exit", code: 0, stdout: "1.4,4800\n" }, // full-scan fallback: real frame
+    ]);
+    vi.resetModules();
+    vi.doMock("child_process", () => ({ spawn }));
+
+    const { extractAudioMetadata } = await import("./ffprobe.js");
+    const meta = await extractAudioMetadata("/tmp/tail-seek-miss.opus");
+
+    expect(meta.durationSeconds).toBeCloseTo(1.5, 6); // 1.4 + 4800/48000, well past the margin
+    expect(calls).toHaveLength(3);
+    expect(calls[1]?.args).toContain("-read_intervals");
+    expect(calls[2]?.args).not.toContain("-read_intervals");
+  });
+
+  // An abort is the caller's own intent, so the decode probe must surface it
+  // rather than swallow it the way it swallows a genuine probe failure. The
+  // signal is aborted only once the decode probe has spawned — aborting up
+  // front trips the container probe instead, leaving this path untested.
+  it("propagates an abort raised during the decode probe", async () => {
+    const controller = new AbortController();
+    const { spawn: baseSpawn, calls } = createSpawnSpy([
+      {
+        kind: "exit",
+        code: 0,
+        stdout: JSON.stringify({
+          streams: [{ codec_type: "audio", codec_name: "opus", sample_rate: "48000", channels: 2 }],
+          format: { duration: "1.25" },
+        }),
+      },
+      { kind: "exit", code: 0, stdout: "9,960\n" },
+    ]);
+    const spawn = (command: string, args: readonly string[]) => {
+      if (calls.length === 1) controller.abort();
+      return baseSpawn(command, args);
+    };
+    vi.resetModules();
+    vi.doMock("child_process", () => ({ spawn }));
+
+    const { extractAudioMetadata } = await import("./ffprobe.js");
+    await expect(
+      extractAudioMetadata("/tmp/aborted.audio", { signal: controller.signal }),
+    ).rejects.toThrow();
+    expect(calls).toHaveLength(2);
+  });
 
   it("extractMediaMetadata falls back to PNG cICP metadata when ffprobe is missing", async () => {
     const { spawn, calls } = createSpawnSpy([{ kind: "missing" }]);
@@ -876,6 +1313,39 @@ describe("ffprobe missing-binary fallback", () => {
 
     expect(meta.videoCodec).toBe("vp9");
     expect(meta.hasAlpha).toBe(true);
+  });
+
+  it("leaves alphaPlaneDecoded absent when the untagged VP9 decode probe fails", async () => {
+    const { spawn, calls } = createSpawnSpy([
+      {
+        kind: "exit",
+        code: 0,
+        stdout: JSON.stringify({
+          streams: [
+            {
+              codec_type: "video",
+              codec_name: "vp9",
+              width: 320,
+              height: 180,
+              r_frame_rate: "30/1",
+              avg_frame_rate: "30/1",
+              pix_fmt: "yuv420p",
+            },
+          ],
+          format: { duration: "1.5" },
+        }),
+      },
+      { kind: "exit", code: 1, stderr: "decoder failed" },
+    ]);
+    vi.resetModules();
+    vi.doMock("child_process", () => ({ spawn }));
+
+    const { extractMediaMetadata: extractMediaMetadataMocked } = await import("./ffprobe.js");
+    const meta = await extractMediaMetadataMocked("/tmp/probe-fails.webm");
+
+    expect(calls[1]?.args).toEqual(expect.arrayContaining(["-c:v", "libvpx-vp9"]));
+    expect(meta.hasAlpha).toBe(false);
+    expect("alphaPlaneDecoded" in meta).toBe(false);
   });
 
   it("extractMediaMetadata rethrows ffprobe-missing error for non-image files without fallback", async () => {
@@ -1175,9 +1645,6 @@ describe("ffprobe option separator", () => {
             {
               codec_type: "audio",
               codec_name: "aac",
-              // LC, so the packet-count refinement actually runs and its
-              // argv is covered here too.
-              profile: "LC",
               sample_rate: "48000",
               channels: 2,
             },
@@ -1185,14 +1652,9 @@ describe("ffprobe option separator", () => {
           format: { duration: "1.25" },
         }),
       },
-      {
-        kind: "exit",
-        code: 0,
-        stdout: JSON.stringify({
-          streams: [{ nb_read_packets: "783" }],
-          format: {},
-        }),
-      },
+      // The decode-based duration probe also runs, so its argv (including its
+      // own `--`) is covered here too.
+      { kind: "exit", code: 0, stdout: "1.2,3840\n" },
       { kind: "exit", code: 0, stdout: "0.000\n1.000\n" },
     ]);
     vi.resetModules();
@@ -1415,28 +1877,7 @@ describe("crc32 works on every runtime the package declares", () => {
   });
 });
 
-describe("pix_fmt alpha detection", () => {
-  // The old pattern's (^|[^a-z]) anchor bound to `yuva` alone, and the list
-  // omitted formats real files actually use.
-  const ALPHA = [
-    "yuva420p",
-    "rgba",
-    "argb",
-    "bgra",
-    "abgr",
-    "gbrap",
-    "ya8",
-    "ya16le",
-    "ayuv64le",
-    "yuva444p12le",
-  ];
-  const OPAQUE = ["yuv420p", "rgb24", "gray", "gbrp", "nv12", "yuv444p10le", "bgr0", "rgb0"];
-
-  it.each(ALPHA)("detects alpha in %s", (fmt) => expect(pixelFormatHasAlpha(fmt)).toBe(true));
-  it.each(OPAQUE)("reports %s as opaque", (fmt) => expect(pixelFormatHasAlpha(fmt)).toBe(false));
-});
-
-describe("AAC duration refinement must never fail or distort the call", () => {
+describe("audio duration decode probe never fails the call and needs no profile allowlist", () => {
   afterEach(() => {
     vi.resetModules();
     vi.doUnmock("child_process");
@@ -1458,90 +1899,169 @@ describe("AAC duration refinement must never fail or distort the call", () => {
     return { meta: await extractAudioMetadata(file), calls };
   }
 
-  // Regression: the refinement had no try/catch, so its failure rejected a
+  // Regression: the old refinement had no try/catch, so its failure rejected a
   // call whose duration was already correct. htmlCompiler catches that as
   // "no audio stream", returns 0, and the render ships silent.
-  it("keeps the container duration when the packet probe fails", async () => {
-    const { meta } = await probe(
+  it("keeps the container duration when the decode probe fails", async () => {
+    const { meta, calls } = await probe(
       [
-        { kind: "exit", code: 0, stdout: aacStream("LC") },
+        { kind: "exit", code: 0, stdout: aacStream() },
         { kind: "exit", code: 1, stdout: "", stderr: "ffprobe exploded" },
       ],
-      "/tmp/aac-packet-probe-fails.m4a",
+      "/tmp/decode-probe-fails.m4a",
     );
     expect(meta.durationSeconds).toBe(600);
+    // The tail-seeked attempt fails, so the full-scan fallback also runs (and
+    // also fails, via the mock's repeated last outcome) before giving up.
+    expect(calls).toHaveLength(3);
   });
 
-  it("keeps the container duration when the packet probe returns junk", async () => {
-    const { meta } = await probe(
+  it("keeps the container duration when the decode probe returns junk", async () => {
+    const { meta, calls } = await probe(
       [
-        { kind: "exit", code: 0, stdout: aacStream("LC") },
+        { kind: "exit", code: 0, stdout: aacStream() },
         { kind: "exit", code: 0, stdout: "not json at all" },
       ],
-      "/tmp/aac-packet-probe-junk.m4a",
+      "/tmp/decode-probe-junk.m4a",
     );
     expect(meta.durationSeconds).toBe(600);
+    expect(calls).toHaveLength(3);
   });
 
-  // Regression: codec_name is "aac" for HE-AAC too, but its packets carry
-  // 2048 output samples — assuming 1024 halved a 10:00 podcast to 5:00.
+  // The old refinement needed a profile allowlist because it guessed a fixed
+  // samples-per-frame value (right for AAC-LC, wrong for HE-AAC/LD/ELD/etc).
+  // Decoding the real last frame's own sample count has no such assumption,
+  // so every profile goes through the same path with no special-casing.
+  it.each(["LC", "HE-AAC", "HE-AACv2", "LD", "ELD", "Main", "", "SomethingNew"])(
+    "corrects duration for AAC profile %s, with no allowlist",
+    async (profile) => {
+      const { meta, calls } = await probe(
+        [
+          { kind: "exit", code: 0, stdout: aacStream(profile) },
+          { kind: "exit", code: 0, stdout: "603.9,4410\n" },
+        ],
+        `/tmp/aac-${profile || "none"}.m4a`,
+      );
+      expect(meta.durationSeconds).toBeCloseTo(604, 5); // 603.9 + 4410/44100
+      expect(calls).toHaveLength(2);
+    },
+  );
+
+  const audioProbe = (stream: object, format: object) =>
+    JSON.stringify({
+      streams: [{ codec_type: "audio", codec_name: "aac", sample_rate: "44100", ...stream }],
+      format: { duration: "600", ...format },
+    });
+  const readInterval = (calls: SpawnCall[]) =>
+    calls[1]?.args[calls[1].args.indexOf("-read_intervals") + 1];
+
   it.each([
-    "HE-AAC",
-    "HE-AACv2",
-    "he-aac",
-    // 512- and 480-sample framing: the 1024 multiplier overstates these by
-    // 2x and ~2.13x, overwriting an already-correct container duration.
-    "LD",
-    "ELD",
-    // Not verified for this maths, so not allowlisted.
-    "Main",
-    "SSR",
-    "LTP",
-    "xHE-AAC",
-    // Missing or unrecognised profile must NOT fall through to the formula —
-    // that is how an unknown HE spelling kept the truncation bug.
-    "",
-    "SomethingNew",
-  ])("does not apply the LC packet maths to profile %s", async (profile) => {
+    ["the stream", { start_time: "1.4" }, {}],
+    ["the format, when the stream has none", {}, { start_time: "1.4" }],
+  ])("measures the decoded end from the start time of %s", async (_, stream, format) => {
     const { meta, calls } = await probe(
-      [{ kind: "exit", code: 0, stdout: aacStream(profile) }],
-      `/tmp/heaac-${profile}.m4a`,
+      [
+        { kind: "exit", code: 0, stdout: audioProbe(stream, format) },
+        { kind: "exit", code: 0, stdout: "601.3,4410\n" },
+      ],
+      `/tmp/start-offset-${Object.keys(format).length}.ts`,
     );
-    expect(meta.durationSeconds).toBe(600);
-    // The second probe is not even attempted.
-    expect(calls).toHaveLength(1);
+    expect(meta.durationSeconds).toBe(600); // 601.3 + 0.1 - 1.4 is within the margin
+    expect(readInterval(calls)).toBe("600.4%+2147483647");
   });
 
-  it.each(["LC", " lc "])("still refines AAC profile %s", async (profile) => {
+  it.each([
+    ["trusts a shorter decode for raw ADTS", "aac", 10],
+    ["keeps the container for an MP4, whose edit list may trim", "mov,mp4,m4a,3gp,3g2,mj2", 600],
+  ])("%s", async (_, formatName, expected) => {
     const { meta } = await probe(
       [
-        { kind: "exit", code: 0, stdout: aacStream(profile) },
-        {
-          kind: "exit",
-          code: 0,
-          stdout: JSON.stringify({ streams: [{ nb_read_packets: "861" }], format: {} }),
-        },
+        { kind: "exit", code: 0, stdout: audioProbe({}, { format_name: formatName }) },
+        { kind: "exit", code: 0, stdout: "9.9,4410\n" },
       ],
-      `/tmp/aac-lc-${profile.trim()}.m4a`,
+      `/tmp/shorter-decode-${formatName.length}.aac`,
     );
-    expect(meta.durationSeconds).toBeCloseTo((861 * 1024) / 44100, 5);
+    expect(meta.durationSeconds).toBeCloseTo(expected, 5);
   });
 
-  it("still refines a plain AAC-LC stream", async () => {
+  it("reads the last frame of a decode listing longer than the stdout cap", async () => {
+    const rows = Array.from({ length: 10000 }, (_, i) => `${(i / 100).toFixed(2)},4410`);
     const { meta } = await probe(
       [
-        { kind: "exit", code: 0, stdout: aacStream("LC") },
-        {
-          kind: "exit",
-          code: 0,
-          stdout: JSON.stringify({ streams: [{ nb_read_packets: "861" }], format: {} }),
-        },
+        { kind: "exit", code: 0, stdout: aacStream() },
+        { kind: "exit", code: 0, stdout: `${rows.join("\n")}\n603.9,4410\n` },
       ],
-      "/tmp/aac-lc-refined.m4a",
+      "/tmp/long-decode-listing.m4a",
     );
-    expect(meta.durationSeconds).toBeCloseTo((861 * 1024) / 44100, 5);
+    expect(meta.durationSeconds).toBeCloseTo(604, 5);
   });
 });
+
+// honest.mp4 is FLAC-in-MP4; lying.mp4 is the same bytes with the mvhd/tkhd/mdhd
+// durations halved, every audio frame intact.
+const HAS_FFPROBE = spawnSync("ffprobe", ["-version"]).status === 0;
+
+describe.skipIf(!HAS_FFPROBE)(
+  "extractAudioMetadata recovers a real lying container's true duration",
+  () => {
+    const honestPath = resolve(__dirname, "__fixtures__/lying-container/honest.mp4");
+    const lyingPath = resolve(__dirname, "__fixtures__/lying-container/lying.mp4");
+
+    it("recovers the true duration from a FLAC-in-MP4 file whose container atoms were patched to lie", async () => {
+      const { extractAudioMetadata } = await import("./ffprobe.js");
+      const trueMeta = await extractAudioMetadata(honestPath);
+      expect(trueMeta.audioCodec).toBe("flac");
+      expect(trueMeta.durationSeconds).toBeGreaterThan(3.9);
+
+      const lyingMeta = await extractAudioMetadata(lyingPath);
+
+      // Recovers the real duration — not the halved container summary.
+      expect(lyingMeta.durationSeconds).toBeCloseTo(trueMeta.durationSeconds, 1);
+    });
+
+    // ffprobe reads an open interval's end from uninitialised heap; glibc's MALLOC_PERTURB_
+    // makes that garbage deterministic on Linux, as Windows' heap does at random.
+    it("decodes the tail in one pass when ffprobe's heap is dirty", async () => {
+      const real = await vi.importActual<typeof import("child_process")>("child_process");
+      const probes: string[][] = [];
+      vi.resetModules();
+      vi.doMock("child_process", () => ({
+        ...real,
+        spawn: (command: string, args: string[], options: object) => {
+          probes.push(args);
+          return real.spawn(command, args, options);
+        },
+      }));
+      const previous = process.env.MALLOC_PERTURB_;
+      process.env.MALLOC_PERTURB_ = "1";
+      try {
+        const { extractAudioMetadata } = await import("./ffprobe.js");
+        expect((await extractAudioMetadata(lyingPath)).durationSeconds).toBeCloseTo(4, 3);
+        // The container probe, then the tail decode; a third call is the full-scan fallback.
+        expect(probes).toHaveLength(2);
+      } finally {
+        if (previous === undefined) delete process.env.MALLOC_PERTURB_;
+        else process.env.MALLOC_PERTURB_ = previous;
+        vi.doUnmock("child_process");
+        vi.resetModules();
+      }
+    });
+
+    // 2 s of AAC in MPEG-TS starting at 1.4 s: last frame 3.448 + 1024/16000 - 1.4.
+    it("does not add an MPEG-TS start time to the duration", async () => {
+      const { extractAudioMetadata } = await import("./ffprobe.js");
+      const path = resolve(__dirname, "__fixtures__/lying-container/start-offset.mpegts");
+      expect((await extractAudioMetadata(path)).durationSeconds).toBeCloseTo(2.112, 3);
+    });
+
+    // 2 s silence + 1 s noise as raw ADTS; ffprobe 8.1 estimates about 9.1 s from the quiet opening.
+    it("corrects a raw ADTS duration that the container overclaims", async () => {
+      const { extractAudioMetadata } = await import("./ffprobe.js");
+      const path = resolve(__dirname, "__fixtures__/lying-container/overclaim.aac");
+      expect((await extractAudioMetadata(path)).durationSeconds).toBeCloseTo(3.072, 3);
+    });
+  },
+);
 
 describe("final video frame timestamp probes", () => {
   afterEach(() => {
@@ -1759,5 +2279,188 @@ describe("runFfprobe process and stream handling", () => {
     await expect(extractMediaMetadata("/tmp/unbounded-output.mov")).rejects.toThrow(
       /exceeded 8000000 characters/,
     );
+  });
+});
+
+describe.skipIf(!HAS_FFPROBE)("VP8/VP9 decoded alpha plane probe on real files", () => {
+  let dir: string;
+  const encode = (name: string, args: string[]): string => {
+    const out = join(dir, name);
+    const res = spawnSync("ffmpeg", [
+      "-v",
+      "error",
+      "-f",
+      "lavfi",
+      "-i",
+      "color=c=red@0.5:s=64x64:d=1,format=rgba",
+      ...args,
+      "-y",
+      out,
+    ]);
+    expect(res.status).toBe(0);
+    return out;
+  };
+  let alpha: string;
+  let alphaVp8: string;
+  let opaqueVp9: string;
+  let opaqueVp8: string;
+  let mpeg4: string;
+  beforeAll(() => {
+    dir = mkdtempSync(join(tmpdir(), "hf-decoded-alpha-"));
+    alpha = encode("alpha.webm", ["-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p"]);
+    // libvpx refuses transparency with its default alt-ref frames.
+    alphaVp8 = encode("alpha-vp8.webm", [
+      "-c:v",
+      "libvpx",
+      "-auto-alt-ref",
+      "0",
+      "-pix_fmt",
+      "yuva420p",
+    ]);
+    opaqueVp9 = encode("opaque-vp9.webm", ["-c:v", "libvpx-vp9", "-pix_fmt", "yuv420p"]);
+    opaqueVp8 = encode("opaque-vp8.webm", ["-c:v", "libvpx", "-pix_fmt", "yuv420p"]);
+    mpeg4 = encode("opaque.mp4", ["-c:v", "mpeg4", "-pix_fmt", "yuv420p"]);
+  });
+  afterAll(() => rmSync(dir, { recursive: true, force: true }));
+
+  it("probeDecodedAlphaPlane sees the alpha plane only in the alpha stream", async () => {
+    const { probeDecodedAlphaPlane } = await import("./ffprobe.js");
+    expect(await probeDecodedAlphaPlane(alpha, "libvpx-vp9")).toBe(true);
+    expect(await probeDecodedAlphaPlane(alphaVp8, "libvpx")).toBe(true);
+    expect(await probeDecodedAlphaPlane(opaqueVp9, "libvpx-vp9")).toBe(false);
+    expect(await probeDecodedAlphaPlane(opaqueVp8, "libvpx")).toBe(false);
+    expect(await probeDecodedAlphaPlane(join(dir, "missing.webm"), "libvpx-vp9")).toBeUndefined();
+  });
+
+  it("extractMediaMetadata records alphaPlaneDecoded=false only for untagged VP8/VP9", async () => {
+    const { extractMediaMetadata } = await import("./ffprobe.js");
+    const vp9 = await extractMediaMetadata(opaqueVp9);
+    expect(vp9).toMatchObject({ videoCodec: "vp9", hasAlpha: false, alphaPlaneDecoded: false });
+    const vp8 = await extractMediaMetadata(opaqueVp8);
+    expect(vp8).toMatchObject({ videoCodec: "vp8", hasAlpha: false, alphaPlaneDecoded: false });
+    // Tagged alpha is already decided by hasAlpha, so it is not probed.
+    const tagged = await extractMediaMetadata(alpha);
+    expect(tagged.hasAlpha).toBe(true);
+    expect("alphaPlaneDecoded" in tagged).toBe(false);
+    const other = await extractMediaMetadata(mpeg4);
+    expect(other.videoCodec).toBe("mpeg4");
+    expect("alphaPlaneDecoded" in other).toBe(false);
+  });
+});
+
+describe("formatFfmpegSeconds", () => {
+  it("never writes an exponent, which ffmpeg and ffprobe reject", () => {
+    expect(formatFfmpegSeconds(8.881784197001252e-16)).toBe("0");
+    expect(formatFfmpegSeconds(-8.881784197001252e-16)).toBe("0");
+    expect(formatFfmpegSeconds(1.5e-7)).toBe("0");
+  });
+
+  it("keeps ordinary times exactly as String() writes them", () => {
+    expect(formatFfmpegSeconds(1.35)).toBe("1.35");
+    expect(formatFfmpegSeconds(4.666666666666667)).toBe("4.666666666666667");
+    expect(formatFfmpegSeconds(0)).toBe("0");
+  });
+});
+
+describe("the audio tail probe's read interval", () => {
+  it("starts at a plain decimal when the duration is a hair over one second", async () => {
+    const probe = {
+      kind: "exit" as const,
+      code: 0,
+      stdout: JSON.stringify({
+        streams: [
+          {
+            codec_type: "audio",
+            codec_name: "aac",
+            sample_rate: "48000",
+            channels: 2,
+            start_time: "0.000000",
+            duration: "1.000001",
+          },
+        ],
+        format: {
+          format_name: "mov,mp4,m4a,3gp,3g2,mj2",
+          start_time: "0.000000",
+          duration: "1.000001",
+        },
+      }),
+    };
+    const { spawn, calls } = createSpawnSpy([probe, { kind: "exit", code: 0, stdout: "" }]);
+    vi.resetModules();
+    vi.doMock("child_process", () => ({ spawn }));
+    const { extractAudioMetadata } = await import("./ffprobe.js");
+    await extractAudioMetadata("/probe-tail/asset.m4a");
+    const intervals = calls.flatMap((call) => {
+      const at = call.args.indexOf("-read_intervals");
+      return at === -1 ? [] : [call.args[at + 1]!];
+    });
+    expect(intervals.length).toBeGreaterThan(0);
+    for (const interval of intervals) expect(interval.split("%")[0]).toMatch(/^\d+(\.\d+)?$/);
+  });
+});
+
+describe("a video whose headers state no duration", () => {
+  it("is measured from its packets, so a recorder's WebM or Matroska is not refused", async () => {
+    const dir = mkdtempSync(resolve(tmpdir(), "hf-no-duration-"));
+    const file = resolve(dir, "recording.mkv");
+    writeFileSync(file, "x");
+    const { spawn } = createSpawnSpy([
+      {
+        kind: "exit",
+        code: 0,
+        stdout: JSON.stringify({
+          streams: [{ codec_type: "video", width: 32, height: 24, avg_frame_rate: "10/1" }],
+          format: {},
+        }),
+      },
+      {
+        kind: "exit",
+        code: 0,
+        stdout: "0.000000,0.100000\n2.800000,0.100000\n2.700000,0.100000\n",
+      },
+    ]);
+    vi.resetModules();
+    vi.doMock("child_process", () => ({ spawn }));
+    const { extractMediaMetadata: mocked, resolvePlayableVideoDuration } =
+      await import("./ffprobe.js");
+    try {
+      const metadata = await mocked(file);
+      expect(resolvePlayableVideoDuration(metadata)).toBeCloseTo(2.9);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+      vi.resetModules();
+      vi.doUnmock("child_process");
+    }
+  });
+
+  it("ignores the half line a long film's output is cut at, and counts a packet with no stated duration as one frame", async () => {
+    const file = resolve(mkdtempSync(resolve(tmpdir(), "hf-no-duration-long-")), "long.mkv");
+    writeFileSync(file, "x");
+    const packets = (n: number) =>
+      Array.from({ length: n }, (_, i) => `${(i / 30).toFixed(6)},N/A`).join("\n") + "\n";
+    // The cut must land just after a decimal point, so its leftover digits read as a huge time.
+    let frames = 5000;
+    while (packets(frames).at(-(64 * 1024) - 1) !== ".") frames++;
+    const { spawn } = createSpawnSpy([
+      {
+        kind: "exit",
+        code: 0,
+        stdout: JSON.stringify({
+          streams: [{ codec_type: "video", width: 32, height: 24, avg_frame_rate: "30/1" }],
+          format: {},
+        }),
+      },
+      { kind: "exit", code: 0, stdout: packets(frames) },
+    ]);
+    vi.resetModules();
+    vi.doMock("child_process", () => ({ spawn }));
+    const { extractMediaMetadata: mocked, resolvePlayableVideoDuration } =
+      await import("./ffprobe.js");
+    try {
+      expect(resolvePlayableVideoDuration(await mocked(file))).toBeCloseTo(frames / 30, 1);
+    } finally {
+      vi.resetModules();
+      vi.doUnmock("child_process");
+    }
   });
 });

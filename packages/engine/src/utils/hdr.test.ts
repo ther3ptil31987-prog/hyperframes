@@ -5,6 +5,7 @@ import {
   getHdrEncoderColorParams,
   analyzeCompositionHdr,
   findHdrAutoPromotion,
+  gradingKeepsSdr,
   formatHdrAutoPromotionWarning,
   sanitizeHdrAutoPromotionAsset,
   DEFAULT_HDR10_MASTERING,
@@ -214,7 +215,7 @@ describe("HDR auto-promotion reporting", () => {
       output: { colorSpace: "BT.2020", codec: "HEVC Main10" },
     });
     expect(formatHdrAutoPromotionWarning(promotion!)).toBe(
-      '[Render] HDR auto-promotion triggered by "assets/hero-hdr.mp4" — output: BT.2020 / HEVC Main10',
+      '[Render] HDR auto-promotion triggered by "assets/hero-hdr.mp4", output: BT.2020 / HEVC Main10',
     );
   });
 
@@ -222,5 +223,16 @@ describe("HDR auto-promotion reporting", () => {
     expect(sanitizeHdrAutoPromotionAsset("assets/hero.mp4\r\n[ERROR] forged")).toBe(
       "assets/hero.mp4",
     );
+  });
+});
+
+describe("gradingKeepsSdr", () => {
+  const graded = { videos: [{}], images: [{ graded: true }] };
+  it("keeps auto renders with graded media SDR, never a forced mode or ungraded media", () => {
+    expect(gradingKeepsSdr(undefined, graded)).toBe(true);
+    expect(gradingKeepsSdr("auto", graded)).toBe(true);
+    expect(gradingKeepsSdr("force-hdr", graded)).toBe(false);
+    expect(gradingKeepsSdr("auto", { videos: [{}], images: [] })).toBe(false);
+    expect(gradingKeepsSdr("auto", { videos: [], images: [], gradedCanvas: true })).toBe(true);
   });
 });

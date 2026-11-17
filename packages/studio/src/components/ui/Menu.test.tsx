@@ -6,9 +6,17 @@ import React, { act, useState } from "react";
 import { compile } from "tailwindcss";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import { loadStylesheet, STYLES_DIR } from "../../styles/styleSources";
-import { ContextMenu, Menu, MenuItem, MenuRadioGroup, MenuRadioItem, MenuSeparator } from "./Menu";
+import {
+  ContextMenu,
+  floatingMotion,
+  Menu,
+  MenuItem,
+  MenuRadioGroup,
+  MenuRadioItem,
+  MenuSeparator,
+} from "./Menu";
 import { Popover } from "./Popover";
-import { isTypingTarget } from "../../utils/typingTarget";
+import { isTypingTarget } from "@hyperframes/core/typing-target";
 import { shouldIgnorePlaybackShortcutTarget } from "../../player/lib/playbackShortcuts";
 import { cleanupMounted, mountHost as render } from "./mountHost.testHelpers";
 
@@ -45,6 +53,13 @@ function clickWithMouse(target: Element): void {
     target.dispatchEvent(new PointerEvent("pointerup", { ...init, pointerType: "mouse" }));
     target.dispatchEvent(new MouseEvent("mouseup", init));
     target.dispatchEvent(new MouseEvent("click", init));
+  });
+}
+
+function rightClick(target: Element): void {
+  const init = { bubbles: true, cancelable: true, composed: true };
+  act(() => {
+    target.dispatchEvent(new MouseEvent("contextmenu", init));
   });
 }
 
@@ -241,11 +256,7 @@ describe("ContextMenu", () => {
     expect(trigger().textContent).toBe("clip");
     expect(popup()).toBeNull();
 
-    act(() => {
-      trigger().dispatchEvent(
-        new MouseEvent("contextmenu", { bubbles: true, cancelable: true, composed: true }),
-      );
-    });
+    rightClick(trigger());
     await settle();
     expect(popup()).not.toBeNull();
 
@@ -254,6 +265,65 @@ describe("ContextMenu", () => {
 
     expect(activated).toEqual(["split"]);
     expect(popup()).toBeNull();
+  });
+});
+
+describe("container={null}", () => {
+  /** Rendered inline means inside the trigger's own parent, not a portal on the body. */
+  function expectInlineBeside(menu: HTMLElement | null): void {
+    expect(menu).not.toBeNull();
+    expect(trigger().parentElement?.contains(menu)).toBe(true);
+  }
+
+  it("opens a Menu inline, next to its trigger, and closes on Escape", async () => {
+    render(
+      <div>
+        <Menu container={null} trigger={<button data-testid="trigger">Actions</button>}>
+          <MenuItem>Bring to front</MenuItem>
+        </Menu>
+      </div>,
+    );
+    clickWithMouse(trigger());
+    await settle();
+    expectInlineBeside(popup());
+
+    key("Escape");
+    await settle();
+    expect(popup()).toBeNull();
+  });
+
+  it("opens a ContextMenu inline, next to its area", async () => {
+    render(
+      <div>
+        <ContextMenu container={null} trigger={<div data-testid="trigger">clip</div>}>
+          <MenuItem>Split</MenuItem>
+        </ContextMenu>
+      </div>,
+    );
+    rightClick(trigger());
+    await settle();
+    expectInlineBeside(popup());
+  });
+
+  it("opens a Popover inline on its first render", async () => {
+    render(
+      <div>
+        <Popover
+          container={null}
+          defaultOpen
+          trigger={<button data-testid="trigger">Speed</button>}
+        >
+          <span>1x</span>
+        </Popover>
+      </div>,
+    );
+    await settle();
+    expectInlineBeside(document.querySelector<HTMLElement>("[role=dialog]"));
+  });
+
+  it("still portals to the body when no container is passed", async () => {
+    await openActionMenu();
+    expect(trigger().parentElement?.contains(popup())).toBe(false);
   });
 });
 
@@ -299,6 +369,83 @@ describe("Popover", () => {
     await settle();
     const arrow = one("[role=dialog] svg", "arrow").parentElement!;
     expect(arrow.getAttribute("data-side")).toBe("bottom");
+  });
+});
+
+// fails without the fix: Escape in a modal opened from a popover's row closed the popover and cancelled the key, so the
+// modal stayed open over a page with no popover (a paywall opened from a picker row).
+describe("Escape goes to the topmost open layer", () => {
+  /** A modal opened above the popup, as a paywall from a picker row is: outside the popup, focus inside it. */
+  function modalAbove(): HTMLButtonElement {
+    const dialog = document.createElement("div");
+    dialog.setAttribute("role", "dialog");
+    dialog.setAttribute("aria-modal", "true");
+    const close = document.createElement("button");
+    dialog.append(close);
+    document.body.append(dialog);
+    act(() => close.focus());
+    return close;
+  }
+  /** Escape at `target`, and whether anything cancelled it. */
+  function escapeAt(target: Element): boolean {
+    const event = new KeyboardEvent("keydown", {
+      key: "Escape",
+      bubbles: true,
+      cancelable: true,
+      composed: true,
+    });
+    act(() => void target.dispatchEvent(event));
+    return event.defaultPrevented;
+  }
+
+  it("leaves a Popover open and the key uncancelled when the modal above it has focus; its own Escape still closes it", async () => {
+    render(
+      <Popover trigger={<button data-testid="trigger">Pickers</button>} aria-label="Pickers">
+        <button>Ultra</button>
+      </Popover>,
+    );
+    act(() => trigger().click());
+    await settle();
+    const close = modalAbove();
+    expect(escapeAt(close), "the modal's Escape is left to the modal").toBe(false);
+    await settle();
+    expect(document.querySelector('[aria-label="Pickers"]')).not.toBeNull();
+    close.parentElement!.remove();
+
+    escapeAt(one('[aria-label="Pickers"] button', "popover row"));
+    await settle();
+    expect(document.querySelector('[aria-label="Pickers"]')).toBeNull();
+  });
+
+  it("leaves a Menu open under a modal above it", async () => {
+    render(
+      <Menu trigger={<button data-testid="trigger">Model</button>} aria-label="Model">
+        <MenuItem>Ultra</MenuItem>
+      </Menu>,
+    );
+    act(() => trigger().click());
+    await settle();
+    expect(escapeAt(modalAbove())).toBe(false);
+    await settle();
+    expect(document.querySelector('[role="menu"]')).not.toBeNull();
+  });
+
+  it("closes a Popover opened from inside a dialog on Escape there: that dialog is under it, not above", async () => {
+    const dialog = document.createElement("dialog");
+    dialog.setAttribute("open", "");
+    document.body.append(dialog);
+    const host = render(
+      <Popover trigger={<button data-testid="trigger">Speed</button>} aria-label="Speed">
+        <span>1x</span>
+      </Popover>,
+    );
+    dialog.append(host);
+    act(() => trigger().click());
+    await settle();
+    escapeAt(trigger());
+    await settle();
+    expect(document.querySelector('[aria-label="Speed"]')).toBeNull();
+    dialog.remove();
   });
 });
 
@@ -371,5 +518,36 @@ describe("open motion", () => {
     expect(compileStudioCss(["duration-open"])).toMatch(
       /\.duration-open \{[\s\S]*?prefers-reduced-motion: reduce[\s\S]*?transition-duration: 0ms/,
     );
+  });
+
+  it("rounds a row's highlight to the panel's corner less the panel's inset", async () => {
+    await openActionMenu();
+
+    const rowRadius = [...items()[0]!.classList].find((c) => c.startsWith("rounded-"))!;
+    expect([...popup()!.classList]).toEqual(expect.arrayContaining(["rounded-lg", "p-1"]));
+    expect(compileStudioCss([rowRadius])).toMatch(
+      /border-radius: calc\(var\(--radius-lg\) - 4px\)/,
+    );
+  });
+});
+
+describe("floatingMotion", () => {
+  it("transitions every property its starting and ending styles set", () => {
+    const classes = floatingMotion("duration-open").split(/\s+/);
+    const transitioned = classes.flatMap(
+      (c) => c.match(/^transition-\[(.+)\]$/)?.[1].split(",") ?? [],
+    );
+    const animated = classes
+      .flatMap(
+        (c) =>
+          c
+            .match(
+              /^data-\[(?:starting|ending)-style\]:(?:\[([\w-]+):|(opacity|scale|translate|rotate)-)/,
+            )
+            ?.slice(1) ?? [],
+      )
+      .filter(Boolean);
+    expect(new Set(animated)).toEqual(new Set(["opacity", "scale"]));
+    for (const property of animated) expect(transitioned).toContain(property);
   });
 });

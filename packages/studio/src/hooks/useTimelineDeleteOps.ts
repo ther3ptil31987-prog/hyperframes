@@ -2,17 +2,20 @@ import { buildProjectApiPath } from "../utils/projectRouting";
 // Timeline clip deletion: the marquee/multi path and the single-clip wrapper
 // the context menu uses. Extracted verbatim from useTimelineEditing.ts to keep
 // it under the studio 600-line cap, following useTimelineAssetDropOps.
+import { keyHint } from "../player/components/studioShortcuts";
 import { useCallback, useRef, type MutableRefObject, type RefObject } from "react";
 import type { TimelineElement } from "../player";
 import { usePlayerStore } from "../player";
 import { saveServerRewriteWithHistory, type RecordEditInput } from "../utils/studioFileHistory";
 import { studioWriteHeaders } from "../utils/studioFileVersion";
 import { getTimelineElementLabel } from "../utils/studioHelpers";
-import { buildPatchTarget, removeIframeTimelineElements } from "./timelineEditingHelpers";
+import {
+  buildPatchTarget,
+  removeIframeTimelineElements,
+  syncCompositionDurationWithEnd,
+} from "./timelineEditingHelpers";
 import { captureDurationRollback, timingGestureStep } from "./timelineTimingSync";
 import { setLinkInSource } from "../components/editor/mediaLinkEdits";
-import { setCompositionDurationToContent } from "../utils/timelineAssetDrop";
-import { furthestClipEndFromSource } from "../player/lib/timelineElementHelpers";
 import {
   resolveMainTrackDeleteRippleShifts,
   resolveShiftedElements,
@@ -22,6 +25,8 @@ import type {
   TimelineGroupMoveChange,
 } from "./useTimelineGroupEditing";
 import { studioApiFetch } from "../utils/studioApiFetch";
+import { countOf } from "../utils/countOf";
+import { heldFileWordsOf } from "../utils/studioSaveDiagnostics";
 
 /** Apply already-resolved ripple changes to the surviving elements for the
  *  optimistic store update after a delete. Pure — no IO. */
@@ -136,23 +141,23 @@ export function useTimelineDeleteOps({
                 },
               );
               if (!removeResponse.ok) {
-                throw new Error(`Failed to delete ${sameFile.length} clips from ${targetPath}`);
+                throw new Error(
+                  (await heldFileWordsOf(removeResponse, targetPath)) ??
+                    `Failed to delete ${countOf(sameFile.length, "clip")} from ${targetPath}`,
+                );
               }
               const removeData = (await removeResponse.json()) as { content?: string };
               const removedContent =
                 typeof removeData.content === "string" ? removeData.content : originalContent;
               // Shrink to the furthest remaining clip end, read from the post-removal source:
               // store durations are runtime-truncated.
-              const deleteContentEnd = furthestClipEndFromSource(removedContent);
-              const patchedContent = unlinkInSource(
-                setCompositionDurationToContent(removedContent, deleteContentEnd),
-                alsoUnlink,
-              );
+              const synced = syncCompositionDurationWithEnd(removedContent);
+              const patchedContent = unlinkInSource(synced.source, alsoUnlink);
               // Optimistically reflect the shrunk length in the readout/seek bar,
               // rolling it back if the persist below fails (see captureDurationRollback).
               rollbackDuration = captureDurationRollback(previewIframeRef.current);
-              if (deleteContentEnd > 0 && targetPath === (activeCompPath || "index.html")) {
-                usePlayerStore.getState().setDuration(deleteContentEnd);
+              if (synced.contentEnd > 0 && targetPath === (activeCompPath || "index.html")) {
+                usePlayerStore.getState().setDuration(synced.contentEnd);
               }
               return { disk: removedContent, after: patchedContent };
             },
@@ -217,7 +222,7 @@ export function useTimelineDeleteOps({
         if (rippleChanges && !rippleFailed && !rippleNoticeShownRef.current) {
           rippleNoticeShownRef.current = true;
           showToast(
-            "Ripple closed the gap on the main track. Undo (⌘Z) restores it, or turn off " +
+            `Ripple closed the gap on the main track. Undo (${keyHint("undo")}) restores it, or turn off ` +
               "Ripple in the timeline toolbar.",
             "info",
           );

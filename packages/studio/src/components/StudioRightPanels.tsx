@@ -8,6 +8,7 @@ import { BlockParamsPanel } from "./editor/BlockParamsPanel";
 import { RenderQueuePanel } from "./renders/RenderQueuePanel";
 import { SlideshowPanel } from "./panels/SlideshowPanel";
 import { VariablesPanel } from "./panels/VariablesPanel";
+import { MotionBlurPanel } from "./panels/MotionBlurPanel";
 import { Dock } from "./dock/Dock";
 import { useDockLayoutStore } from "./dock/dockLayoutStore";
 import type { RenderJob } from "./renders/useRenderQueue";
@@ -174,7 +175,7 @@ export const StudioRightPanels = memo(function StudioRightPanels({
     // timeline offers that write as a mute. Checked here as well as in the panel
     // because the button is not the only caller.
     if (!canHideSelections(domEditGroupSelections)) {
-      showToast("Audio can't be hidden — use the group's own controls", "info");
+      showToast("Audio can't be hidden. Use the group's own controls", "info");
       return;
     }
     const { elements } = usePlayerStore.getState();
@@ -294,6 +295,14 @@ export const StudioRightPanels = memo(function StudioRightPanels({
       </Dock.Panel>
       <Dock.Panel id="variables">
         <VariablesPanel
+          sdkSession={sdkSession}
+          publishSdkSession={publishSdkSession}
+          reloadPreview={reloadPreview}
+          recordEdit={recordEdit}
+        />
+      </Dock.Panel>
+      <Dock.Panel id="motionBlur">
+        <MotionBlurPanel
           sdkSession={sdkSession}
           publishSdkSession={publishSdkSession}
           reloadPreview={reloadPreview}

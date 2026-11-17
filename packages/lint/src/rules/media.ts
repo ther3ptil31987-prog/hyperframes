@@ -3,6 +3,7 @@ import {
   readAttr,
   readDecodedAttr,
   stripJsComments,
+  stripJsCode,
   truncateSnippet,
   isMediaTag,
   hasAttrName,
@@ -10,10 +11,15 @@ import {
   mediaTimeWindow,
   mediaWindowsOverlap,
 } from "../utils";
-import { validateColorGradingContract } from "@hyperframes/parsers/color-grading-contract";
+import {
+  COLOR_GRADING_SOURCE_TAGS,
+  COLOR_GROUP_TAG,
+  validateColorGradingContract,
+} from "@hyperframes/parsers/color-grading-contract";
 import { extractMediaSrcMutations } from "@hyperframes/parsers/composition";
 import { parseHTML } from "linkedom";
 import { findLinkedClipFindings } from "./linkedClips";
+import { findUnreadableAudioAttributeFindings } from "./audioAttributes";
 
 /**
  * Does the GSAP call that names `#id` also set `volume` in the same call?
@@ -60,6 +66,7 @@ const IMAGE_SRC_EXT = new Set([
   "heif",
   "tiff",
   "ico",
+  "avif",
 ]);
 const VIDEO_SRC_EXT = new Set([
   "mp4",
@@ -74,7 +81,7 @@ const VIDEO_SRC_EXT = new Set([
   "mpeg",
 ]);
 
-const AUDIO_SRC_EXT = new Set(["mp3", "wav", "aac", "flac", "opus", "aiff", "wma"]);
+const AUDIO_SRC_EXT = new Set(["mp3", "wav", "aac", "flac", "opus", "aiff", "wma", "m4a"]);
 
 type SrcKind = "image" | "video" | "audio";
 
@@ -230,6 +237,7 @@ function findImperativeMediaControlFindings(ctx: LintContext): HyperframeLintFin
   if (mediaTags.length === 0 || ctx.scripts.length === 0) return findings;
 
   for (const script of ctx.scripts) {
+    const code = stripJsCode(script.content);
     const mediaVars = new Map<string, string | undefined>();
     const assignmentPatterns = [
       {
@@ -249,6 +257,7 @@ function findImperativeMediaControlFindings(ctx: LintContext): HyperframeLintFin
     for (const { pattern, variableIndex, targetIndex } of assignmentPatterns) {
       let match: RegExpExecArray | null;
       while ((match = pattern.exec(script.content)) !== null) {
+        if (code[match.index] !== script.content[match.index]) continue;
         const variableName = match[variableIndex];
         const target = match[targetIndex];
         if (!variableName || !target) continue;
@@ -261,13 +270,13 @@ function findImperativeMediaControlFindings(ctx: LintContext): HyperframeLintFin
     const directIdPatterns = [
       {
         pattern:
-          /\b(?:document|window\.document)\.getElementById\(\s*["']([^"']+)["']\s*\)\.play\s*\(/g,
+          /\b(?:document|window\.document)\.getElementById\(\s*["']([^"']+)["']\s*\)\s*(?:\?\.|\.)\s*play\s*(?:\?\.\s*)?\(/g,
         kind: "play()",
         targetIndex: 1,
       },
       {
         pattern:
-          /\b(?:document|window\.document)\.getElementById\(\s*["']([^"']+)["']\s*\)\.pause\s*\(/g,
+          /\b(?:document|window\.document)\.getElementById\(\s*["']([^"']+)["']\s*\)\s*(?:\?\.|\.)\s*pause\s*(?:\?\.\s*)?\(/g,
         kind: "pause()",
         targetIndex: 1,
       },
@@ -285,13 +294,13 @@ function findImperativeMediaControlFindings(ctx: LintContext): HyperframeLintFin
       },
       {
         pattern:
-          /\b(?:document|window\.document)\.querySelector\(\s*(["'])([\s\S]*?)\1\s*\)\.play\s*\(/g,
+          /\b(?:document|window\.document)\.querySelector\(\s*(["'])([\s\S]*?)\1\s*\)\s*(?:\?\.|\.)\s*play\s*(?:\?\.\s*)?\(/g,
         kind: "play()",
         targetIndex: 2,
       },
       {
         pattern:
-          /\b(?:document|window\.document)\.querySelector\(\s*(["'])([\s\S]*?)\1\s*\)\.pause\s*\(/g,
+          /\b(?:document|window\.document)\.querySelector\(\s*(["'])([\s\S]*?)\1\s*\)\s*(?:\?\.|\.)\s*pause\s*(?:\?\.\s*)?\(/g,
         kind: "pause()",
         targetIndex: 2,
       },
@@ -312,6 +321,7 @@ function findImperativeMediaControlFindings(ctx: LintContext): HyperframeLintFin
     for (const { pattern, kind, targetIndex } of directIdPatterns) {
       let match: RegExpExecArray | null;
       while ((match = pattern.exec(script.content)) !== null) {
+        if (code[match.index] !== script.content[match.index]) continue;
         const target = match[targetIndex];
         if (!target) continue;
         const elementId = mediaIndex.ids.has(target)
@@ -335,8 +345,20 @@ function findImperativeMediaControlFindings(ctx: LintContext): HyperframeLintFin
     for (const [variableName, elementId] of mediaVars) {
       const escapedVar = escapeRegExp(variableName);
       const variablePatterns = [
-        { pattern: new RegExp(`\\b${escapedVar}\\.play\\s*\\(`, "g"), kind: "play()" },
-        { pattern: new RegExp(`\\b${escapedVar}\\.pause\\s*\\(`, "g"), kind: "pause()" },
+        {
+          pattern: new RegExp(
+            `\\b${escapedVar}\\s*(?:\\?\\.|\\.)\\s*play\\s*(?:\\?\\.\\s*)?\\(`,
+            "g",
+          ),
+          kind: "play()",
+        },
+        {
+          pattern: new RegExp(
+            `\\b${escapedVar}\\s*(?:\\?\\.|\\.)\\s*pause\\s*(?:\\?\\.\\s*)?\\(`,
+            "g",
+          ),
+          kind: "pause()",
+        },
         { pattern: new RegExp(`\\b${escapedVar}\\.currentTime\\s*=`, "g"), kind: "currentTime" },
         {
           pattern: new RegExp(`\\b${escapedVar}\\.muted\\s*=`, "g"),
@@ -346,6 +368,7 @@ function findImperativeMediaControlFindings(ctx: LintContext): HyperframeLintFin
       for (const { pattern, kind } of variablePatterns) {
         let match: RegExpExecArray | null;
         while ((match = pattern.exec(script.content)) !== null) {
+          if (code[match.index] !== script.content[match.index]) continue;
           findings.push({
             code: "imperative_media_control",
             severity: "error",
@@ -401,6 +424,66 @@ function findRuntimeMediaSrcMutationFindings(ctx: LintContext): HyperframeLintFi
     }
   }
   return findings;
+}
+
+// HTML5 void elements cannot contain children, so they can never be a parent
+// of a nested <video>. Skipping them avoids false positives where the linter
+// looks for `</img>` and never finds it.
+const VOID_ELEMENTS = new Set([
+  "area",
+  "base",
+  "br",
+  "col",
+  "embed",
+  "hr",
+  "img",
+  "input",
+  "link",
+  "meta",
+  "source",
+  "track",
+  "wbr",
+]);
+
+const literalCloseTag = (name: string) => new RegExp(`</${escapeRegExp(name)}>`, "gi");
+
+function innermostTimedWrapper(
+  source: string,
+  tags: OpenTag[],
+  media: OpenTag,
+): { name: string; id?: string; start: string; duration: string | null } | null {
+  let found: ReturnType<typeof innermostTimedWrapper> = null;
+  for (const parent of tags) {
+    if (parent.index >= media.index) break;
+    if (parent.name === "video" || parent.name === "audio" || VOID_ELEMENTS.has(parent.name))
+      continue;
+    // The composition root uses data-start as a playback anchor, not as a clip timer
+    if (readDecodedAttr(parent.raw, "data-composition-id")) continue;
+    const start = readAttr(parent.raw, "data-start");
+    if (!start) continue;
+    const events: Array<[at: number, delta: 1 | -1]> = [
+      ...tags
+        .filter((t) => t.name === parent.name && t.index > parent.index && t.index < media.index)
+        .map((t): [number, 1] => [t.index, 1]),
+      ...[
+        ...source.substring(parent.index, media.index).matchAll(literalCloseTag(parent.name)),
+      ].map((m): [number, -1] => [parent.index + m.index, -1]),
+    ];
+    let depth = 1;
+    for (const [, delta] of events.sort((x, y) => x[0] - y[0])) {
+      depth += delta;
+      if (depth === 0) break;
+    }
+    if (depth > 0) {
+      found = {
+        name: parent.name,
+        id: readAttr(parent.raw, "id") || undefined,
+        start,
+        duration: readAttr(parent.raw, "data-duration"),
+      };
+    }
+  }
+  return found;
 }
 
 export const mediaRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = [
@@ -477,11 +560,14 @@ export const mediaRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = 
           snippet: truncateSnippet(tag.raw),
         });
       };
-      if (tag.name !== "video" && tag.name !== "img") {
+      if (
+        tag.name !== COLOR_GROUP_TAG &&
+        !(COLOR_GRADING_SOURCE_TAGS as readonly string[]).includes(tag.name)
+      ) {
         report(
           "color_grading_non_media",
-          `data-color-grading on <${tag.name}> has no effect. The shader runtime only grades real <video> and <img> elements.`,
-          "Move the grading attribute to the real <video> or <img> media element. Do not attach it to a wrapper or CSS background.",
+          `data-color-grading on <${tag.name}> has no effect. The shader runtime only grades real <video>, <img> and <canvas> elements.`,
+          "Move the grading attribute to the real <video>, <img> or <canvas> element. Do not attach it to a wrapper or CSS background.",
         );
         continue;
       }
@@ -527,7 +613,7 @@ export const mediaRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = 
           message: `<video${elementId ? ` id="${elementId}"` : ""}> has data-start but declares neither muted nor data-has-audio. If the file has sound, add data-has-audio="true" (the sound stays on this clip). If it is silent, add muted.`,
           elementId,
           fixHint:
-            'Add data-has-audio="true" when the file has sound (recommended — keeps picture and sound on one clip), or add `muted` for silent footage.',
+            'Add data-has-audio="true" when the file has sound (recommended: it keeps picture and sound on one clip), or add `muted` for silent footage.',
           snippet: truncateSnippet(tag.raw),
         });
       }
@@ -550,59 +636,20 @@ export const mediaRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = 
   // video_nested_in_timed_element
   ({ source, tags }) => {
     const findings: HyperframeLintFinding[] = [];
-    // HTML5 void elements cannot contain children, so they can never be a
-    // parent of a nested <video>. Skipping them avoids false positives where
-    // the linter looks for `</img>` and never finds it.
-    const voidElements = new Set([
-      "area",
-      "base",
-      "br",
-      "col",
-      "embed",
-      "hr",
-      "img",
-      "input",
-      "link",
-      "meta",
-      "source",
-      "track",
-      "wbr",
-    ]);
-    const timedTagPositions: Array<{ name: string; start: number; id?: string }> = [];
-    for (const tag of tags) {
-      if (tag.name === "video" || tag.name === "audio") continue;
-      if (voidElements.has(tag.name)) continue;
-      // Skip the composition root — it uses data-start as a playback anchor, not as a clip timer
-      if (readDecodedAttr(tag.raw, "data-composition-id")) continue;
-      if (readAttr(tag.raw, "data-start")) {
-        timedTagPositions.push({
-          name: tag.name,
-          start: tag.index,
-          id: readAttr(tag.raw, "id") || undefined,
-        });
-      }
-    }
     for (const tag of tags) {
       if (tag.name !== "video") continue;
       if (!readAttr(tag.raw, "data-start")) continue;
-      for (const parent of timedTagPositions) {
-        if (parent.start < tag.index) {
-          const parentClosePattern = new RegExp(`</${parent.name}>`, "gi");
-          const between = source.substring(parent.start, tag.index);
-          if (!parentClosePattern.test(between)) {
-            findings.push({
-              code: "video_nested_in_timed_element",
-              severity: "error",
-              message: `<video> with data-start is nested inside <${parent.name}${parent.id ? ` id="${parent.id}"` : ""}> which also has data-start. The frame extractor resolves the video's start from its own data-start without the wrapper's offset, while visibility uses the wrapper's window, so the two disagree: the clip shows the wrong source frames and then disappears partway through its slot.`,
-              elementId: readAttr(tag.raw, "id") || undefined,
-              fixHint:
-                "Time the wrapper OR the video, never both: remove data-start from the wrapper (use it as a non-timed visual container), or move the <video> up to be a direct child of the stage.",
-              snippet: truncateSnippet(tag.raw),
-            });
-            break;
-          }
-        }
-      }
+      const parent = innermostTimedWrapper(source, tags, tag);
+      if (!parent) continue;
+      findings.push({
+        code: "video_nested_in_timed_element",
+        severity: "error",
+        message: `<video> with data-start is nested inside <${parent.name}${parent.id ? ` id="${parent.id}"` : ""}> which also has data-start. The frame extractor resolves the video's start from its own data-start without the wrapper's offset, while visibility uses the wrapper's window, so the two disagree: the clip shows the wrong source frames and then disappears partway through its slot.`,
+        elementId: readAttr(tag.raw, "id") || undefined,
+        fixHint:
+          "A <video> takes no timing from its wrapper: time the <video> and leave the wrapper untimed (remove its data-start; it only places or animates), or move the <video> up to be a direct child of the stage.",
+        snippet: truncateSnippet(tag.raw),
+      });
     }
     return findings;
   },
@@ -620,7 +667,7 @@ export const mediaRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = 
         severity: "error",
         message: `Self-closing <${tagName}/> is invalid HTML. The browser will leave the tag open, swallowing all subsequent elements as invisible fallback content. This makes compositions INVISIBLE.`,
         elementId,
-        fixHint: `Change <${tagName} .../> to <${tagName} ...></${tagName}> — media elements MUST have explicit closing tags.`,
+        fixHint: `Change <${tagName} .../> to <${tagName} ...></${tagName}>. Media elements MUST have explicit closing tags.`,
         snippet: truncateSnippet(scMatch[0]),
       });
     }
@@ -668,7 +715,7 @@ export const mediaRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = 
       findings.push({
         code: "base64_media_prohibited",
         severity: "error",
-        message: `Inline base64 audio/video detected (${(dataSize / 1024).toFixed(0)} KB)${isSuspicious ? " — likely fabricated data" : ""}. Base64 media is prohibited — it bloats file size and breaks rendering.`,
+        message: `Inline base64 audio/video detected (${(dataSize / 1024).toFixed(0)} KB)${isSuspicious ? ", likely fabricated data" : ""}. Base64 media is prohibited: it bloats file size and breaks rendering.`,
         fixHint:
           "Use a relative path (assets/music.mp3) or HTTPS URL for the audio/video src. Never embed media as base64.",
         snippet: truncateSnippet((b64Match[1] ?? "").slice(0, 80) + "..."),
@@ -678,7 +725,7 @@ export const mediaRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = 
   },
 
   // media_missing_data_start + media_missing_id + media_missing_src + media_preload_none
-  ({ tags }) => {
+  ({ source, tags }) => {
     const findings: HyperframeLintFinding[] = [];
     for (const tag of tags) {
       if (tag.name !== "video" && tag.name !== "audio") continue;
@@ -686,12 +733,15 @@ export const mediaRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = 
       const hasId = readAttr(tag.raw, "id");
       const hasSrc = mediaHasResolvableSrc(tag, tags);
       if (hasSrc && !hasDataStart) {
+        const wrapper = tag.name === "video" ? innermostTimedWrapper(source, tags, tag) : null;
         findings.push({
           code: "media_missing_data_start",
           severity: "error",
           message: `<${tag.name}${hasId ? ` id="${hasId}"` : ""}> has src but no data-start. HyperFrames cannot own playback for untimed media, so preview and render behavior can diverge.`,
           elementId: hasId || undefined,
-          fixHint: `Add data-start="0" (or the intended start time) and data-duration if the clip should stop before the source ends.`,
+          fixHint: wrapper
+            ? `This <${tag.name}> sits inside the timed <${wrapper.name}${wrapper.id ? ` id="${wrapper.id}"` : ""}> (data-start="${wrapper.start}") and takes no timing from it, so without its own data-start it plays from composition time 0, and a data-start on it would clash with the wrapper's. Move the <${tag.name}> out as a direct child of the stage and give it that wrapper's data-start="${wrapper.start}"${wrapper.duration ? ` and data-duration="${wrapper.duration}"` : ""}.`
+            : `Add data-start="0" (or the intended start time) and data-duration if the clip should stop before the source ends.`,
           snippet: truncateSnippet(tag.raw),
         });
       }
@@ -699,7 +749,7 @@ export const mediaRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = 
         findings.push({
           code: "media_missing_id",
           severity: "error",
-          message: `<${tag.name}> has data-start but no id attribute. The renderer requires id to discover media elements — this ${tag.name === "audio" ? "audio will be SILENT" : "video will be FROZEN"} in renders.`,
+          message: `<${tag.name}> has data-start but no id attribute. The renderer requires id to discover media elements, so this ${tag.name === "audio" ? "audio will be SILENT" : "video will be FROZEN"} in renders.`,
           fixHint: `Add a unique id attribute: <${tag.name} id="my-${tag.name}" ...>`,
           snippet: truncateSnippet(tag.raw),
         });
@@ -761,7 +811,7 @@ export const mediaRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = 
       findings.push({
         code: "media_crossorigin_breaks_preview",
         severity: "error",
-        message: `<${tag.name}${elementId ? ` id="${elementId}"` : ""}> has crossorigin, which forces a CORS-checked fetch. If the media host omits Access-Control-Allow-Origin, the load silently fails in Studio preview (media shows BLANK/black) while server-side renders still work — hiding the bug.`,
+        message: `<${tag.name}${elementId ? ` id="${elementId}"` : ""}> has crossorigin, which forces a CORS-checked fetch. If the media host omits Access-Control-Allow-Origin, the load silently fails in Studio preview (media shows BLANK/black) while server-side renders still work, which hides the bug.`,
         elementId,
         fixHint:
           "Remove the crossorigin attribute unless you read the media back via canvas/WebGL/WebAudio AND the host is known to send CORS headers. Plain displayed media never needs it.",
@@ -786,7 +836,8 @@ export const mediaRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = 
       const source = { id: readAttr(tag.raw, "id") || undefined, raw: tag.raw };
       if (tag.name === "video") {
         if (isAudibleVideoTag(tag.raw)) videos.push([src, source]);
-      } else if (tag.name === "audio") {
+      } else if (tag.name === "audio" && readAttr(tag.raw, "data-timeline-role") !== "room-tone") {
+        // A room tone plays another stretch of the file under the video's own sound to bridge a cut: it is meant.
         audios.push([src, source]);
       }
     }
@@ -802,7 +853,7 @@ export const mediaRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = 
       findings.push({
         code: "video_audio_double_source",
         severity: "error",
-        message: `<audio${audioInfo.id ? ` id="${audioInfo.id}"` : ""}> and <video${videoInfo.id ? ` id="${videoInfo.id}"` : ""}> both point to the same source at the same time. The unmuted video already provides audio — the duplicate <audio> will cause double playback and echo.`,
+        message: `<audio${audioInfo.id ? ` id="${audioInfo.id}"` : ""}> and <video${videoInfo.id ? ` id="${videoInfo.id}"` : ""}> both point to the same source at the same time. The unmuted video already provides audio, so the duplicate <audio> will cause double playback and echo.`,
         elementId: audioInfo.id,
         fixHint:
           "Remove the <audio> element and let the video carry its own sound (recommended), or mute the video (add `muted`) and keep the separate <audio> when picture and sound must be cut independently.",
@@ -832,7 +883,11 @@ export const mediaRules: Array<(ctx: LintContext) => HyperframeLintFinding[]> = 
 
   // audio_group_carve_attr
   findAudioGroupCarveAttrFindings,
+
+  // audio_group_holds_elements
+  findAudioGroupHoldsElementsFindings,
   findLinkedClipFindings,
+  findUnreadableAudioAttributeFindings,
 ];
 
 /**
@@ -855,7 +910,7 @@ function findVolumeTweenOverridesGainFindings(ctx: LintContext): HyperframeLintF
     // the case it exists to bless.
     .map((tag) => ({ tag, volume: Number(readAttr(tag.raw, "data-volume") ?? "1") }))
     .filter((entry) => Number.isFinite(entry.volume) && entry.volume !== 1)
-    // A lane already has its own rule, and it wins over both of these.
+    // A lane silences the tween (its own rule says so) and scales by data-volume.
     .filter((entry) => !readDecodedAttr(entry.tag.raw, "data-automation"))
     .map((entry) => ({ ...entry, id: readAttr(entry.tag.raw, "id") }))
     .filter((entry): entry is typeof entry & { id: string } => Boolean(entry.id));
@@ -869,7 +924,7 @@ function findVolumeTweenOverridesGainFindings(ctx: LintContext): HyperframeLintF
     findings.push({
       code: "audio_volume_tween_overrides_gain",
       severity: "warning",
-      message: `#${id} has data-volume="${volume}" (${db}) and a GSAP tween on \`volume\`. Tween values are absolute — they REPLACE this gain rather than scale it — so wherever the tween names a value the clip plays at that value, not at ${db}.`,
+      message: `#${id} has data-volume="${volume}" (${db}) and a GSAP tween on \`volume\`. Tween values are absolute: they REPLACE this gain rather than scale it, so wherever the tween names a value the clip plays at that value, not at ${db}.`,
       elementId: id,
       fixHint:
         "Write the tween's targets in the same absolute gain (e.g. `volume: 1.95`, not `volume: 1`), or reset data-volume to 1 and let the tween carry the level on its own.",
@@ -914,7 +969,7 @@ function findVolumeDoubleAutomationFindings(ctx: LintContext): HyperframeLintFin
     findings.push({
       code: "audio_volume_double_automation",
       severity: "warning",
-      message: `#${id} has both a volume automation lane and a GSAP tween on \`volume\`. The lane wins — the tween is ignored in preview and in the render.`,
+      message: `#${id} has both a volume automation lane and a GSAP tween on \`volume\`. The lane wins, and the tween is ignored in preview and in the render.`,
       elementId: id,
       fixHint:
         "Keep one of them: delete the volume lane to go back to tweening, or drop the tween and shape the level in the automation lane.",
@@ -980,7 +1035,7 @@ function findCarveUngroupedSourcesFindings(ctx: LintContext): HyperframeLintFind
       message: `${elementId ? `#${elementId}'s` : "This"} carve names ${clipIds.length} voice clips directly (${clipIds.join(", ")}) instead of a group.`,
       elementId,
       fixHint:
-        "Group the voice clips and carve against the group — a hand-rolled clip list silently rots when a clip is added.",
+        "Group the voice clips and carve against the group. A hand-rolled clip list silently rots when a clip is added.",
       snippet: truncateSnippet(tag.raw),
     });
   }
@@ -1086,10 +1141,38 @@ function findAudioGroupTimingAttrFindings(ctx: LintContext): HyperframeLintFindi
     findings.push({
       code: "audio_group_timing_attrs",
       severity: "warning",
-      message: `${elementId ? `#${elementId}` : "This audio group"} carries ${present.map((attr) => `\`${attr}\``).join(", ")}, which a bus has no use for — its members carry the timing and its automation clock is composition time.`,
+      message: `${elementId ? `#${elementId}` : "This audio group"} carries ${present.map((attr) => `\`${attr}\``).join(", ")}, which a bus has no use for: its members carry the timing and its automation clock is composition time.`,
       elementId,
       fixHint: `Remove ${present.map((attr) => `\`${attr}\``).join(", ")} from the group element.`,
       snippet: truncateSnippet(tag.raw),
+    });
+  }
+  return findings;
+}
+
+/** A bus holds nothing; a self-closed `<hf-audio-group />` stays open in HTML and takes in every later sibling. */
+function findAudioGroupHoldsElementsFindings(ctx: LintContext): HyperframeLintFinding[] {
+  const findings: HyperframeLintFinding[] = [];
+  for (const group of ctx.tags) {
+    if (group.name !== "hf-audio-group") continue;
+    const end = group.closeIndex ?? Number.POSITIVE_INFINITY;
+    const held = ctx.tags.filter((tag) => tag.index > group.index && tag.index < end);
+    if (held.length === 0) continue;
+    const elementId = readAttr(group.raw, "id") || undefined;
+    const first = readAttr(held[0]!.raw, "id");
+    findings.push({
+      code: "audio_group_holds_elements",
+      severity: "warning",
+      message:
+        `${elementId ? `#${elementId}` : "This audio group"} holds ${held.length} element(s), ` +
+        `starting with <${held[0]!.name}${first ? `#${first}` : ""}>. Being inside it routes no audio ` +
+        "through the bus (only `data-audio-group` does), and while the group has `data-hidden` they are " +
+        "hidden and silenced in preview and render.",
+      elementId,
+      fixHint:
+        "Close the group with `</hf-audio-group>` right after its opening tag (`/>` does not close a custom " +
+        "element), and give clips meant for this bus `data-audio-group`.",
+      snippet: truncateSnippet(group.raw),
     });
   }
   return findings;
@@ -1117,7 +1200,7 @@ function findAudioGroupCarveAttrFindings(ctx: LintContext): HyperframeLintFindin
     findings.push({
       code: "audio_group_carve_attr",
       severity: "warning",
-      message: `${elementId ? `#${elementId}` : "This audio group"} carries \`data-fx-carve\`, which belongs on the clip being carved — a bus has no audio of its own to level-match against, and a carve here stacks with any its members already have.`,
+      message: `${elementId ? `#${elementId}` : "This audio group"} carries \`data-fx-carve\`, which belongs on the clip being carved. A bus has no audio of its own to level-match against, and a carve here stacks with any its members already have.`,
       elementId,
       fixHint:
         "Remove `data-fx-carve` and the `fromCarve` nodes it wrote into this bus's `data-fx-chain`, and carve the bed clip instead.",

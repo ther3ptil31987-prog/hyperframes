@@ -2,6 +2,13 @@
 // audio's project-relative path. Lives under `beats/` in the project so it
 // survives the audio being removed and re-added.
 
+import {
+  decodeAuthoredAttribute,
+  decodedUrlPath,
+  scanHtmlOpeningTags,
+  type HtmlOpeningTagSpan,
+} from "@hyperframes/parsers";
+
 interface BeatFileData {
   version: 1;
   audio: string;
@@ -25,15 +32,15 @@ export function audioRelPathForSrc(src: string | null | undefined): string | nul
     const queryOrHash = after.search(/[?#]/);
     if (queryOrHash !== -1) after = after.slice(0, queryOrHash);
     if (after.startsWith("comp/")) after = after.slice("comp/".length);
-    rel = after ? decodeURIComponent(after) : null;
+    rel = after ? decodedUrlPath(after) : null;
   }
   if (!rel) {
     // Fall back to the FULL pathname (not just basename) so two files with the
     // same name in different folders don't collide on one beat file.
     try {
-      rel = decodeURIComponent(new URL(src, "http://_").pathname);
+      rel = decodedUrlPath(new URL(src, "http://_").pathname);
     } catch {
-      rel = src;
+      rel = decodedUrlPath(src);
     }
   }
   if (!rel) return null;
@@ -82,14 +89,20 @@ export function parseBeats(content: string): { times: number[]; strengths: numbe
 
 const MUSIC_ID_RE = /\b(music|bgm|soundtrack|background[-_]?music)\b/i;
 
-function attr(tag: string, name: string): string | null {
-  const m = tag.match(new RegExp(`\\b${name}\\s*=\\s*["']([^"']*)["']`, "i"));
-  return m ? m[1]! : null;
+function attr(tag: HtmlOpeningTagSpan, name: string): string | null {
+  const attribute = tag.attributes.find((value) => value.name === name);
+  return attribute?.kind === "value" ? decodeAuthoredAttribute(attribute.value) : null;
 }
 
-function isSoundingVideoTag(tag: string): boolean {
-  const unquoted = tag.replace(/"[^"]*"|'[^']*'/g, '""');
-  return attr(tag, "data-has-audio") === "true" && !/\smuted(?=[\s/>=])/i.test(unquoted);
+function isSoundingVideoTag(tag: HtmlOpeningTagSpan): boolean {
+  return (
+    attr(tag, "data-has-audio") === "true" &&
+    !tag.attributes.some((attribute) => attribute.name === "muted")
+  );
+}
+
+function isMusicSourceTag(tag: HtmlOpeningTagSpan): boolean {
+  return tag.closed && (tag.name === "audio" || (tag.name === "video" && isSoundingVideoTag(tag)));
 }
 
 /**
@@ -98,14 +111,11 @@ function isSoundingVideoTag(tag: string): boolean {
  * the FIRST `<audio>`, or `<video data-has-audio="true">` without `muted` (in
  * document order) where data-timeline-role="music", or —
  * when no role is set — whose id matches the music regex. An explicit non-music
- * role excludes the element. Returns the raw src attribute, or null.
+ * role excludes the element. Returns the decoded src attribute, or null.
  */
 export function findMusicAudioSrc(html: string): string | null {
-  // `[^>]*` spans newlines (it's a negated class, not `.`), so multi-line opening
-  // tags are handled. HyperFrames authors src as an attribute on <audio>.
-  const tags = html.match(/<(?:audio|video)\b[^>]*>/gi) ?? [];
-  for (const tag of tags) {
-    if (/^<video/i.test(tag) && !isSoundingVideoTag(tag)) continue;
+  for (const tag of scanHtmlOpeningTags(html)) {
+    if (!isMusicSourceTag(tag)) continue;
     const src = attr(tag, "src");
     if (!src) continue;
     const role = attr(tag, "data-timeline-role");

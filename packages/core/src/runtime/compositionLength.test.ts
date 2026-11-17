@@ -2,8 +2,11 @@ import { describe, expect, it, vi } from "vitest";
 import { parseHTMLContent } from "../compiler/htmlDocument";
 import {
   findRootCompositionElement,
+  LOOP_INFLATED_TIMELINE_SECONDS,
   MIN_VALID_TIMELINE_DURATION_SECONDS,
+  longestMediaWindow,
   readStaticCompositionMeta,
+  resolveCompositionLength,
   resolveCompositionLengthSeconds,
   resolveContentDerivedDuration,
   resolveMediaWindowDurationSeconds,
@@ -18,6 +21,20 @@ describe("resolveCompositionLengthSeconds", () => {
     fallback: 0,
     derived: () => 0,
   };
+
+  it("says which input set the length", () => {
+    expect(resolveCompositionLength({ ...base, declared: 9 }).from).toBe("declared");
+    expect(resolveCompositionLength({ ...base, timeline: () => 10, floors: () => [4] }).from).toBe(
+      "timeline",
+    );
+    expect(resolveCompositionLength({ ...base, floors: () => [null, 7] })).toEqual({
+      seconds: 7,
+      from: "floor",
+      floorIndex: 1,
+    });
+    expect(resolveCompositionLength({ ...base, fallback: 5 }).from).toBe("fallback");
+    expect(resolveCompositionLength({ ...base, derived: () => 2 }).from).toBe("derived");
+  });
 
   it("takes a declared length and reads nothing else", () => {
     const timeline = vi.fn(() => 10);
@@ -53,6 +70,25 @@ describe("resolveCompositionLengthSeconds", () => {
     expect(
       resolveCompositionLengthSeconds({ ...base, timeline: () => oneFrame, derived: () => 2 }),
     ).toBe(2);
+  });
+
+  it("plays to the sub-composition floor, not a repeat:-1 timeline's 1e10 s", () => {
+    const endless = () => 1e10 + 2;
+    expect(resolveCompositionLengthSeconds({ ...base, timeline: endless, floors: () => [6] })).toBe(
+      6,
+    );
+    expect(resolveCompositionLengthSeconds({ ...base, timeline: endless, fallback: 5 })).toBe(5);
+  });
+
+  it("treats a timeline as loop-inflated from LOOP_INFLATED_TIMELINE_SECONDS on", () => {
+    const at = (seconds: number) =>
+      resolveCompositionLengthSeconds({ ...base, timeline: () => seconds, floors: () => [6] });
+    expect(at(LOOP_INFLATED_TIMELINE_SECONDS)).toBe(6);
+    expect(at(LOOP_INFLATED_TIMELINE_SECONDS - 1)).toBe(LOOP_INFLATED_TIMELINE_SECONDS - 1);
+  });
+
+  it("keeps a repeat:-1 timeline's length when nothing else gives one", () => {
+    expect(resolveCompositionLengthSeconds({ ...base, timeline: () => 1e10 })).toBe(1e10);
   });
 
   it("derives the length only when nothing else gives one", () => {
@@ -125,6 +161,34 @@ describe("rules moved unchanged from the runtime", () => {
       `<div data-composition-id="main"><div data-composition-id="scene" data-start="1" data-duration="2">` +
       `<div data-composition-id="inner" data-start="0" data-duration="50"></div></div></div>`;
     expect(readStaticCompositionMeta(parseHTMLContent(html))?.durationSeconds).toBe(3);
+  });
+
+  it("names the clip missing its trim when its full media length sets the film's length", () => {
+    const doc = parseHTMLContent(
+      `<div data-composition-id="main">` +
+        `<video id="cut" data-start="0" data-duration="3" src="cut.mp4"></video>` +
+        `<video id="source" data-start="2" src="full-source.mp4"></video></div>`,
+    );
+    const natural: Record<string, number> = { cut: 3600, source: 5400 };
+    const media = {
+      mediaStart: (el: HTMLMediaElement) => Number(el.getAttribute("data-start")),
+      mediaDuration: (el: HTMLMediaElement) =>
+        el.hasAttribute("data-duration")
+          ? Number(el.getAttribute("data-duration"))
+          : natural[el.id]!,
+    };
+    const longest = longestMediaWindow(doc, media);
+    expect(longest?.element.id).toBe("source");
+    expect(longest?.seconds).toBe(5402);
+    expect(
+      resolveCompositionLength({
+        declared: null,
+        timeline: () => 3,
+        floors: () => [longest?.seconds ?? null, 3],
+        fallback: 0,
+        derived: () => 0,
+      }),
+    ).toEqual({ seconds: 5402, from: "floor", floorIndex: 0 });
   });
 
   it("skips a media clip of one frame or less", () => {

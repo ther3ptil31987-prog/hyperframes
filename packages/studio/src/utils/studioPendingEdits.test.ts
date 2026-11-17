@@ -1,18 +1,46 @@
 // @vitest-environment jsdom
 import { describe, expect, it, vi } from "vitest";
 import {
+  setStudioPendingEditsSettled,
   addStudioPendingEditFlushListener,
   adoptingStudioPendingEdit,
   beginStudioPendingEdit,
   flushStudioPendingEdits,
+  afterStudioPendingEdits,
   hasStudioPendingEdits,
   isStudioEditSaving,
   paintBackNewestStudioPendingEdit,
+  setStudioWaitingPressCancel,
   trackStudioPendingEdit,
   trackedStudioEdit,
 } from "./studioPendingEdits";
 import { StudioFileConflictError } from "./studioSaveDiagnostics";
 import { revertNewestStudioPendingEdit as hostRevert } from "../index";
+
+describe("a canvas press still waiting to run", () => {
+  it("is not what a host's revert takes back, since the host steps history after it", () => {
+    const cancel = vi.fn(() => true);
+    setStudioWaitingPressCancel(cancel);
+    try {
+      expect(hostRevert()).toBeNull();
+      expect(cancel).not.toHaveBeenCalled();
+    } finally {
+      setStudioWaitingPressCancel(null);
+    }
+  });
+
+  it("is never a pending edit, since a reload waits for those and the press waits for the reload", () => {
+    setStudioWaitingPressCancel(() => true);
+    const reload = vi.fn();
+    try {
+      afterStudioPendingEdits(reload);
+      expect(reload).toHaveBeenCalledOnce();
+      expect(hasStudioPendingEdits()).toBe(false);
+    } finally {
+      setStudioWaitingPressCancel(null);
+    }
+  });
+});
 
 describe("studio pending edit flush", () => {
   it("waits for mounted panels to persist pending local edits", async () => {
@@ -486,4 +514,23 @@ it("counts an edit whose later write failed as saved once an earlier write lande
   edit.settle(committed.catch(() => undefined));
   const shown = paintBackNewestStudioPendingEdit()!;
   await expect(shown.landed()).resolves.toBe(true);
+});
+
+describe("every pending edit settled", () => {
+  it("is told once, when the last of two overlapping edits settles", async () => {
+    const told = vi.fn();
+    setStudioPendingEditsSettled(told);
+    try {
+      const first = beginStudioPendingEdit(null);
+      const second = beginStudioPendingEdit(null);
+      first.settle();
+      await Promise.resolve();
+      await Promise.resolve();
+      expect(told).not.toHaveBeenCalled();
+      second.settle();
+      await vi.waitFor(() => expect(told).toHaveBeenCalledOnce());
+    } finally {
+      setStudioPendingEditsSettled(null);
+    }
+  });
 });

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { defaultAudioFxParams, HF_AUDIO_FX } from "./audioFx.js";
+import { defaultAudioFxParams, getAudioFxDef, HF_AUDIO_FX } from "./audioFx.js";
 import { HF_AUDIO_FX_PRESETS } from "./audioFxPresets.js";
 import { audioBandAt, BANDS, EFFECT_COPY, PRESET_PROBLEM, SUMMARY } from "./audioFxCopy.js";
 
@@ -172,5 +172,50 @@ describe("no copy assumes the track is a voice", () => {
     const voiced = Object.entries(PRESET_PROBLEM).filter(([id]) => VOICE_PRESETS.has(id));
     expect(voiced.length).toBeGreaterThan(0);
     expect(voiced.some(([, text]) => SPEECH.test(text))).toBe(true);
+  });
+});
+
+/** Everything Studio shows for the true-peak limiter, and the ceiling knob's hint. */
+function truePeakCopy(): { shown: string; hint: string } {
+  const copy = EFFECT_COPY.truepeak;
+  const ceiling = copy?.params.ceiling;
+  const summary = SUMMARY.truepeak;
+  if (!copy || !ceiling?.hint || !summary) throw new Error("truepeak copy is missing");
+  const shown = [copy.does, copy.reachFor, ceiling.label, ceiling.hint, summary({})];
+  return { shown: shown.join("\n"), hint: ceiling.hint };
+}
+
+describe("the true-peak copy does not promise a hard ceiling", () => {
+  it("never says never or must-not-clip", () => {
+    expect(truePeakCopy().shown).not.toMatch(/never exceed|must not clip|never above|guarantee/i);
+  });
+
+  it("tells the author about the 4x estimate and the headroom to leave", () => {
+    const { hint } = truePeakCopy();
+    expect(hint).toMatch(/4x/);
+    expect(hint).toMatch(/1\.7 dB/);
+    expect(hint).toMatch(/headroom/);
+  });
+});
+
+describe("the plain limiter copy does not promise a hard ceiling", () => {
+  // The limiter follows the signal's level with no lookahead, and Level after is applied past
+  // the ceiling, so a fast or inter-sample peak can end above it.
+  it("says nothing about never clipping or nothing getting past", () => {
+    const copy = EFFECT_COPY.limiter;
+    const summary = SUMMARY.limiter;
+    const description = getAudioFxDef("limiter")?.description;
+    if (!copy || !summary || !description) throw new Error("limiter copy is missing");
+    const shown = [
+      description,
+      copy.does,
+      copy.reachFor,
+      copy.params.limit?.label,
+      summary({}),
+    ].join("\n");
+    expect(shown).not.toMatch(
+      /never|nothing|guarantee|hard ceiling|no louder|must not|cannot exceed/i,
+    );
+    expect(shown).toMatch(/can (still )?(get )?pass|get past/i);
   });
 });

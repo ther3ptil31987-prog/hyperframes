@@ -3,7 +3,7 @@ import type { KnipConfig } from "knip";
 const config: KnipConfig = {
   workspaces: {
     "packages/cli": {
-      entry: ["src/cli.ts"],
+      entry: ["src/cli.ts", "src/api.ts"],
     },
     "packages/core": {
       entry: ["src/index.ts", "src/lint/index.ts", "src/compiler/index.ts"],

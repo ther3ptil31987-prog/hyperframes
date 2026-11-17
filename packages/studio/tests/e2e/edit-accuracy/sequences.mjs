@@ -2,6 +2,7 @@
 import { watch } from "node:fs";
 import { dirname, join } from "node:path";
 import { COMPOSITION, PLAYHEAD } from "./grid.mjs";
+import { hashOf, traceBench } from "./trace.mjs";
 import { centre, dist, percentile, quadDistance } from "./geometry.mjs";
 import {
   VIEWPORT,
@@ -10,6 +11,7 @@ import {
   chord,
   controlDrag,
   measure,
+  measureShown,
   nextFrame,
   openStudio,
   pointerGesture,
@@ -19,6 +21,7 @@ import {
   selectTarget,
   settled,
   saveFault,
+  seekTo,
   sleep,
   smoothness,
   timedWrite,
@@ -107,12 +110,78 @@ export function watchVersions(dir, files) {
   const versions = [readFiles(dir, files)];
   const record = () => {
     const now = readFiles(dir, files);
-    if (!sameFiles(now, versions.at(-1))) versions.push(now);
+    if (!sameFiles(now, versions.at(-1))) {
+      versions.push(now);
+      traceBench("version", { n: versions.length - 1, hash: hashOf(JSON.stringify(now)) });
+    }
   };
   const watchers = [...new Set(files.map((f) => dirname(join(dir, f))))].map((d) =>
     watch(d, record),
   );
   return { versions, stop: () => watchers.forEach((w) => w.close()) };
+}
+
+/** Studio's own history replies in arrival order: each claim's group, each undo or redo's entry and what it reverts. */
+function watchHistory(page) {
+  const replies = [];
+  const at = { list: null };
+  const read = (response) => {
+    const kind = /\/history\/(claim|step|undo)$/.exec(new URL(response.url()).pathname)?.[1];
+    if (!kind || response.request().method() !== "POST") return;
+    at.list ??= response.url().replace(/\/(claim|step|undo)$/, "");
+    const status = response.status();
+    replies.push(
+      response
+        .json()
+        .catch(() => null)
+        // fallow-ignore-next-line complexity
+        .then((body) =>
+          kind === "claim"
+            ? { claim: body?.claimed?.id ?? null, status, readable: Boolean(body) }
+            : { id: body?.entry?.id ?? null, undoes: body?.entry?.undoes ?? null, status },
+        ),
+    );
+  };
+  page.on("response", read);
+  return { replies, at, stop: () => page.off("response", read) };
+}
+
+/** Whether every group the gestures took is already an entry in the history list, polled for `ms`. */
+async function groupsListed(listUrl, ids, ms = 3000) {
+  if (!listUrl || !ids.length) return null;
+  for (const deadline = Date.now() + ms; ; await sleep(100)) {
+    const view = await fetch(listUrl)
+      .then((r) => r.json())
+      .catch(() => null);
+    const listed = new Set((view?.entries ?? []).map((entry) => entry.id));
+    if (ids.every((id) => listed.has(id))) return true;
+    if (Date.now() > deadline) return false;
+  }
+}
+
+/** The groups left to undo, oldest first: a claim opens one unless it names the newest (one gesture writing
+ * twice), an undo must revert the newest. Anything else is a fault: one gesture, one group, one undo. */
+// fallow-ignore-next-line complexity
+export function historyGroups(replies) {
+  const [stack, faults] = [[], []];
+  for (const r of replies) {
+    if (r.status !== 200 || r.readable === false) faults.push(`history reply ${r.status}`);
+    else if ("claim" in r) {
+      if (r.claim && r.claim !== stack.at(-1)) stack.push(r.claim);
+    } else if (r.undoes && r.undoes === stack.at(-1)) stack.pop();
+    else faults.push(`undid ${r.undoes}, not the newest group ${stack.at(-1)}`);
+  }
+  if (new Set(stack).size !== stack.length) faults.push("two gestures share a group");
+  return { stack, faults };
+}
+
+/** The first undo or redo reply after `seen`, or null when none arrives. */
+async function steppedAfter(history, seen) {
+  for (const deadline = Date.now() + 5000; Date.now() < deadline; await sleep(20)) {
+    const found = (await Promise.all(history.replies.slice(seen))).find((r) => "undoes" in r);
+    if (found) return found;
+  }
+  return null;
 }
 
 function mergeSmooth(parts) {
@@ -136,17 +205,27 @@ function mergeSmooth(parts) {
 export const slowest = (writes = []) =>
   writes.length ? Math.max(...writes.map((w) => w.ms ?? 0)) : null;
 
-/** Undo (or redo) once per entry, each landing on that entry's file; stops at the first write that never lands. */
+/**
+ * Undo (or redo) once per entry: its reply must revert the entry's group and, where the entry knows its
+ * bytes, its write must land on them. Stops at the first write that never lands.
+ */
 // fallow-ignore-next-line complexity
-async function walk(ctx, keys, entries, current) {
-  const [landed, writes] = [[], []];
+async function walk(ctx, keys, entries, current, history) {
+  const [landed, writes, stepped] = [[], [], []];
   for (const want of entries) {
     await blurPreview(ctx.page);
-    const since = Date.now();
+    const [since, seen] = [Date.now(), history.replies.length];
     await chord(ctx.page, keys);
     const w = await timedWrite(ctx, current, since);
+    const step = w.reached ? await steppedAfter(history, seen) : null;
     writes.push(w);
-    landed.push(w.reached && Boolean(want) && sameFiles(w.files, want));
+    stepped.push(step?.id ?? null);
+    landed.push(
+      w.reached &&
+        Boolean(want.undoes) &&
+        step?.undoes === want.undoes &&
+        (!want.files || sameFiles(w.files, want.files)),
+    );
     current = w.files;
     if (!w.reached) break;
   }
@@ -154,6 +233,7 @@ async function walk(ctx, keys, entries, current) {
     ok: landed.length === entries.length && landed.every(Boolean),
     landed,
     writes,
+    stepped,
     current,
   };
 }
@@ -212,8 +292,13 @@ async function driveStep(ctx, step, state) {
   }
   const name = step.element ?? "A";
   const c = ctx[name];
-  // In flight: pressed where the last drag let go, without reading the preview first.
-  let pre = step.inFlight ? state.last.lastMeasure : await measure(c);
+  // In flight: pressed where the last drag let go, without reading the preview first. The waiting
+  // marker belongs to the selected element, so another element is read bare until it is selected.
+  let pre = step.inFlight
+    ? state.last.lastMeasure
+    : name === state.selected
+      ? (await measureShown(c)).m
+      : await measure(c);
   if (name !== state.selected) {
     await selectTarget(c, pre);
     state.selected = name;
@@ -360,19 +445,21 @@ const boxError = (state, m) =>
 export async function runSequence(args) {
   const drags = args.spec.steps.some((s) => s.do === "drag");
   const control = await controlDrag(args.browser, drags ? "move" : "nudge");
-  let watcher = null;
+  let [watcher, history] = [null, null];
   try {
     return await inStudio(args, (session) => {
       watcher = watchVersions(args.dir, args.files);
-      return measureSequence(args, session, control, watcher);
+      history = watchHistory(session.page);
+      return measureSequence(args, session, control, watcher, history);
     });
   } finally {
     watcher?.stop();
+    history?.stop();
   }
 }
 
 // fallow-ignore-next-line complexity
-async function measureSequence({ spec, dir, files, evidence }, session, control, watcher) {
+async function measureSequence({ spec, dir, files, evidence }, session, control, watcher, history) {
   const { page, pre, zoom, shoot, consoleErrors } = session;
   const ctx = { A: session.ctx, B: { ...session.ctx, handles: null, selector: "#other" } };
   const state = {
@@ -397,7 +484,14 @@ async function measureSequence({ spec, dir, files, evidence }, session, control,
   const collect = async () => {
     const open = steps.filter((s) => s.do === "drag" && !s.teleport);
     const windows = open.length ? await stopFrames(page) : [];
-    open.forEach((s, i) => (s.teleport = scoreTeleport(s.gesture, windows[i] ?? [])));
+    open.forEach((s, i) => {
+      const frames = windows[i] ?? [];
+      s.teleport = scoreTeleport(s.gesture, frames);
+      s.elementTeleport = scoreTeleport(
+        s.gesture,
+        frames.map((f) => ({ ...f, waitingQuad: undefined })),
+      ).max;
+    });
   };
   for (const step of spec.steps) {
     if (step.do !== "drag") await collect();
@@ -415,6 +509,14 @@ async function measureSequence({ spec, dir, files, evidence }, session, control,
     backSince = back ? (backSince ?? Date.now()) : null;
     if (backSince !== null && Date.now() - backSince >= UNDONE_QUIET_MS) break;
   }
+  await page.waitForFunction(
+    // Asked over each preview's editing port: a preview that cannot answer yet is not clear.
+    async () =>
+      !document.querySelector("[data-dom-edit-press-waiting]") &&
+      (await window.__editBenchFrames.matchesInPreviews("[data-hf-studio-manual-edit-gesture]")) ===
+        false,
+    { timeout: 20_000 },
+  );
   await waitForFiles(ctx.A, { timeout: 5000 });
   watcher.stop();
   const versions = watcher.versions;
@@ -427,28 +529,47 @@ async function measureSequence({ spec, dir, files, evidence }, session, control,
   const committedFiles = readFiles(dir, files);
   evidence.files = committedFiles;
 
-  // The undo stack the steps imply: each saving step pushes (before, after), an undo pops. A settled
-  // case knows where each step's saves ended, so one action is one undo even when it wrote twice.
+  // The groups the history took, against the steps: each gesture one group, each undo the newest.
+  const groups = historyGroups(await Promise.all(history.replies));
+  const ids = groups.stack.toReversed();
+  const groupsOk = !groups.faults.length && groups.stack.length === state.depth;
+  // Each gesture is its own entry in the list once its saves are in, before anything else happens.
+  const listed = await groupsListed(history.at.list, groups.stack);
+  // A settled case knows each step's bytes (its saves ended before the next step); a fast one only
+  // where all are undone and all redone, since one gesture may write more than once.
   const stack = [];
   let vi = 0;
   spec.steps.forEach((s, i) => {
-    if (!saves(s)) return;
-    const next = spec.settle ? steps[i].saves : vi + 1;
+    if (!spec.settle || !saves(s)) return;
     if (s.do === "undo") stack.pop();
-    else stack.push({ before: versions[vi], after: versions[next] });
-    vi = next;
+    else stack.push({ before: versions[vi], after: versions[steps[i].saves] });
+    vi = steps[i].saves;
   });
-  const undo = await walk(ctx.A, "Control+z", stack.map((e) => e.before).reverse(), committedFiles);
+  const last = (i) => i === state.depth - 1;
+  const undo = await walk(
+    ctx.A,
+    "Control+z",
+    Array.from({ length: state.depth }, (_, i) => ({
+      undoes: ids[i],
+      files: spec.settle ? stack.at(-1 - i).before : last(i) ? versions[0] : undefined,
+    })),
+    committedFiles,
+    history,
+  );
   // The file the steps should have left: the last surviving save's, or the original when all were undone.
-  const expected = stack.length ? stack.at(-1).after : versions[0];
+  const expected = spec.settle ? (stack.at(-1)?.after ?? versions[0]) : versions.at(-1);
   const undone = await settled(ctx.A);
   await shoot("undone");
   const redo = undo.ok
     ? await walk(
         ctx.A,
         "Control+Shift+z",
-        stack.map((e) => e.after),
+        undo.stepped.toReversed().map((undoes, i) => ({
+          undoes,
+          files: spec.settle ? stack[i].after : last(i) ? committedFiles : undefined,
+        })),
         undo.current,
+        history,
       )
     : { ok: false, landed: [] };
   const redone = undo.ok ? await settled(ctx.A) : null;
@@ -456,7 +577,9 @@ async function measureSequence({ spec, dir, files, evidence }, session, control,
   await waitForFiles(ctx.A, { timeout: 15_000 });
 
   await page.reload();
-  const reloaded = await openStudio(ctx.A);
+  // The reload opens at the case's playhead; the steps may have left it elsewhere.
+  const opened = await openStudio(ctx.A);
+  const reloaded = state.time === ctx.A.playhead ? opened : await seekTo(ctx.A, state.time);
   await shoot("reloaded");
   const shown = state.text && (await ctx.A.handles.target.evaluate((e) => e.textContent));
   const drags = steps.filter((s) => s.do === "drag");
@@ -505,8 +628,10 @@ async function measureSequence({ spec, dir, files, evidence }, session, control,
         text.shown &&
         (!text.select || (text.selection?.editing && text.selection.text.trim().length > 0)),
     },
-    reloaded,
+    reloaded: { ...reloaded, time: state.time },
     undo: {
+      groups: groupsOk,
+      listed,
       bytes: undo.ok && sameFiles(committedFiles, expected ?? {}),
       box: quadDistance(undone.visible, pre.visible),
       redoBytes: redo.ok,
@@ -527,6 +652,7 @@ async function measureSequence({ spec, dir, files, evidence }, session, control,
     })),
     diag: {
       saves: { seen: versions.length - 1, owed },
+      history: { ...groups, owed: state.depth, undid: undo.stepped ?? [] },
       undoWalk: undo.landed,
       redoWalk: redo.landed,
       traces: Object.fromEntries(

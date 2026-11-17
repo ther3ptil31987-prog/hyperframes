@@ -1,10 +1,18 @@
+import "./utils/hideChildConsoles.js";
+import "./utils/windowsExeSearch.js";
+import { readFile, rm } from "node:fs/promises";
 import { constants, setPriority } from "node:os";
+import { lintHyperframeHtml } from "@hyperframes/lint";
+import { runBrowserInstall } from "./browser/installRun.js";
 import { ensureBrowser, releaseOwnedBrowserInstallLock } from "./browser/manager.js";
 import { lintProject } from "./utils/lintProject.js";
 import { killOrphanedProcesses } from "./utils/orphanCleanup.js";
-import { installRenderSetupSignalHandlers } from "./renderSetupWorkerLifecycle.js";
+import {
+  installRenderSetupSignalHandlers,
+  renderSetupErrorLine,
+  renderSetupResultLine,
+} from "./renderSetupWorkerLifecycle.js";
 
-const RESULT_PREFIX = "HYPERFRAMES_RENDER_SETUP_RESULT:";
 const mode = process.argv[2];
 const input = JSON.parse(process.env.HYPERFRAMES_RENDER_SETUP_INPUT ?? "{}");
 
@@ -15,24 +23,53 @@ const disposeSignalHandlers = installRenderSetupSignalHandlers(
   process.env.HYPERFRAMES_RENDER_DETACHED !== "1",
 );
 
-let result: unknown;
-if (mode === "browser") {
-  result = await ensureBrowser(input);
-} else if (mode === "lint") {
-  // Nobody waits on a background lint the way they wait on a Studio boot, so it takes idle CPU only.
-  setPriority(constants.priority.PRIORITY_LOW);
-  result = await lintProject(
-    input.projectDir,
-    input.entryFile,
-    input.host ? { host: input.host } : undefined,
-  );
-} else if (mode === "orphan-cleanup") {
-  const killed = killOrphanedProcesses();
-  result = killed;
-  if (killed > 0) await new Promise((resolve) => setTimeout(resolve, 600));
-} else {
+const SANDBOX_REFUSED_PRIORITY = new Set(["EPERM", "EACCES"]);
+
+function setOwnPriority(priority: number, whatStaysNormal: string): void {
+  try {
+    setPriority(priority);
+  } catch (error) {
+    if (SANDBOX_REFUSED_PRIORITY.has((error as { info?: { code?: string } }).info?.code ?? ""))
+      return;
+    process.stderr.write(`${whatStaysNormal} at normal priority: ${(error as Error).message}\n`);
+  }
+}
+
+async function runMode(): Promise<unknown> {
+  if (mode === "browser") return ensureBrowser(input);
+  if (mode === "browser-install") {
+    setOwnPriority(constants.priority.PRIORITY_ABOVE_NORMAL, "The Chrome install runs");
+    return runBrowserInstall(input);
+  }
+  if (mode === "lint") {
+    // A background lint (Studio's, preview's) takes idle CPU only; a render waits on its lint, so that one does not.
+    if (input.background) setOwnPriority(constants.priority.PRIORITY_LOW, "Lint runs");
+    return lintProject(
+      input.projectDir,
+      input.entryFile,
+      input.host ? { host: input.host } : undefined,
+    );
+  }
+  if (mode === "lint-html") {
+    try {
+      return await lintHyperframeHtml(await readFile(input.htmlPath, "utf-8"), input.opts);
+    } finally {
+      await rm(input.htmlPath, { force: true });
+    }
+  }
+  if (mode === "orphan-cleanup") {
+    const killed = killOrphanedProcesses();
+    if (killed > 0) await new Promise((resolve) => setTimeout(resolve, 600));
+    return killed;
+  }
   throw new Error(`Unknown render setup mode: ${mode}`);
 }
 
-disposeSignalHandlers();
-process.stdout.write(RESULT_PREFIX + JSON.stringify(result) + "\n");
+try {
+  const result = await runMode().finally(disposeSignalHandlers);
+  process.stdout.write(renderSetupResultLine(result));
+} catch (error) {
+  process.stderr.write(renderSetupErrorLine(error), () => {
+    throw error;
+  });
+}

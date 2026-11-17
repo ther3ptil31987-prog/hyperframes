@@ -1,3 +1,5 @@
+import { PREVIEW_RASTER_ATTR } from "../studioPreviewMark";
+
 export const ROOT_CSS_STACKING_CONTEXT_ID = "css:root";
 
 const NON_NONE_STACKING_CONTEXT_PROPERTIES = [
@@ -67,6 +69,7 @@ function createsWillChangeStackingContext(style: CSSStyleDeclaration): boolean {
 }
 
 function createsCssStackingContext(element: HTMLElement, style: CSSStyleDeclaration): boolean {
+  if (element.hasAttribute(PREVIEW_RASTER_ATTR)) return true;
   if (createsPositionedStackingContext(style)) return true;
   if (createsZIndexedStackingContext(element, style)) return true;
   if (createsVisualEffectStackingContext(style)) return true;
@@ -90,7 +93,18 @@ function cssStackingContextPath(element: Element): string {
  * the leaf itself: an element that establishes a context still compares its own
  * z-index with siblings in its parent's context.
  */
-export function resolveCssStackingContextId(node: Element): string {
+export function resolveCssStackingContextId(
+  node: Element,
+  byParent?: Map<Element | null, string>,
+): string {
+  const known = byParent?.get(node.parentElement);
+  if (known !== undefined) return known;
+  const id = nearestCssStackingContextId(node);
+  byParent?.set(node.parentElement, id);
+  return id;
+}
+
+function nearestCssStackingContextId(node: Element): string {
   const win = node.ownerDocument.defaultView;
   if (!win) return ROOT_CSS_STACKING_CONTEXT_ID;
   let cursor = node.parentElement;

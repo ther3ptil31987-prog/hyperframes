@@ -3,17 +3,51 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 
-const publishState = vi.hoisted(() => ({ publish: vi.fn() }));
+const publishState = vi.hoisted(() => ({
+  publish: vi.fn(),
+  noticeRelease: null as string | null,
+  confirm: vi.fn(),
+}));
+
+vi.mock("../ui/prompts.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../ui/prompts.js")>()),
+  confirm: publishState.confirm,
+}));
+
+vi.mock("../utils/attendedTerminal.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof import("../utils/attendedTerminal.js")>()),
+  isUnattended: () => false,
+}));
 
 vi.mock("../utils/publishProject.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../utils/publishProject.js")>()),
   publishProjectArchive: publishState.publish,
 }));
 
+vi.mock("../share/publishTransition.js", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../share/publishTransition.js")>();
+  return {
+    ...actual,
+    checkPublishTransition: (args: { dir?: string; update?: string }) =>
+      actual.checkPublishTransition(args, publishState.noticeRelease),
+  };
+});
+
 import publishCommand, { examples, parseUpdateTarget } from "./publish.js";
-import { ensureProjectId } from "../utils/projectLink.js";
-import { writeStore } from "../auth/store.js";
+import { ensureProjectId, writeProjectLink, writeTeamProject } from "../utils/projectLink.js";
+import { writeStore as writeUnboundStore, type Credentials } from "../auth/store.js";
+import { oauthIdentity } from "../auth/config.js";
 import { consumeCommandResult } from "../utils/commandResult.js";
+
+async function writeStore(credentials: Credentials, path?: string): Promise<void> {
+  await writeUnboundStore(
+    {
+      ...credentials,
+      ...(credentials.oauth ? { oauth: { ...oauthIdentity(), ...credentials.oauth } } : {}),
+    },
+    path,
+  );
+}
 
 const VISIBLE_INDEX = `<html><body><div data-composition-id="main" data-width="1920" data-height="1080" data-start="0" data-duration="5"><div class="clip" data-start="0" data-duration="5">Visible</div></div></body></html>`;
 
@@ -106,7 +140,7 @@ describe("publish default-entry preflight", () => {
     const output = await runEntryMismatch("compositions/brand/index.html");
 
     expect(output).toContain("blank_root_with_standalone_composition");
-    expect(output).not.toContain("run with --lint-verbose for full output");
+    expect(output).not.toContain("for full output");
   });
 });
 
@@ -170,6 +204,71 @@ describe("publish visibility messaging", () => {
     expect(output).not.toContain("Private — authentication and access required");
   });
 
+  it("asks before updating an existing project named by the folder, without promising a private upload", async () => {
+    const project = mkdtempSync(join(tmpdir(), "hf-publish-existing-"));
+    const config = mkdtempSync(join(tmpdir(), "hf-publish-existing-config-"));
+    writeFileSync(join(project, "index.html"), VISIBLE_INDEX);
+    writeTeamProject(project, { projectId: "existing-\u001b[2Kproject" });
+    vi.stubEnv("HYPERFRAMES_CONFIG_DIR", config);
+    vi.stubEnv("HEYGEN_API_KEY", "");
+    vi.stubEnv("HYPERFRAMES_API_KEY", "");
+    publishState.publish.mockReset();
+    publishState.confirm.mockReset();
+    publishState.confirm.mockResolvedValue(false);
+    const prompt = (isPublic: boolean) =>
+      captureLog(() =>
+        publishCommand.run?.({ args: { dir: project, public: isPublic, proxy: false } } as never),
+      );
+    try {
+      await writeStore({ oauth: { access_token: "token" } }, join(config, "credentials"));
+      const output = await prompt(false);
+      expect(output).toContain(
+        "If you can access project existing-?[2Kproject, this updates it in place and keeps its current visibility, which may be public. Otherwise it creates a new private project.",
+      );
+      expect(output).not.toContain("privately");
+      expect(output).toContain("Aborted.");
+      const publicOutput = await prompt(true);
+      expect(publicOutput).toContain("requests public visibility");
+      expect(publicOutput).toContain(
+        "If you can access project existing-?[2Kproject, this updates it in place. Otherwise it creates a new public project.",
+      );
+      await writeStore({ api_key: "valid-key" }, join(config, "credentials"));
+      const signedOut = await prompt(false);
+      expect(signedOut).toContain("uploads this project privately");
+      expect(signedOut).not.toContain("existing-");
+      expect(publishState.publish).not.toHaveBeenCalled();
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(project, { recursive: true, force: true });
+      rmSync(config, { recursive: true, force: true });
+    }
+  });
+
+  it("refuses --update without a login before asking", async () => {
+    const project = mkdtempSync(join(tmpdir(), "hf-publish-update-signed-out-"));
+    const config = mkdtempSync(join(tmpdir(), "hf-publish-update-signed-out-config-"));
+    writeFileSync(join(project, "index.html"), VISIBLE_INDEX);
+    vi.stubEnv("HYPERFRAMES_CONFIG_DIR", config);
+    vi.stubEnv("HEYGEN_API_KEY", "");
+    vi.stubEnv("HYPERFRAMES_API_KEY", "");
+    publishState.confirm.mockReset();
+    try {
+      consumeCommandResult();
+      const output = await captureLog(() =>
+        publishCommand.run?.({
+          args: { dir: project, public: false, proxy: false, update: "target" },
+        } as never),
+      );
+      expect(output).toContain("--update requires authentication");
+      expect(publishState.confirm).not.toHaveBeenCalled();
+      expect(consumeCommandResult().exitCode).toBe(1);
+    } finally {
+      vi.unstubAllEnvs();
+      rmSync(project, { recursive: true, force: true });
+      rmSync(config, { recursive: true, force: true });
+    }
+  });
+
   it("labels an authentication-required anonymous URL as a claim URL", async () => {
     const output = await runPublish({ public: false, claimed: false });
 
@@ -193,7 +292,7 @@ describe("publish --update / --space ownership preflight", () => {
     const project = mkdtempSync(join(tmpdir(), "hf-publish-owner-"));
     const config = mkdtempSync(join(tmpdir(), "hf-publish-owner-config-"));
     writeFileSync(join(project, "index.html"), VISIBLE_INDEX);
-    vi.stubEnv("HEYGEN_CONFIG_DIR", config);
+    vi.stubEnv("HYPERFRAMES_CONFIG_DIR", config);
     vi.stubEnv("HEYGEN_API_KEY", credentials.env ?? "");
     vi.stubEnv("HYPERFRAMES_API_KEY", "");
     if (credentials.stored) await writeStore(credentials.stored, join(config, "credentials"));
@@ -352,11 +451,57 @@ describe("publish --update / --space ownership preflight", () => {
 
       expect(stored?.credentials.oauth).toMatchObject(loginB);
       expect(stored?.credentials.user?.email).toBe("b@example.com");
-      expect(fetchMock.mock.calls.map(([url]) => url)).toEqual(["https://auth.test/token"]);
+      expect(fetchMock).not.toHaveBeenCalled();
       expect(exitCode).toBe(1);
       expect(errors.join("\n")).toContain("Your login changed during publish. Run publish again.");
     } finally {
       error.mockRestore();
     }
   });
+});
+
+describe("expired transition preserves only owned legacy updates", () => {
+  it.each(["anonymous", "api-key", "oauth"])(
+    "checks %s ownership before publication",
+    async (kind) => {
+      const project = mkdtempSync(join(tmpdir(), "hf-publish-transition-owner-"));
+      const config = mkdtempSync(join(tmpdir(), "hf-publish-transition-config-"));
+      vi.stubEnv("HYPERFRAMES_CONFIG_DIR", config);
+      vi.stubEnv("HEYGEN_API_KEY", kind === "api-key" ? "fixture-key" : "");
+      vi.stubEnv("HYPERFRAMES_API_KEY", "");
+      writeFileSync(join(project, "index.html"), VISIBLE_INDEX);
+      writeProjectLink(project, { projectId: "legacy", url: "https://hyperframes.dev/p/legacy" });
+      writeTeamProject(project, { projectId: "legacy" });
+      if (kind === "oauth")
+        await writeStore({ oauth: { access_token: "fixture-token" } }, join(config, "credentials"));
+      mockPublished({
+        projectId: "legacy",
+        url: "https://hyperframes.dev/p/legacy",
+        updated: true,
+      });
+      publishState.noticeRelease = "2020-01-01T00:00:00.000Z";
+      try {
+        const run = () =>
+          publishCommand.run?.({ args: { dir: project, yes: true, proxy: false } } as never);
+        if (kind === "oauth") {
+          await captureLog(run);
+          expect(publishState.publish).toHaveBeenCalledWith(
+            project,
+            expect.objectContaining({
+              projectId: "legacy",
+              credential: expect.objectContaining({ type: "oauth" }),
+            }),
+          );
+        } else {
+          await expect(run()).rejects.toMatchObject({ code: "legacy_publish_login_required" });
+          expect(publishState.publish).not.toHaveBeenCalled();
+        }
+      } finally {
+        publishState.noticeRelease = null;
+        vi.unstubAllEnvs();
+        rmSync(project, { recursive: true, force: true });
+        rmSync(config, { recursive: true, force: true });
+      }
+    },
+  );
 });

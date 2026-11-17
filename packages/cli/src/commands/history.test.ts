@@ -1,6 +1,8 @@
 // @vitest-environment node
 import { spawn } from "node:child_process";
 import {
+  chmodSync,
+  existsSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
@@ -8,6 +10,7 @@ import {
   renameSync,
   rmSync,
   utimesSync,
+  watch,
   writeFileSync,
 } from "node:fs";
 import type { AddressInfo } from "node:net";
@@ -25,7 +28,7 @@ import { runCommand } from "citty";
 import { Hono } from "hono";
 import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { consumeCommandResult } from "../utils/commandResult.js";
-import { historyDeps, withOwner } from "../utils/historyOwner.js";
+import { historyDeps, withOwner, withReader } from "../utils/historyOwner.js";
 import historyCommand from "./history.js";
 
 /** History's clock, a day ahead of the file system's, so each write is dated by the mtime it is stamped with. */
@@ -55,6 +58,7 @@ function project() {
   historyDeps.historyRoot = tempDir("hf-history-cli-root-");
   historyDeps.findServer = async () => null;
   historyDeps.turnIdleMs = 60_000;
+  historyDeps.ownerWaitMs = undefined;
   clock.at = Date.now() + 86_400_000;
   historyDeps.now = () => clock.at;
   const write = (path: string, text: string) => {
@@ -152,6 +156,27 @@ describe.each(["direct", "preview"])("hyperframes history (%s)", (mode) => {
     return { ...p, personWrites };
   }
 
+  it("refuses an empty start restore with exit 2 and leaves files intact", async () => {
+    const p = project();
+    rmSync(join(p.dir, "index.html"));
+    rmSync(join(p.dir, "notes.html"));
+    const history = await openProjectHistory({
+      projectDir: p.dir,
+      historyRoot: historyDeps.historyRoot,
+      now: () => clock.at,
+    });
+    p.write("index.html", "A");
+    p.write("notes.html", "N");
+    await history.close();
+    if (mode === "preview") await preview(p.dir);
+    const result = await p.hf("restore", "start");
+    expect(result.code).toBe(2);
+    expect(result.err).toBe(
+      "Restoring this point would remove every file in this project, so nothing was changed.",
+    );
+    expect(p.files()).toEqual(["A", "N"]);
+  });
+
   it("an agent's labelled turn, a person's edit after it: --since shows both, undo of the turn keeps the edit", async () => {
     const { json, hf, turn, personWrites, files } = await setup();
     const startedAt = new Date(clock.at - 1).toISOString();
@@ -188,6 +213,18 @@ describe.each(["direct", "preview"])("hyperframes history (%s)", (mode) => {
     const undo = await hf("undo", "--who", "claude");
     expect(undo.code, undo.err).toBe(0);
     expect(files()).toEqual(["A", "N2"]);
+  });
+
+  it("a turn with a long label and agent name still ends and undoes as that agent's", async () => {
+    const { write, json, hf, files } = await setup();
+    const name = "agent-".repeat(40);
+    await hf("begin", "--who", name, "--label", "x".repeat(201));
+    write("index.html", "A2");
+
+    const ended = await json("end");
+    expect(ended.entry).toMatchObject({ who: { kind: "agent", name }, files: ["index.html"] });
+    expect((await hf("undo", "--who", name)).code).toBe(0);
+    expect(files()[0]).toBe("A");
   });
 
   it("undo by one agent leaves another agent's open turn open", async () => {
@@ -236,6 +273,39 @@ describe.each(["direct", "preview"])("hyperframes history (%s)", (mode) => {
     expect((await hf("show", entry.id)).out).toContain("M index.html");
     const diff = (await hf("show", entry.id.slice(0, 8), "--diff")).out;
     expect(diff).toMatch(/-A\n\\ No newline at end of file\n\+A2/);
+  });
+
+  it("--diff names a video it never keeps, one line, and still shows the page's change", async () => {
+    const { hf, json, write } = await setup();
+    await hf("begin", "--who", "claude", "--label", "Import clip");
+    write("clip.mp4", "video bytes the history only hashes");
+    write("index.html", "A2");
+    const { entry } = await json("end");
+
+    const shown = await hf("show", entry.id, "--diff");
+
+    expect(shown.code, shown.err).toBe(0);
+    expect(shown.out).toContain("Media clip.mp4 changed, not kept in history");
+    expect(shown.out).toMatch(/-A\n\\ No newline at end of file\n\+A2/);
+    const peeked = await hf("peek", entry.id, "clip.mp4");
+    expect([peeked.code, peeked.err]).toEqual([
+      2,
+      "clip.mp4 is video or audio: the history keeps that it changed, not its bytes",
+    ]);
+  });
+
+  it.each([false, true])("shows a large text diff completely (json=%s)", async (json) => {
+    const { hf, turn } = await setup();
+    const before = `before-${"a".repeat(600_000)}-end-before\n`;
+    const after = `after-${"b".repeat(600_000)}-end-after-🎬\n`;
+    await turn("claude", "Write notes", "notes.html", before);
+    const entry = await turn("claude", "Rewrite notes", "notes.html", after);
+
+    const result = await hf("show", entry.id, "--diff", ...(json ? ["--json"] : []));
+
+    expect(result.code, result.err).toBe(0);
+    const diff = json ? JSON.parse(result.out).diff : result.out;
+    expect(diff).toContain(`-${before}+${after.trimEnd()}`);
   });
 
   it("peek reads a file as it was without writing, and restore puts every file back", async () => {
@@ -300,7 +370,7 @@ describe("hyperframes history, one owner", () => {
     await hf();
     const turn = {
       via: "preview",
-      id: "turn-1",
+      id: "7f3c2a1e-0b4d-4c8e-9a6f-2d1b3c4e5f60",
       who: { kind: "agent", name: "claude" },
       label: "Retitle",
       startedAt: 1,
@@ -310,7 +380,7 @@ describe("hyperframes history, one owner", () => {
     write("index.html", "A2");
 
     expect((await json("end")).entry).toMatchObject({
-      id: "turn-1",
+      id: "7f3c2a1e-0b4d-4c8e-9a6f-2d1b3c4e5f60",
       who: turn.who,
       files: ["index.html"],
     });
@@ -417,7 +487,8 @@ describe("hyperframes history, one owner", () => {
     const { dir, write, json, hf } = project();
     await hf();
     const who = { kind: "agent", name: "claude" };
-    const marker = { via: "direct", id: "turn-1", who, label: "Retitle", startedAt: 1 };
+    const id = "7f3c2a1e-0b4d-4c8e-9a6f-2d1b3c4e5f61";
+    const marker = { via: "direct", id, who, label: "Retitle", startedAt: 1 };
     writeFileSync(join(dir, ".hyperframes", "history-turn.json"), JSON.stringify(marker));
     write("index.html", "A2");
 
@@ -429,6 +500,15 @@ describe("hyperframes history, one owner", () => {
     const home = tempDir("hf-history-cli-home-");
     const historyRoot = join(home, ".cache", "hyperframes", "history");
     const held = await openProjectHistory({ projectDir: dir, historyRoot });
+    // The CLI's first try at the lock leaves a claim draft beside owner.pid: proof it found the history held.
+    const triedLock = new Promise<void>((tried) => {
+      const watcher = watch(join(historyRoot, held.projectId), (_event, name) => {
+        if (!name?.startsWith("owner.pid-")) return;
+        watcher.close();
+        tried();
+      });
+      onTestFinished(() => watcher.close());
+    });
     write("index.html", "A2");
     const cli = resolve(fileURLToPath(import.meta.url), "..", "..", "cli.ts");
     const child = spawn("bun", ["run", cli, "history", "--dir", dir], {
@@ -440,9 +520,15 @@ describe("hyperframes history, one owner", () => {
         HYPERFRAMES_NO_TELEMETRY: "1",
       },
     });
+    onTestFinished(() => void child.kill());
     const exited = new Promise<number | null>((done) => child.on("exit", done));
     const logFile = join(historyRoot, held.projectId, "log.jsonl");
-    await new Promise((settle) => setTimeout(settle, 1500));
+    await Promise.race([
+      triedLock,
+      exited.then((code) => {
+        throw new Error(`the CLI exited (${code}) before trying the held lock`);
+      }),
+    ]);
     expect(
       readFileSync(logFile, "utf-8").trim().split("\n"),
       "nothing written while held",
@@ -487,14 +573,139 @@ describe("hyperframes history, refusals", () => {
     expect(read("added.html")).toBe("new");
   });
 
-  it("--json refusals go to stdout as {ok: false, error}", async () => {
+  it.each(["direct", "preview"])(
+    "begin --exclusive starts once another agent's turn has been idle (%s)",
+    async (mode) => {
+      const { dir, hf } = project();
+      await hf();
+      if (mode === "preview") await preview(dir);
+      historyDeps.turnIdleMs = 300;
+      await hf("begin", "--who", "codex", "--label", "Retitle");
+      advance(1_000);
+
+      const begun = await hf("begin", "--who", "claude", "--label", "Notes", "--exclusive");
+      expect([begun.code, begun.err]).toEqual([0, ""]);
+      expect((await hf("end", "--who", "claude")).code).toBe(0);
+    },
+  );
+
+  it("begin --exclusive through a preview refuses another agent's open turn", async () => {
+    const { dir, hf } = project();
+    await hf();
+    await preview(dir);
+    await hf("begin", "--who", "codex", "--label", "Retitle");
+    const refused = await hf("begin", "--who", "claude", "--label", "Notes", "--exclusive");
+    expect([refused.code, refused.err]).toEqual([
+      2,
+      "codex's turn is open; it has to end before yours begins",
+    ]);
+  });
+
+  it("begin --exclusive through a preview lets only one of two agents win", async () => {
+    const { dir, hf } = project();
+    await hf();
+    await preview(dir);
+    const begin = (who: string) =>
+      withOwner(dir, async (owner) => {
+        await owner.begin({ kind: "agent", name: who }, who, true);
+      }).then(
+        () => "won",
+        (error: Error) => error.message,
+      );
+    const results = await Promise.all([begin("codex"), begin("claude")]);
+    expect(results.filter((result) => result === "won")).toHaveLength(1);
+    expect(results.find((result) => result !== "won")).toMatch(
+      /^(codex|claude)'s turn is open; it has to end before yours begins$/,
+    );
+  });
+
+  it("begin --exclusive refuses another agent's open turn and keeps it open", async () => {
+    const { write, hf, json } = project();
+    await hf();
+    await hf("begin", "--who", "codex", "--label", "Retitle");
+    write("index.html", "A2");
+
+    const refused = await hf("begin", "--who", "claude", "--label", "Notes", "--exclusive");
+    expect([refused.code, refused.err]).toEqual([
+      2,
+      "codex's turn is open; it has to end before yours begins",
+    ]);
+    expect((await hf("end", "--who", "codex")).code).toBe(0);
+    const entries = (await json()).entries as Array<{ who: { name: string }; files: string[] }>;
+    expect(entries.filter((entry) => entry.who.name === "codex")).toMatchObject([
+      { files: ["index.html"] },
+    ]);
+  });
+
+  it("serializes concurrent begin --exclusive claims under the history owner lock", async () => {
+    const { dir } = project();
+    const historyRoot = tempDir("hf-history-cli-root-");
+    const held = await openProjectHistory({ projectDir: dir, historyRoot });
+    const home = join(historyRoot, held.projectId);
+    const claimers = new Set<string>();
+    const bothWaiting = new Promise<void>((resolveWaiting) => {
+      const inspect = (_event: string, name: string | null) => {
+        const pid = name?.match(/^owner\.pid-(\d+)-/)?.[1];
+        if (pid) claimers.add(pid);
+        if (claimers.size < 2) return;
+        watcher.close();
+        resolveWaiting();
+      };
+      const watcher = watch(home, inspect);
+      onTestFinished(() => watcher.close());
+    });
+    const cli = resolve(fileURLToPath(import.meta.url), "..", "..", "cli.ts");
+    const begin = (who: string) => {
+      const child = spawn(
+        "bun",
+        ["run", cli, "history", "begin", "--who", who, "--label", who, "--exclusive", "--dir", dir],
+        {
+          env: {
+            ...process.env,
+            HYPERFRAMES_HISTORY_ROOT: historyRoot,
+            HYPERFRAMES_SKIP_UPDATE_CHECK: "1",
+            HYPERFRAMES_NO_TELEMETRY: "1",
+          },
+        },
+      );
+      onTestFinished(() => void child.kill());
+      return new Promise<{ code: number | null; error: string }>((done) => {
+        let error = "";
+        child.stderr.on("data", (chunk) => (error += chunk));
+        child.on("exit", (code) => done({ code, error: error.trim() }));
+      });
+    };
+    const results = [begin("codex"), begin("claude")];
+    await bothWaiting;
+    await held.close();
+
+    const settled = await Promise.all(results);
+    expect(settled.map((result) => result.code).sort()).toEqual([0, 2]);
+    expect(settled.find((result) => result.code === 2)?.error).toMatch(
+      /'s turn is open; it has to end before yours begins$/,
+    );
+  });
+
+  it("end --who refuses another agent's turn, and --if-open succeeds with none open", async () => {
+    const { hf, json } = project();
+    await hf();
+    expect(await json("end", "--if-open")).toMatchObject({ entry: null, parts: [] });
+    expect((await hf("end")).code).toBe(2);
+
+    await hf("begin", "--who", "codex", "--label", "Retitle");
+    const refused = await hf("end", "--who", "claude", "--if-open");
+    expect([refused.code, refused.err]).toEqual([2, "The open turn is codex's, not claude's"]);
+    expect((await hf("end", "--who", "codex")).code).toBe(0);
+  });
+
+  it("--json refusals go to stdout as {ok: false, error: expect.objectContaining({ message: error })}", async () => {
     const { hf } = project();
     await hf();
     const refused = await hf("show", "zzzz", "--json");
     expect(refused.code).toBe(2);
     expect(JSON.parse(refused.out)).toMatchObject({
       ok: false,
-      error: 'No entry "zzzz" in this history',
+      error: expect.objectContaining({ message: 'No entry "zzzz" in this history' }),
     });
     expect((await hf("--limit", "0")).code).toBe(2);
   });
@@ -508,15 +719,186 @@ describe("hyperframes history, refusals", () => {
     expect(readdirSync(historyDeps.historyRoot)).toEqual([]);
   });
 
-  it("exits 2 with the holder's pid when another process keeps the history past the wait", async () => {
-    const { dir, hf } = project();
-    await openProjectHistory({ projectDir: dir, historyRoot: historyDeps.historyRoot }).then(
-      (held) => onTestFinished(() => held.close()),
-    );
-    const busy = await hf();
-    expect([busy.code, busy.err]).toEqual([
+  it("reads the history while another app keeps it open, and refuses to change it there", async () => {
+    const { dir, read, hf, turn } = project();
+    await hf();
+    const first = await turn("claude", "Retitle", "index.html", "A2");
+    await turn("claude", "Again", "index.html", "A3");
+    await hf("begin", "--who", "codex", "--label", "Open turn");
+    const marker = () => readFileSync(join(dir, ".hyperframes", "history-turn.json"), "utf-8");
+    const before = marker();
+    const held = await openProjectHistory({
+      projectDir: dir,
+      historyRoot: historyDeps.historyRoot,
+    });
+    onTestFinished(() => held.close());
+    historyDeps.ownerWaitMs = 0;
+
+    const listed = await hf("--json", "--limit", "2");
+    expect(listed.code).toBe(0);
+    const labels = JSON.parse(listed.out).entries.map((entry: { label: string }) => entry.label);
+    expect(labels).toEqual(["Again", "Retitle"]);
+    expect((await hf("show", first.id)).out).toContain("M index.html");
+    const stdout = vi.spyOn(process.stdout, "write").mockImplementation(() => true);
+    await hf("peek", first.id, "index.html");
+    expect(String(stdout.mock.calls[0]?.[0])).toBe("A2");
+    stdout.mockRestore();
+    expect(marker()).toBe(before);
+
+    const refused = await hf("undo", first.id);
+    expect([refused.code, refused.err]).toEqual([
       2,
-      `This project's history is open in another process (pid ${process.pid}).`,
+      `This project is open in another app (pid ${process.pid}), which keeps its history: undo, restore or pin there.`,
     ]);
-  }, 15_000);
+    expect(read("index.html")).toBe("A3");
+  });
+
+  it("still refuses a history id it cannot read, instead of reading the history as empty", async () => {
+    const { dir, hf } = project();
+    mkdirSync(join(dir, ".hyperframes"), { recursive: true });
+    writeFileSync(join(dir, ".hyperframes", "history-id"), "garbage\n");
+    const refused = await hf();
+    expect(refused.code).toBe(2);
+    expect(refused.err).toContain("holds no history id this version can read");
+  });
+
+  it("peek refuses cleanly when another app pruned the point's file after its log was read", async () => {
+    const { dir, hf, turn } = project();
+    await hf();
+    const first = await turn("claude", "Retitle", "index.html", "A2");
+    const held = await openProjectHistory({
+      projectDir: dir,
+      historyRoot: historyDeps.historyRoot,
+    });
+    onTestFinished(() => held.close());
+    historyDeps.ownerWaitMs = 0;
+    const hash = held.peek(first.id)!["index.html"]!;
+    rmSync(join(historyDeps.historyRoot, held.projectId, "blobs", hash.slice(0, 2), hash));
+
+    const refused = await hf("peek", first.id, "index.html");
+    expect([refused.code, refused.err]).toEqual([2, "That point is no longer kept"]);
+  });
 });
+
+describe.skipIf(process.platform === "win32" || process.getuid?.() === 0)(
+  "hyperframes history, a history this run cannot write",
+  () => {
+    /** The project's history folder (or a folder in it) set to `mode` for the rest of the test. */
+    function lock(mode: number, ...parts: string[]) {
+      const [id] = readdirSync(historyDeps.historyRoot).filter((name) =>
+        existsSync(join(historyDeps.historyRoot, name, "log.jsonl")),
+      );
+      const path = join(historyDeps.historyRoot, id!, ...parts);
+      const dirs = [
+        path,
+        ...readdirSync(path, { recursive: true, withFileTypes: true })
+          .filter((entry) => entry.isDirectory())
+          .map((entry) => join(entry.parentPath, entry.name)),
+      ];
+      for (const dir of dirs.reverse()) chmodSync(dir, mode);
+      onTestFinished(() => dirs.forEach((dir) => chmodSync(dir, 0o755)));
+    }
+
+    it("lists the history as last recorded when its folder cannot be written, and says so", async () => {
+      const { hf, turn } = project();
+      await hf();
+      const entry = await turn("claude", "Retitle", "index.html", "A2");
+      lock(0o555);
+      const listed = await hf("--json");
+      expect(listed.code).toBe(0);
+      expect(JSON.parse(listed.out).entries.map((item: { id: string }) => item.id)).toContain(
+        entry.id,
+      );
+      expect(listed.err).toMatch(/could not write this project's history/i);
+    });
+
+    it("lists the history when its log can be read but not appended to", async () => {
+      const { hf, write, turn } = project();
+      await hf();
+      const entry = await turn("claude", "Retitle", "index.html", "A2");
+      const [id] = readdirSync(historyDeps.historyRoot).filter((name) =>
+        existsSync(join(historyDeps.historyRoot, name, "log.jsonl")),
+      );
+      const log = join(historyDeps.historyRoot, id!, "log.jsonl");
+      chmodSync(log, 0o444);
+      onTestFinished(() => chmodSync(log, 0o644));
+      write("notes.html", "N2");
+      const listed = await hf("--json");
+      expect(listed.code).toBe(0);
+      expect(JSON.parse(listed.out).entries.map((item: { id: string }) => item.id)).toContain(
+        entry.id,
+      );
+      expect(listed.err).toMatch(/could not write this project's history/i);
+    });
+
+    it("lists the history when only its stored file copies cannot be written", async () => {
+      const { hf, write, turn } = project();
+      await hf();
+      const entry = await turn("claude", "Retitle", "index.html", "A2");
+      lock(0o555, "blobs");
+      write("notes.html", "N2");
+      const listed = await hf("--json");
+      expect(listed.code).toBe(0);
+      expect(JSON.parse(listed.out).entries.map((item: { id: string }) => item.id)).toContain(
+        entry.id,
+      );
+    });
+
+    it("never runs a read twice: a write error after it started is the command's own", async () => {
+      const { dir, hf } = project();
+      await hf();
+      let runs = 0;
+      const unwritable = Object.assign(new Error("no space"), { code: "ENOSPC", syscall: "write" });
+      await expect(
+        withReader(dir, async () => {
+          runs += 1;
+          throw unwritable;
+        }),
+      ).rejects.toBe(unwritable);
+      expect(runs).toBe(1);
+    });
+
+    it("a folder it cannot read fails the read with that error, never as one it could not write", async () => {
+      const { hf, turn } = project();
+      await hf();
+      await turn("claude", "Retitle", "index.html", "A2");
+      lock(0o111, "blobs");
+      const error = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        await expect(hf("--json")).rejects.toMatchObject({ code: "EACCES", syscall: "scandir" });
+        expect(error.mock.calls.flat().join(" ")).not.toMatch(/could not write/i);
+      } finally {
+        error.mockRestore();
+      }
+    });
+
+    it("an owner file it cannot read fails the read with that error, never as one it could not write", async () => {
+      const { hf, turn } = project();
+      await hf();
+      await turn("claude", "Retitle", "index.html", "A2");
+      const [id] = readdirSync(historyDeps.historyRoot).filter((name) =>
+        existsSync(join(historyDeps.historyRoot, name, "log.jsonl")),
+      );
+      const owner = join(historyDeps.historyRoot, id!, "owner.pid");
+      writeFileSync(owner, "999999999");
+      chmodSync(owner, 0o000);
+      onTestFinished(() => chmodSync(owner, 0o644));
+      const error = vi.spyOn(console, "error").mockImplementation(() => {});
+      try {
+        await expect(hf("--json")).rejects.toMatchObject({ code: "EACCES", syscall: "open" });
+        expect(error.mock.calls.flat().join(" ")).not.toMatch(/could not write/i);
+      } finally {
+        error.mockRestore();
+      }
+    });
+
+    it("still fails an undo it cannot record, and leaves the files as they are", async () => {
+      const { hf, read, turn } = project();
+      await hf();
+      await turn("claude", "Retitle", "index.html", "A2");
+      lock(0o555);
+      await expect(hf("undo", "--who", "claude")).rejects.toMatchObject({ code: "EACCES" });
+      expect(read("index.html")).toBe("A2");
+    });
+  },
+);

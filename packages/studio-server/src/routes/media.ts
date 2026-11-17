@@ -1,10 +1,18 @@
 import type { Hono } from "hono";
 import { streamSSE } from "hono/streaming";
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { basename, dirname, extname, join, posix } from "node:path";
 import type { MediaProcessingJobState, StudioApiAdapter } from "../types.js";
-import { mkdirWithinProject, pinWithinProject, resolveWithinProject } from "../helpers/safePath.js";
-import { probeMediaMetadata } from "../helpers/mediaMetadata.js";
+import { requestedProjectPath } from "../helpers/requestSubPath.js";
+import {
+  mkdirWithinProject,
+  pinWritableWithinProject,
+  resolveWithinProject,
+  resolveWritableWithinProject,
+} from "../helpers/safePath.js";
+import { probeMediaMetadata, type MediaMetadata } from "../helpers/mediaMetadata.js";
+import { forgetJobsFinishedLongerThan } from "../helpers/finishedJobs.js";
+import { ThumbnailGenerationCoordinator } from "./thumbnailGenerationCoordinator.js";
 
 const VIDEO_EXTENSIONS = new Set([
   ".mp4",
@@ -34,8 +42,9 @@ interface BackgroundRemovalBody {
   device?: string;
 }
 
-type JobWithCreatedAt = MediaProcessingJobState & { createdAt: number };
 type ProbeMediaMetadata = typeof probeMediaMetadata;
+
+const MAX_CONCURRENT_METADATA_PROBES = 4;
 
 function isVideoPath(path: string): boolean {
   return VIDEO_EXTENSIONS.has(extname(path).toLowerCase());
@@ -43,13 +52,6 @@ function isVideoPath(path: string): boolean {
 
 function isImagePath(path: string): boolean {
   return IMAGE_EXTENSIONS.has(extname(path).toLowerCase());
-}
-
-function normalizeProjectAssetPath(path: string): string {
-  return path
-    .trim()
-    .replace(/^[.]\//, "")
-    .replace(/[?#].*$/, "");
 }
 
 function containsNullByte(path: string): boolean {
@@ -98,14 +100,14 @@ function defaultPlatePath(
   return uniqueAssetPath(projectDir, `assets/cutouts/${slugFileBase(inputPath)}-plate.webm`, taken);
 }
 
-function outputsInFlight(mediaJobs: Map<string, JobWithCreatedAt>): Set<string> {
+function outputsInFlight(mediaJobs: Map<string, MediaProcessingJobState>): Set<string> {
   const running = [...mediaJobs.values()].filter((job) => job.status === "processing");
   return new Set(
     running.flatMap((job) => [job.outputAssetPath, job.backgroundOutputAssetPath ?? ""]),
   );
 }
 
-function makeJobId(projectId: string, mediaJobs: Map<string, JobWithCreatedAt>): string {
+function makeJobId(projectId: string, mediaJobs: Map<string, MediaProcessingJobState>): string {
   const stamp = new Date()
     .toISOString()
     .replace(/[-:.TZ]/g, "")
@@ -132,24 +134,24 @@ export function registerMediaRoutes(
   adapter: StudioApiAdapter,
   options: { probeMediaMetadata?: ProbeMediaMetadata } = {},
 ): void {
-  const mediaJobs = new Map<string, JobWithCreatedAt>();
+  const mediaJobs = new Map<string, MediaProcessingJobState>();
   const TTL_MS = 300_000;
   const readMediaMetadata = options.probeMediaMetadata ?? probeMediaMetadata;
+  const probes = new ThumbnailGenerationCoordinator<MediaMetadata>(MAX_CONCURRENT_METADATA_PROBES);
 
   function cleanupFinishedJobs(): void {
-    const now = Date.now();
-    for (const [id, job] of mediaJobs) {
-      if ((job.status === "complete" || job.status === "failed") && now - job.createdAt > TTL_MS) {
-        mediaJobs.delete(id);
-      }
-    }
+    forgetJobsFinishedLongerThan(
+      TTL_MS,
+      mediaJobs,
+      (job) => job.status === "complete" || job.status === "failed",
+    );
   }
 
   api.get("/projects/:id/media/metadata", async (c) => {
     const project = await adapter.resolveProject(c.req.param("id"));
     if (!project) return c.json({ error: "not found" }, 404);
 
-    const assetPath = normalizeProjectAssetPath(c.req.query("path") ?? "");
+    const assetPath = requestedProjectPath(project.dir, c.req.query("path") ?? "");
     if (!assetPath) return c.json({ error: "path required" }, 400);
     if (containsNullByte(assetPath)) return c.json({ error: "forbidden" }, 403);
     if (/^(?:https?:|data:|blob:)/i.test(assetPath)) {
@@ -158,9 +160,12 @@ export function registerMediaRoutes(
 
     const filePath = resolveWithinProject(project.dir, assetPath);
     if (!filePath) return c.json({ error: "forbidden" }, 403);
-    if (!existsSync(filePath)) return c.json({ error: "media not found" }, 404);
+    const stat = statSync(filePath, { throwIfNoEntry: false });
+    if (!stat) return c.json({ error: "media not found" }, 404);
 
-    return c.json({ path: assetPath, metadata: await readMediaMetadata(filePath) });
+    const key = JSON.stringify([filePath, stat.dev, stat.ino, stat.size, stat.mtimeMs]);
+    const metadata = await probes.acquire(key, c.req.raw.signal, () => readMediaMetadata(filePath));
+    return c.json({ path: assetPath, metadata });
   });
 
   api.post(
@@ -177,7 +182,9 @@ export function registerMediaRoutes(
       if (!project) return c.json({ error: "not found" }, 404);
 
       const body = (await c.req.json().catch(() => ({}))) as BackgroundRemovalBody;
-      const inputAssetPath = body.inputPath ? normalizeProjectAssetPath(body.inputPath) : "";
+      const inputAssetPath = body.inputPath
+        ? requestedProjectPath(project.dir, body.inputPath)
+        : "";
       if (!inputAssetPath) return c.json({ error: "inputPath required" }, 400);
       if (containsNullByte(inputAssetPath)) return c.json({ error: "forbidden" }, 403);
       if (/^(?:https?:|data:|blob:)/i.test(inputAssetPath)) {
@@ -195,19 +202,19 @@ export function registerMediaRoutes(
       }
 
       const requestedOutput = body.outputPath
-        ? posix.normalize(normalizeProjectAssetPath(body.outputPath))
+        ? posix.normalize(requestedProjectPath(project.dir, body.outputPath))
         : "";
       if (requestedOutput && containsNullByte(requestedOutput)) {
         return c.json({ error: "forbidden" }, 403);
       }
-      if (requestedOutput && !resolveWithinProject(project.dir, requestedOutput)) {
+      if (requestedOutput && !resolveWritableWithinProject(project.dir, requestedOutput)) {
         return c.json({ error: "forbidden" }, 403);
       }
       const taken = outputsInFlight(mediaJobs);
       const outputAssetPath = requestedOutput
         ? uniqueAssetPath(project.dir, requestedOutput, taken)
         : defaultOutputPath(project.dir, inputAssetPath, taken);
-      const outputPath = pinWithinProject(project.dir, outputAssetPath);
+      const outputPath = pinWritableWithinProject(project.dir, outputAssetPath);
       if (!outputPath) return c.json({ error: "forbidden" }, 403);
       if (inputIsVideo && !VIDEO_OUTPUT_EXTENSIONS.has(extname(outputAssetPath).toLowerCase())) {
         return c.json({ error: "video background removal output must be .webm or .mov" }, 400);
@@ -225,7 +232,7 @@ export function registerMediaRoutes(
         taken.add(outputAssetPath);
         backgroundOutputAssetPath = defaultPlatePath(project.dir, inputAssetPath, taken);
         backgroundOutputPath =
-          pinWithinProject(project.dir, backgroundOutputAssetPath) ?? undefined;
+          pinWritableWithinProject(project.dir, backgroundOutputAssetPath) ?? undefined;
         if (!backgroundOutputPath) {
           return c.json({ error: "forbidden" }, 403);
         }
@@ -246,8 +253,7 @@ export function registerMediaRoutes(
         quality: normalizeQuality(body.quality),
         device: normalizeDevice(body.device),
         jobId,
-      }) as JobWithCreatedAt;
-      state.createdAt = Date.now();
+      });
       mediaJobs.set(jobId, state);
 
       return c.json({

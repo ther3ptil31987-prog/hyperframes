@@ -1,5 +1,7 @@
 import { runCommand } from "citty";
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import childProcess from "node:child_process";
+import fs from "node:fs";
 import {
   chmodSync,
   mkdirSync,
@@ -7,62 +9,68 @@ import {
   writeFileSync,
   readFileSync,
   mkdtempSync,
+  realpathSync,
   rmSync,
+  statSync,
+  symlinkSync,
 } from "node:fs";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
+import { syncBuiltinESMExports } from "node:module";
 import { tmpdir } from "node:os";
 import { pathToFileURL } from "node:url";
+import * as manager from "../whisper/manager.js";
 import { WhisperUnavailableError } from "../whisper/manager.js";
+import { formatVtt, loadTranscript } from "../whisper/normalize.js";
+import * as parakeet from "../whisper/parakeet.js";
+import * as sherpa from "../whisper/sherpa.js";
+import * as whisper from "../whisper/transcribe.js";
 import { CliRuntimeError, consumeCommandResult } from "../utils/commandResult.js";
+import transcribeCmd from "./transcribe.js";
 
 // Make the whisper core report "unavailable" so we exercise the soft-skip path.
 const transcribeMock = vi.fn();
 const prepareWavMock = vi.fn((input: string) => input);
 let audioSeconds = 1;
-vi.mock("../whisper/transcribe.js", () => ({
-  transcribe: transcribeMock,
-  prepareWav: (input: string) => prepareWavMock(input),
-  getPreparedWavDurationSeconds: () => audioSeconds,
-}));
 
 // Engine selection: which runners look installed, and the sherpa decode child it spawns.
-const runners = { sherpa: false, mlx: false };
+const runners: { sherpa: boolean; mlx: boolean; whisper?: boolean } = { sherpa: false, mlx: false };
 let runtimeDir: string;
-vi.mock("../whisper/sherpa.js", async (importOriginal) => {
-  const sherpa = await importOriginal<typeof import("../whisper/sherpa.js")>();
-  return {
-    ...sherpa,
-    sherpaParakeetInstalled: () => runners.sherpa,
-    transcribeWithSherpa: (
-      wavPath: string,
-      dir: string,
-      options: Parameters<typeof sherpa.transcribeWithSherpa>[2],
-    ) =>
-      sherpa.transcribeWithSherpa(wavPath, dir, {
-        ...options,
-        runtimeDir,
-        cliUrl: pathToFileURL(join(runtimeDir, "dist", "cli.js")).href,
-      }),
-  };
-});
+const realTranscribeWithSherpa = sherpa.transcribeWithSherpa;
+const realTranscribeWithParakeet = parakeet.transcribeWithParakeet;
+const realPrepareWav = whisper.prepareWav;
 const mlxMock = vi.fn();
-vi.mock("../whisper/parakeet.js", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("../whisper/parakeet.js")>()),
-  findParakeet: () => (runners.mlx ? "/bin/parakeet-mlx" : undefined),
-  transcribeWithParakeet: (...a: unknown[]) => mlxMock(...a),
-}));
 const execFileMock = vi.fn();
-vi.mock("node:child_process", async (importOriginal) => ({
-  ...(await importOriginal<typeof import("node:child_process")>()),
-  execFile: (...a: unknown[]) => execFileMock(...a),
-}));
 
 const trackTranscribeUnavailable = vi.fn();
 vi.mock("../telemetry/events.js", () => ({
   trackTranscribeUnavailable: (...a: unknown[]) => trackTranscribeUnavailable(...a),
 }));
 
-import transcribeCmd from "./transcribe.js";
+/** The runners the command reaches, replaced for each test because afterEach restores every spy. */
+function replaceRunners(): void {
+  vi.spyOn(whisper, "transcribe").mockImplementation((...a) => transcribeMock(...a));
+  vi.spyOn(whisper, "prepareWav").mockImplementation(async (input) => prepareWavMock(input));
+  vi.spyOn(whisper, "getPreparedWavDurationSeconds").mockImplementation(() => audioSeconds);
+  vi.spyOn(sherpa, "sherpaParakeetInstalled").mockImplementation(() => runners.sherpa);
+  vi.spyOn(sherpa, "transcribeWithSherpa").mockImplementation((wavPath, dir, options) =>
+    realTranscribeWithSherpa(wavPath, dir, {
+      ...options,
+      runtimeDir,
+      cliUrl: pathToFileURL(join(runtimeDir, "dist", "cli.js")).href,
+    }),
+  );
+  vi.spyOn(parakeet, "findParakeet").mockImplementation(() =>
+    runners.mlx ? "/bin/parakeet-mlx" : undefined,
+  );
+  vi.spyOn(parakeet, "transcribeWithParakeet").mockImplementation((...a) => mlxMock(...a));
+  vi.spyOn(manager, "findWhisper").mockImplementation(() =>
+    runners.whisper ? { executablePath: "/bin/whisper-cli", source: "system" } : undefined,
+  );
+  vi.spyOn(childProcess, "execFile").mockImplementation(((...a: unknown[]) =>
+    execFileMock(...a)) as unknown as typeof childProcess.execFile);
+  // Node's named exports of a builtin follow its default export only once synced.
+  syncBuiltinESMExports();
+}
 
 /** Makes each runner write a one-word transcript naming itself. */
 function fakeTranscript(dir: string, text: string) {
@@ -76,6 +84,14 @@ function fakeTranscript(dir: string, text: string) {
     durationSeconds: 1,
     speechOnsetSeconds: null,
   };
+}
+
+/** A caption name the disk takes, whose temp sibling (13 characters longer) it refuses on every OS, even as root. */
+const NO_ROOM_FOR_TEMP = "c".repeat(250);
+const NAME_REFUSED = /ENAMETOOLONG|ENOENT|EINVAL/;
+
+function errorMessage(json: Record<string, unknown>): string {
+  return String((json.error as { message?: unknown } | undefined)?.message);
 }
 
 function lastJson(): Record<string, unknown> {
@@ -94,11 +110,12 @@ describe("transcribe command", () => {
   beforeEach(() => {
     dirs = [];
     consumeCommandResult();
+    replaceRunners();
     transcribeMock.mockReset();
     prepareWavMock.mockReset().mockImplementation((input: string) => input);
     trackTranscribeUnavailable.mockReset();
     mlxMock.mockReset();
-    Object.assign(runners, { sherpa: false, mlx: false });
+    Object.assign(runners, { sherpa: false, mlx: false, whisper: false });
     transcribeMock.mockRejectedValue(
       new WhisperUnavailableError("whisper-cpp not found. Install: brew install whisper-cpp"),
     );
@@ -109,7 +126,36 @@ describe("transcribe command", () => {
     consumeCommandResult();
     for (const d of dirs) rmSync(d, { recursive: true, force: true });
     vi.restoreAllMocks();
+    syncBuiltinESMExports();
     vi.unstubAllEnvs();
+  });
+
+  it("keeps quiet Spanish words before the relative speech onset in transcript and captions", async () => {
+    const { dir, input } = dummyAudio();
+    dirs.push(dir);
+    const words = [
+      { id: "w0", text: "Siempre", start: 0.2, end: 0.49 },
+      { id: "w1", text: "que", start: 0.49, end: 0.7 },
+      { id: "w2", text: "los", start: 0.7, end: 0.91 },
+      { id: "w3", text: "nietos", start: 0.91, end: 1.33 },
+      { id: "w4", text: "vecindario", start: 10.03, end: 11.02 },
+    ];
+    const htmlPath = join(dir, "index.html");
+    writeFileSync(htmlPath, "<script>const TRANSCRIPT = [];</script>");
+    transcribeMock.mockImplementation(async (_input, outputDir) => {
+      const result = fakeTranscript(outputDir, "whisper");
+      writeFileSync(result.transcriptPath, JSON.stringify(words));
+      return { ...result, wordCount: 5, durationSeconds: 50, speechOnsetSeconds: 10 };
+    });
+
+    await runCommand(transcribeCmd, {
+      rawArgs: [input, "--dir", dir, "--engine", "whisper", "--language", "es", "--json"],
+    });
+
+    expect(JSON.parse(readFileSync(join(dir, "transcript.json"), "utf8"))).toEqual(words);
+    const captions = readFileSync(htmlPath, "utf8").match(/const TRANSCRIPT = ([\s\S]*?);/)![1]!;
+    expect(JSON.parse(captions)).toEqual(words);
+    expect(lastJson()).toMatchObject({ ok: true, wordCount: 5, speechOnsetSeconds: 10 });
   });
 
   it("keeps typed progress on stderr and reports resolved metadata in one stdout result", async () => {
@@ -188,8 +234,9 @@ describe("transcribe command", () => {
 
   describe("engine selection", () => {
     beforeEach(() => {
-      runtimeDir = mkdtempSync(join(tmpdir(), "hf-transcribe-runtime-"));
-      dirs.push(runtimeDir);
+      const runtimeRoot = mkdtempSync(join(tmpdir(), "hf-transcribe-runtime-"));
+      dirs.push(runtimeRoot);
+      runtimeDir = join(runtimeRoot, "runtime");
       const pkg = join(runtimeDir, "node_modules", "sherpa-onnx-node");
       mkdirSync(pkg, { recursive: true });
       writeFileSync(join(pkg, "package.json"), JSON.stringify({ main: "index.js" }));
@@ -219,6 +266,21 @@ describe("transcribe command", () => {
       return { engine: out.engine, model: out.model, word: words[0]?.text, start: words[0]?.start };
     }
 
+    it("installs whisper's stop handling only when whisper starts, after any install or download", async () => {
+      const run = transcribeMock.getMockImplementation()!;
+      const handlers: number[] = [];
+      let signal: unknown;
+      transcribeMock.mockImplementationOnce(async (input, outputDir, options) => {
+        handlers.push(process.listenerCount("SIGTERM"));
+        signal = options.startCancellation();
+        handlers.push(process.listenerCount("SIGTERM"));
+        return run(input, outputDir, options);
+      });
+      await transcribeWith("whisper", { sherpa: false, mlx: false });
+      expect(signal).toBeInstanceOf(AbortSignal);
+      expect(handlers[1]).toBeGreaterThan(handlers[0]!);
+    });
+
     it("auto and parakeet prefer sherpa-onnx, then parakeet-mlx, then whisper", async () => {
       const sherpa = {
         engine: "parakeet",
@@ -242,6 +304,32 @@ describe("transcribe command", () => {
       });
     });
 
+    it.skipIf(process.platform === "win32")(
+      "lets parakeet-mlx detect the language itself, since it has no --language option",
+      async () => {
+        // Rejects --language the way parakeet-mlx does, and writes one token otherwise.
+        const runner = join(runtimeDir, "parakeet-mlx");
+        writeFileSync(
+          runner,
+          `#!/bin/sh
+[ "$1" = --help ] && exit 0
+in="$1"
+for a in "$@"; do [ "$a" = --language ] && { echo "Error: No such option: --language" >&2; exit 2; }; done
+while [ "$1" != --output-dir ]; do shift; done
+echo '{"sentences":[{"tokens":[{"text":" hola","start":0,"end":1}]}]}' > "$2/$(basename "$in" .wav).json"
+`,
+        );
+        chmodSync(runner, 0o755);
+        vi.stubEnv("HYPERFRAMES_PARAKEET", runner);
+        mlxMock.mockImplementation(realTranscribeWithParakeet);
+
+        expect(await transcribeWith("auto", { sherpa: false, mlx: true }, "es")).toMatchObject({
+          engine: "parakeet",
+          word: "hola",
+        });
+      },
+    );
+
     it("auto uses Parakeet only for a language it transcribes", async () => {
       const both = { sherpa: true, mlx: true };
       expect(await transcribeWith("auto", both, "ja")).toMatchObject({ engine: "whisper" });
@@ -250,11 +338,29 @@ describe("transcribe command", () => {
       expect(transcribeMock).toHaveBeenCalledTimes(1);
     });
 
+    it("sends a non-English language to an installed whisper, since Parakeet picks its own", async () => {
+      const all = { sherpa: true, mlx: true, whisper: true };
+      expect(await transcribeWith("auto", all, "fr")).toMatchObject({ engine: "whisper" });
+      expect(await transcribeWith("parakeet", all, "es")).toMatchObject({ engine: "whisper" });
+      expect(await transcribeWith("auto", all, "en-GB")).toMatchObject({ engine: "parakeet" });
+      expect(await transcribeWith("auto", all)).toMatchObject({ engine: "parakeet" });
+      const noWhisper = { sherpa: true, mlx: true, whisper: false };
+      expect(await transcribeWith("auto", noWhisper, "fr")).toMatchObject({ engine: "parakeet" });
+
+      Object.assign(runners, all);
+      const { dir, input } = dummyAudio();
+      dirs.push(dir);
+      await transcribeCmd.run!({ args: { input, engine: "auto", language: "fr" } } as never);
+      expect(vi.mocked(console.error).mock.calls.flat().join("\n")).toContain(
+        "Parakeet chooses its own language, so whisper transcribes --language fr.",
+      );
+    });
+
     it("--engine parakeet with a language it does not transcribe fails without falling back", async () => {
       Object.assign(runners, { sherpa: true, mlx: true });
       const { exitCode, out } = await transcribeFails("parakeet", { language: "ja" });
       expect(exitCode).toBe(1);
-      expect(out.error).toMatch(
+      expect(errorMessage(out)).toMatch(
         /^Parakeet does not transcribe --language ja; it covers en, es, .*uk\. Use --engine whisper\.$/,
       );
       expect(execFileMock).not.toHaveBeenCalled();
@@ -284,7 +390,10 @@ describe("transcribe command", () => {
       Object.assign(runners, { sherpa: true, mlx: false });
       const { exitCode, out } = await transcribeFails("auto");
       expect(exitCode).toBe(130);
-      expect(out).toEqual({ ok: false, error: "Transcription cancelled" });
+      expect(out).toEqual({
+        ok: false,
+        error: expect.objectContaining({ message: "Transcription cancelled" }),
+      });
     });
 
     it("reports the fallback's own timeout as a failure, not a cancel", async () => {
@@ -298,7 +407,9 @@ describe("transcribe command", () => {
       Object.assign(runners, { sherpa: true, mlx: false });
       const { exitCode, out } = await transcribeFails("auto");
       expect(exitCode).toBe(1);
-      expect(out.error).toMatch(/The whisper fallback failed too: spawnSync whisper-cli ETIMEDOUT/);
+      expect(errorMessage(out)).toMatch(
+        /The whisper fallback failed too: spawnSync whisper-cli ETIMEDOUT/,
+      );
     });
 
     it("--engine parakeet with nothing installed names the install command", async () => {
@@ -308,7 +419,7 @@ describe("transcribe command", () => {
       await expect(
         transcribeCmd.run!({ args: { input, json: true, engine: "parakeet" } } as never),
       ).rejects.toThrow(CliRuntimeError);
-      expect(lastJson().error).toContain("hyperframes models install parakeet");
+      expect(errorMessage(lastJson())).toContain("hyperframes models install parakeet");
       expect(transcribeMock).not.toHaveBeenCalled();
     });
 
@@ -329,6 +440,27 @@ describe("transcribe command", () => {
       }
       return { exitCode: exitCode || consumeCommandResult().exitCode, out: lastJson() };
     }
+
+    it("auto names the Parakeet install when whisper is missing and Parakeet is not installed", async () => {
+      transcribeMock.mockRejectedValue(new WhisperUnavailableError("whisper-cpp not found"));
+      const { exitCode, out } = await transcribeFails("auto", { optional: true });
+      expect(exitCode).toBe(0);
+      expect(out).toEqual({
+        ok: false,
+        skipped: true,
+        reason: "whisper_unavailable",
+        install: "hyperframes models install parakeet",
+      });
+    });
+
+    it.each([
+      ["a language Parakeet does not transcribe", "auto", "ja"],
+      ["an explicit --engine whisper", "whisper", undefined],
+    ])("offers no Parakeet install for %s", async (_case, engine, language) => {
+      transcribeMock.mockRejectedValue(new WhisperUnavailableError("whisper-cpp not found"));
+      const { out } = await transcribeFails(engine, { optional: true, language });
+      expect(out).toEqual({ ok: false, skipped: true, reason: "whisper_unavailable" });
+    });
 
     it.each(["whisper", "auto"])(
       "--no-runtime-install reaches %s including the fallback",
@@ -362,7 +494,7 @@ describe("transcribe command", () => {
       Object.assign(runners, { sherpa: true, mlx: false });
       const { exitCode, out } = await transcribeFails("parakeet");
       expect(exitCode).toBe(1);
-      expect(out.error).toMatch(
+      expect(errorMessage(out)).toMatch(
         /^Parakeet failed: .*Protobuf parsing failed\. To repair it, run: hyperframes models install parakeet$/,
       );
       expect(transcribeMock).not.toHaveBeenCalled();
@@ -375,9 +507,9 @@ describe("transcribe command", () => {
       );
       Object.assign(runners, { sherpa: true, mlx: false });
       const { out } = await transcribeFails("parakeet");
-      expect(out.error).toContain(`${"a".repeat(590)} tail`);
-      expect(out.error).toContain("b…. To repair it");
-      expect(String(out.error).length).toBeLessThan(800);
+      expect(errorMessage(out)).toContain(`${"a".repeat(590)} tail`);
+      expect(errorMessage(out)).toContain("b…. To repair it");
+      expect(errorMessage(out).length).toBeLessThan(800);
     });
 
     it("reports the Parakeet error, not whisper_unavailable, when the fallback is missing too", async () => {
@@ -387,7 +519,9 @@ describe("transcribe command", () => {
       const { exitCode, out } = await transcribeFails("auto", { optional: true });
       expect(exitCode).toBe(1);
       expect(out.skipped).toBeUndefined();
-      expect(out.error).toMatch(/^Parakeet failed: .*install parakeet.*whisper-cpp not found/);
+      expect(errorMessage(out)).toMatch(
+        /^Parakeet failed: .*install parakeet.*whisper-cpp not found/,
+      );
     });
 
     it("stops with exit 130 on Ctrl-C instead of falling back", async () => {
@@ -395,7 +529,10 @@ describe("transcribe command", () => {
       Object.assign(runners, { sherpa: true, mlx: false });
       const { exitCode, out } = await transcribeFails("auto");
       expect(exitCode).toBe(130);
-      expect(out).toEqual({ ok: false, error: "Transcription cancelled" });
+      expect(out).toEqual({
+        ok: false,
+        error: expect.objectContaining({ message: "Transcription cancelled" }),
+      });
       expect(transcribeMock).not.toHaveBeenCalled();
     });
 
@@ -413,10 +550,7 @@ describe("transcribe command", () => {
           "ffmpeg failed: Error opening output files: Invalid argument\nOutput file does not contain any stream",
         ],
       ])("after saying %j, the run exits %i", async (said, code, error) => {
-        const actual = await vi.importActual<typeof import("../whisper/transcribe.js")>(
-          "../whisper/transcribe.js",
-        );
-        prepareWavMock.mockImplementation((input: string) => actual.prepareWav(input));
+        vi.mocked(whisper.prepareWav).mockImplementation(realPrepareWav);
         const dir = mkdtempSync(join(tmpdir(), "hf-transcribe-ffmpeg-"));
         dirs.push(dir);
         const ffmpeg = join(dir, "ffmpeg");
@@ -427,7 +561,7 @@ describe("transcribe command", () => {
         Object.assign(runners, { sherpa: true, mlx: false });
         const { exitCode, out } = await transcribeFails("auto");
         expect(exitCode).toBe(code);
-        expect(out).toEqual({ ok: false, error });
+        expect(out).toEqual({ ok: false, error: expect.objectContaining({ message: error }) });
         expect(transcribeMock).not.toHaveBeenCalled();
       });
     });
@@ -442,7 +576,9 @@ describe("transcribe command", () => {
         expect(exitCode).toBe(1);
         expect(out).toEqual({
           ok: false,
-          error: "Command failed: ffmpeg -i silent.mp4 -vn -ar 16000",
+          error: expect.objectContaining({
+            message: "Command failed: ffmpeg -i silent.mp4 -vn -ar 16000",
+          }),
         });
       }
       expect(execFileMock).not.toHaveBeenCalled();
@@ -493,6 +629,10 @@ describe("transcribe command", () => {
       dirs.push(dir);
       await transcribeCmd.run!({ args: { input, json: true, engine: "auto" } } as never);
       expect(lastJson()).toMatchObject({ ok: true, engine: "parakeet", wordCount: 0 });
+
+      await transcribeCmd.run!({ args: { input, json: true, engine: "auto", to: "srt" } } as never);
+      expect(lastJson()).toMatchObject({ ok: true, wordCount: 0, format: "srt" });
+      expect(readFileSync(join(dir, "transcript.srt"), "utf-8")).toBe("");
     });
 
     it.runIf(process.platform === "linux" && process.arch === "x64")(
@@ -508,7 +648,7 @@ describe("transcribe command", () => {
         expect(console.error).not.toHaveBeenCalled();
         const { exitCode, out } = await transcribeFails("parakeet");
         expect(exitCode).toBe(1);
-        expect(out.error).toMatch(
+        expect(errorMessage(out)).toMatch(
           /^Parakeet needs glibc 2\.32 or newer; this system has glibc 2\.31\.$/,
         );
       },
@@ -547,6 +687,404 @@ Render video. Built for agents.
     });
   });
 
+  it("transcribes a media file straight to a VTT sidecar in one run", async () => {
+    const { dir, input } = dummyAudio();
+    dirs.push(dir);
+    const words = [
+      { id: "w0", text: "Write", start: 0, end: 0.5 },
+      { id: "w1", text: "HTML.", start: 0.5, end: 1 },
+    ];
+    transcribeMock.mockImplementation(async (_input, outputDir) => {
+      const result = fakeTranscript(outputDir, "whisper");
+      writeFileSync(result.transcriptPath, JSON.stringify(words));
+      return { ...result, wordCount: 2 };
+    });
+
+    await runCommand(transcribeCmd, {
+      rawArgs: [input, "--dir", dir, "--engine", "whisper", "--to", "vtt", "--json"],
+    });
+
+    const outputPath = join(dir, "transcript.vtt");
+    expect(readFileSync(outputPath, "utf-8")).toBe(formatVtt(words));
+    expect(JSON.parse(readFileSync(join(dir, "transcript.json"), "utf8"))).toEqual(words);
+    expect(console.log).toHaveBeenCalledTimes(1);
+    expect(lastJson()).toMatchObject({ ok: true, wordCount: 2, format: "vtt", outputPath });
+  });
+
+  it("fails on a missing --output folder before transcribing", async () => {
+    const { dir, input } = dummyAudio();
+    dirs.push(dir);
+    const output = join(dir, "missing", "captions.srt");
+
+    await expect(
+      transcribeCmd.run!({
+        args: { input, json: true, engine: "whisper", to: "srt", output },
+      } as never),
+    ).rejects.toThrow(CliRuntimeError);
+
+    expect(transcribeMock).not.toHaveBeenCalled();
+    expect(lastJson()).toEqual({
+      ok: false,
+      error: expect.objectContaining({
+        message: `Output folder not found: ${join(dir, "missing")}`,
+      }),
+    });
+  });
+
+  it.each([
+    ["an existing folder", (dir: string) => dir, "--output is a folder"],
+    [
+      "a path ending in a slash",
+      (dir: string) => join(dir, "captions") + "/",
+      "--output is a folder",
+    ],
+    [
+      "a path under a file",
+      (dir: string) => join(dir, "narration.wav", "out.srt"),
+      "Output folder not found",
+    ],
+    ["the input media", (dir: string) => join(dir, "narration.wav"), "would overwrite"],
+    ["the transcript it writes", (dir: string) => join(dir, "transcript.json"), "would overwrite"],
+    [
+      "a link to the input media",
+      (dir: string) => {
+        symlinkSync(join(dir, "narration.wav"), join(dir, "link.wav"));
+        return join(dir, "link.wav");
+      },
+      "would overwrite",
+    ],
+    [
+      "the transcript through a linked folder",
+      (dir: string) => {
+        symlinkSync(dir, join(dir, "alias"), "dir");
+        return join(dir, "alias", "transcript.json");
+      },
+      "would overwrite",
+    ],
+    [
+      "the input media by its real path",
+      (dir: string) => join(realpathSync(dir), "narration.wav"),
+      "would overwrite",
+    ],
+    [
+      "the transcript by its real path",
+      (dir: string) => join(realpathSync(dir), "transcript.json"),
+      "would overwrite",
+    ],
+    [
+      "the transcript in other letter case",
+      (dir: string) => join(dir, "Transcript.json"),
+      "would overwrite",
+    ],
+  ])("fails --output naming %s before transcribing", async (_name, output, error) => {
+    const { dir, input } = dummyAudio();
+    dirs.push(dir);
+
+    await expect(
+      transcribeCmd.run!({
+        args: { input, json: true, engine: "whisper", to: "srt", output: output(dir) },
+      } as never),
+    ).rejects.toThrow(CliRuntimeError);
+
+    expect(transcribeMock).not.toHaveBeenCalled();
+    expect(lastJson()).toMatchObject({
+      ok: false,
+      error: expect.objectContaining({ message: expect.stringContaining(error) }),
+    });
+  });
+
+  it("refuses --output naming the input media in other letter case on any disk", async () => {
+    const { dir, input } = dummyAudio();
+    dirs.push(dir);
+    const output = join(dir, "NARRATION.WAV");
+    // Case-insensitive disks alias the name to the media (same inode); case-sensitive ones do not.
+    if (existsSync(output)) expect(statSync(output).ino).toBe(statSync(input).ino);
+
+    await expect(
+      transcribeCmd.run!({
+        args: { input, json: true, engine: "whisper", to: "srt", output },
+      } as never),
+    ).rejects.toThrow(CliRuntimeError);
+
+    expect(transcribeMock).not.toHaveBeenCalled();
+    expect(lastJson()).toMatchObject({
+      ok: false,
+      error: expect.objectContaining({ message: expect.stringContaining("would overwrite") }),
+    });
+    expect(readFileSync(input, "utf8")).toBe("not-real-audio");
+  });
+
+  it("refuses the transcript under an upper-cased folder spelling on a first run", async () => {
+    const { dir, input } = dummyAudio();
+    dirs.push(dir);
+    const upper = join(dirname(dir), basename(dir).toUpperCase());
+    const caseInsensitive = existsSync(upper);
+
+    await expect(
+      transcribeCmd.run!({
+        args: {
+          input,
+          json: true,
+          engine: "whisper",
+          to: "srt",
+          output: join(upper, "transcript.json"),
+        },
+      } as never),
+    ).rejects.toThrow(CliRuntimeError);
+
+    expect(transcribeMock).not.toHaveBeenCalled();
+    // Only a case-insensitive disk has the upper-cased folder; elsewhere it is simply missing.
+    const error = caseInsensitive ? "would overwrite" : "Output folder not found";
+    expect(lastJson()).toMatchObject({
+      ok: false,
+      error: expect.objectContaining({ message: expect.stringContaining(error) }),
+    });
+  });
+
+  it("refuses an export whose default caption path is its own input", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hf-transcribe-test-"));
+    dirs.push(dir);
+    const input = join(dir, "transcript.srt");
+    const srt = "1\n00:00:00,000 --> 00:00:01,000\n<i>Hello</i>\n";
+    writeFileSync(input, srt);
+
+    await expect(
+      transcribeCmd.run!({ args: { input, json: true, to: "srt" } } as never),
+    ).rejects.toThrow(CliRuntimeError);
+
+    expect(lastJson()).toMatchObject({
+      ok: false,
+      error: expect.objectContaining({ message: expect.stringContaining("would overwrite") }),
+    });
+    expect(readFileSync(input, "utf8")).toBe(srt);
+  });
+
+  it("says why an export's caption file could not be written", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "hf-transcribe-test-"));
+    dirs.push(dir);
+    const input = join(dir, "subtitles.srt");
+    writeFileSync(input, "1\n00:00:00,000 --> 00:00:01,000\nHello\n");
+    const output = join(dir, NO_ROOM_FOR_TEMP);
+
+    await expect(
+      transcribeCmd.run!({ args: { input, json: true, to: "vtt", output } } as never),
+    ).rejects.toThrow(CliRuntimeError);
+
+    expect(lastJson()).toMatchObject({
+      ok: false,
+      error: expect.objectContaining({
+        message: expect.stringContaining(`The caption file ${output} could not be written: `),
+      }),
+    });
+    expect(errorMessage(lastJson())).toMatch(NAME_REFUSED);
+  });
+
+  async function runWithInodeZero(zero: (path: string) => boolean, args: object): Promise<void> {
+    const realStatSync = fs.statSync;
+    vi.spyOn(fs, "statSync").mockImplementation(((path: string, options?: object) => {
+      const stats = realStatSync(path, options);
+      return zero(String(path)) ? Object.assign(stats, { ino: 0n }) : stats;
+    }) as unknown as typeof statSync);
+    syncBuiltinESMExports();
+    transcribeMock.mockImplementation(async (_input, outputDir) =>
+      fakeTranscript(outputDir, "whisper"),
+    );
+    try {
+      await transcribeCmd.run!({ args } as never);
+    } catch (err) {
+      if (!(err instanceof CliRuntimeError)) throw err;
+    } finally {
+      vi.mocked(fs.statSync).mockRestore();
+      syncBuiltinESMExports();
+    }
+  }
+
+  it("does not call two different files the same when the disk reports inode 0", async () => {
+    const { dir, input } = dummyAudio();
+    dirs.push(dir);
+    const output = join(dir, "captions.srt");
+    writeFileSync(output, "old captions");
+
+    await runWithInodeZero(() => true, { input, json: true, engine: "whisper", to: "srt", output });
+
+    expect(lastJson()).toMatchObject({ ok: true, outputPath: output });
+    expect(readFileSync(output, "utf8")).toContain("-->");
+  });
+
+  it.each([
+    ["the media", "every path", "would overwrite"],
+    ["the media", "the caption path only", "would overwrite"],
+    ["the media", "the media only", "would overwrite"],
+    ["the transcript", "every path", "it is the same file as"],
+    ["the transcript", "the caption path only", "it is the same file as"],
+    ["the transcript", "the transcript only", "it is the same file as"],
+  ])("refuses a link to %s when %s reports inode 0", async (target, zeroed, error) => {
+    const { dir, input } = dummyAudio();
+    dirs.push(dir);
+    const kept = target === "the media" ? input : join(dir, "transcript.json");
+    const output = join(dir, "link.srt");
+    symlinkSync(kept, output);
+    const zeroPath = zeroed === "the caption path only" ? output : kept;
+
+    await runWithInodeZero((path) => zeroed === "every path" || path === zeroPath, {
+      input,
+      json: true,
+      engine: "whisper",
+      to: "srt",
+      output,
+    });
+
+    expect(lastJson()).toMatchObject({
+      ok: false,
+      error: expect.objectContaining({ message: expect.stringContaining(error) }),
+    });
+    expect(readFileSync(kept, "utf8")).not.toContain("-->");
+  });
+
+  it("fails a trailing -o with no path before transcribing", async () => {
+    const { dir, input } = dummyAudio();
+    dirs.push(dir);
+
+    await expect(
+      runCommand(transcribeCmd, { rawArgs: [input, "--to", "srt", "--json", "-o"] }),
+    ).rejects.toThrow(CliRuntimeError);
+
+    expect(transcribeMock).not.toHaveBeenCalled();
+    expect(lastJson()).toEqual({
+      ok: false,
+      error: expect.objectContaining({ message: "--output needs a file path" }),
+    });
+  });
+
+  it.each([
+    [
+      "a link to the transcript it is about to write",
+      (dir: string) => {
+        symlinkSync(join(dir, "transcript.json"), join(dir, "dangling.srt"));
+        return join(dir, "dangling.srt");
+      },
+      "it is the same file as",
+    ],
+    [
+      "a relative link to it inside a linked folder",
+      (dir: string) => {
+        mkdirSync(join(dir, "sub"));
+        symlinkSync("../transcript.json", join(dir, "sub", "cap.srt"));
+        symlinkSync(join(dir, "sub"), join(dir, "lnk"), "dir");
+        return join(dir, "lnk", "cap.srt");
+      },
+      "it is the same file as",
+    ],
+    [
+      "a name with no room for its temp file",
+      (dir: string) => join(dir, NO_ROOM_FOR_TEMP),
+      NAME_REFUSED,
+    ],
+  ])("keeps the transcript when --output is %s", async (_name, output, reason) => {
+    const { dir, input } = dummyAudio();
+    dirs.push(dir);
+    const transcript = join(dir, "transcript.json");
+    const caption = output(dir);
+    transcribeMock.mockImplementation(async (_input, outputDir) =>
+      fakeTranscript(outputDir, "whisper"),
+    );
+
+    await transcribeCmd.run!({
+      args: { input, json: true, engine: "whisper", to: "srt", output: caption },
+    } as never);
+
+    expect(consumeCommandResult().exitCode).toBe(1);
+    expect(lastJson()).toMatchObject({
+      ok: false,
+      error: expect.objectContaining({
+        message: expect.stringContaining(
+          `Transcript saved to ${transcript}, but the caption file ${caption} could not be written: `,
+        ),
+      }),
+    });
+    expect(errorMessage(lastJson())).toMatch(reason);
+    expect(JSON.parse(readFileSync(transcript, "utf8"))).toMatchObject([{ text: "whisper" }]);
+  });
+
+  it.each(["srt", "vtt"] as const)(
+    "replaces a link planted at transcript.%s instead of writing through it",
+    async (to) => {
+      const { dir, input } = dummyAudio();
+      const outside = mkdtempSync(join(tmpdir(), "hf-transcribe-outside-"));
+      dirs.push(dir, outside);
+      const target = join(outside, "profile");
+      writeFileSync(target, "keep me\n");
+      const caption = join(dir, `transcript.${to}`);
+      transcribeMock.mockImplementation(async (_input, outputDir) =>
+        fakeTranscript(outputDir, "whisper"),
+      );
+
+      symlinkSync(target, caption);
+      await transcribeCmd.run!({ args: { input, json: true, engine: "whisper", to } } as never);
+      expect(lastJson()).toMatchObject({ ok: true });
+      expect(readFileSync(target, "utf8")).toBe("keep me\n");
+
+      // Exporting the project's own transcript.json takes the other path to the same file name.
+      rmSync(caption);
+      symlinkSync(target, caption);
+      const transcript = join(dir, "transcript.json");
+      await transcribeCmd.run!({ args: { input: transcript, json: true, to } } as never);
+      expect(lastJson()).toMatchObject({ ok: true, outputPath: caption });
+
+      expect(readFileSync(target, "utf8")).toBe("keep me\n");
+      expect(readFileSync(caption, "utf8")).toContain("-->");
+    },
+  );
+
+  it("says the transcript was saved when the caption file cannot be written", async () => {
+    const { dir, input } = dummyAudio();
+    dirs.push(dir);
+    const output = join(dir, "captions.srt");
+    transcribeMock.mockImplementation(async (_input, outputDir) => {
+      // A folder at the caption path makes the write fail on any OS, even as root.
+      mkdirSync(output);
+      return fakeTranscript(outputDir, "whisper");
+    });
+
+    await transcribeCmd.run!({
+      args: { input, json: true, engine: "whisper", to: "srt", output },
+    } as never);
+
+    expect(consumeCommandResult().exitCode).toBe(1);
+    expect(lastJson()).toMatchObject({
+      ok: false,
+      error: expect.objectContaining({
+        message: expect.stringContaining(
+          `Transcript saved to ${join(dir, "transcript.json")}, but the caption file ${output} could not be written: `,
+        ),
+      }),
+    });
+    expect(existsSync(join(dir, "transcript.json"))).toBe(true);
+  });
+
+  it("groups transcribed CJK words into captions instead of one cue per word", async () => {
+    const { dir, input } = dummyAudio();
+    dirs.push(dir);
+    transcribeMock.mockImplementation(async (_input, outputDir) => {
+      const result = fakeTranscript(outputDir, "whisper");
+      writeFileSync(
+        result.transcriptPath,
+        JSON.stringify([
+          { text: "今日はいい", start: 0, end: 0.8 },
+          { text: "天気ですね", start: 0.8, end: 1.6 },
+        ]),
+      );
+      return { ...result, wordCount: 2 };
+    });
+
+    await transcribeCmd.run!({
+      args: { input, dir, json: true, engine: "whisper", to: "srt" },
+    } as never);
+
+    const { words: cues } = loadTranscript(join(dir, "transcript.srt"));
+    expect(cues.map((cue) => cue.text)).toEqual(["今日はいい天気ですね"]);
+  });
+
   it("rejects a below-minimum --timeout with a discoverable error", async () => {
     const { dir, input } = dummyAudio();
     dirs.push(dir);
@@ -564,8 +1102,8 @@ Render video. Built for agents.
     if (typeof log !== "string") throw new Error("Expected JSON log output");
     const parsed = JSON.parse(log);
     expect(parsed.ok).toBe(false);
-    expect(parsed.error).toContain("--timeout");
-    expect(parsed.error).toContain("5000");
+    expect(errorMessage(parsed)).toContain("--timeout");
+    expect(errorMessage(parsed)).toContain("5000");
   });
 
   it("--preserve-cues keeps single-word cues separate when exporting from JSON", async () => {

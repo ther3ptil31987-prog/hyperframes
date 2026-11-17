@@ -11,6 +11,8 @@ const extractionCalls = vi.hoisted(
   () => new Array<{ timelineEnd: number | undefined; durationSeconds: number }>(),
 );
 const toneMapHdrToSdrCalls = vi.hoisted(() => new Array<boolean | undefined>());
+const contentKeyedDirsCalls = vi.hoisted(() => new Array<readonly string[] | undefined>());
+const requestedVideoIds = vi.hoisted(() => new Array<string[]>());
 const fixtureState = vi.hoisted(() => ({ sourceDurationSeconds: 60 }));
 
 vi.mock("@hyperframes/engine", async (importOriginal) => {
@@ -20,8 +22,13 @@ vi.mock("@hyperframes/engine", async (importOriginal) => {
     extractAllVideoFrames: async (
       videos: VideoElement[],
       _baseDir: string,
-      options: { timelineEnd?: number; toneMapHdrToSdr?: boolean },
+      options: {
+        timelineEnd?: number;
+        toneMapHdrToSdr?: boolean;
+        contentKeyedDirs?: readonly string[];
+      },
     ): Promise<ExtractionResult> => {
+      requestedVideoIds.push(videos.map((v) => v.id));
       const sourceDurationSeconds = fixtureState.sourceDurationSeconds;
       const video = videos[0];
       if (!video) throw new Error("timeline-bound fixture requires one video");
@@ -38,6 +45,7 @@ vi.mock("@hyperframes/engine", async (importOriginal) => {
       video.end = video.start + durationSeconds;
       extractionCalls.push({ timelineEnd: options.timelineEnd, durationSeconds });
       toneMapHdrToSdrCalls.push(options.toneMapHdrToSdr);
+      contentKeyedDirsCalls.push(options.contentKeyedDirs);
       return {
         success: true,
         extracted: [],
@@ -66,14 +74,22 @@ vi.mock("@hyperframes/engine", async (importOriginal) => {
   };
 });
 
+import { join } from "node:path";
+import { REMOTE_MEDIA_SUBDIR } from "../../htmlCompiler.js";
 import { createRenderJob } from "../../renderOrchestrator.js";
 import { runExtractVideosStage } from "./extractVideosStage.js";
 
 async function runStage(
   compositionDuration: number,
   materializeSymlinks: boolean,
-  options: { source?: string; log?: ProducerLogger } = {},
-): Promise<void> {
+  options: {
+    source?: string;
+    log?: ProducerLogger;
+    extraVideos?: VideoElement[];
+    hdrMode?: "auto" | "force-hdr" | "force-sdr";
+    format?: "mp4" | "webm" | "mov";
+  } = {},
+): Promise<VideoElement[]> {
   const composition = {
     duration: compositionDuration,
     videos: [
@@ -86,6 +102,7 @@ async function runStage(
         loop: false,
         hasAudio: false,
       },
+      ...(options.extraVideos ?? []),
     ],
     audios: [],
     images: [],
@@ -98,7 +115,8 @@ async function runStage(
     job: createRenderJob({
       fps: { num: 30, den: 1 },
       quality: "standard",
-      hdrMode: "force-sdr",
+      hdrMode: options.hdrMode ?? "force-sdr",
+      format: options.format,
     }),
     cfg: resolveConfig(),
     log: options.log,
@@ -107,6 +125,7 @@ async function runStage(
     assertNotAborted: () => {},
     materializeSymlinks,
   });
+  return composition.videos;
 }
 
 describe.each([
@@ -140,6 +159,57 @@ describe.each([
     await runStage(2, materializeSymlinks);
 
     expect(toneMapHdrToSdrCalls).toEqual([true]);
+  });
+
+  it.each([
+    ["auto", "mp4", false],
+    ["auto", "webm", true],
+    ["force-hdr", "mov", true],
+  ] as const)(
+    "tone maps HDR sources in %s mode to %s output: %s",
+    async (hdrMode, format, want) => {
+      toneMapHdrToSdrCalls.splice(0);
+
+      await runStage(2, materializeSymlinks, { hdrMode, format });
+
+      expect(toneMapHdrToSdrCalls).toEqual([want]);
+    },
+  );
+
+  it("drops clips starting at or after the end before extraction, keeping natural-length ones", async () => {
+    requestedVideoIds.splice(0);
+    const outside = (id: string, start: number, end: number): VideoElement => ({
+      id,
+      src: "outside.mp4",
+      start,
+      end,
+      mediaStart: 0,
+      loop: false,
+      hasAudio: false,
+    });
+
+    const videos = await runStage(2, materializeSymlinks, {
+      extraVideos: [
+        outside("after-end", 2, 4),
+        outside("just-before-end", 1.99, 0),
+        outside("natural-length", 0, 0),
+        outside("negative-natural-length", -1, 0),
+      ],
+    });
+
+    const kept = ["root-video", "just-before-end", "natural-length", "negative-natural-length"];
+    expect(requestedVideoIds).toEqual([kept]);
+    expect(videos.map((v) => v.id)).toEqual(kept);
+  });
+
+  it("caches the compiled remote-media copies by content", async () => {
+    contentKeyedDirsCalls.splice(0);
+
+    await runStage(2, materializeSymlinks);
+
+    expect(contentKeyedDirsCalls).toEqual([
+      [join("/tmp/hf-timeline-bound-compiled", REMOTE_MEDIA_SUBDIR)],
+    ]);
   });
 });
 

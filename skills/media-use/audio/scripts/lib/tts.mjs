@@ -1,8 +1,10 @@
+import "../../../scripts/lib/windows-exe-search.mjs";
 import { fetchMedia } from "../../../scripts/lib/media-fetch.mjs";
+import { refuseUnderLimit } from "../../../scripts/lib/credit-limit.mjs";
 // tts.mjs — multi-provider TTS for the media audio engine. The provider chain,
 // auto-detected from env, is the one documented in ../SKILL.md:
 //
-//   1. HeyGen (Starfish)  — $HEYGEN_API_KEY / $HYPERFRAMES_API_KEY / ~/.heygen.
+//   1. HeyGen (Starfish)  — $HEYGEN_API_KEY / $HYPERFRAMES_API_KEY / ~/.hyperframes.
 //        Direct v3 REST (NOT `hyperframes tts`, which in the published build is
 //        Kokoro-only and silently ignores a HeyGen key). Returns word_timestamps
 //        in the same call, so no separate transcribe pass.
@@ -17,8 +19,14 @@ import { fetchMedia } from "../../../scripts/lib/media-fetch.mjs";
 import { spawn, spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join } from "node:path";
-import { heygenAuthHeaders, heygenCredential, heygenJSON, heygenMessage } from "./heygen.mjs";
+import { dirname, isAbsolute, join } from "node:path";
+import {
+  heygenAuthHeaders,
+  heygenCredential,
+  heygenJSON,
+  heygenMessage,
+  noteProjectElevenLabsKey,
+} from "./heygen.mjs";
 import { pythonInvocation } from "./python.mjs";
 import { synthesizeGemini } from "./gemini-tts.mjs";
 import { geminiConfigured } from "./gemini-auth.mjs";
@@ -49,9 +57,13 @@ export function pickProvider(userProvider) {
     if (userProvider === "heygen" && !heygenAvailable()) heygenAuthHeaders();
     if (userProvider === "elevenlabs" && !process.env.ELEVENLABS_API_KEY)
       throw new Error("provider=elevenlabs but $ELEVENLABS_API_KEY is not set");
+    if (userProvider === "elevenlabs") noteProjectElevenLabsKey();
     return userProvider;
   }
-  return heygenAvailable() ? "heygen" : elevenlabsAvailable() ? "elevenlabs" : "kokoro";
+  if (heygenAvailable()) return "heygen";
+  if (!elevenlabsAvailable()) return "kokoro";
+  noteProjectElevenLabsKey();
+  return "elevenlabs";
 }
 
 // ── voice resolution ──────────────────────────────────────────────────────────
@@ -145,6 +157,21 @@ export function resolveNpxCliPath(
   return pathExists(besideNode) ? besideNode : null;
 }
 
+export const MISSING_CLI_MESSAGE =
+  "No HyperFrames CLI was handed to this helper, and it does not look one up in the project. " +
+  "Run the helper through the plugin launcher (`plugin-cli.mjs --script <helper> ...`), or set " +
+  "HYPERFRAMES_CLI_ENTRY to the absolute path of your installed CLI's bin/hyperframes.mjs.";
+
+// The HyperFrames CLI or plugin launcher that starts this code hands over its own entry file, so
+// `npx hyperframes` runs that same CLI with the same Node. Without one it fails rather than
+// letting npx resolve `hyperframes` from the project.
+function launchingCliCommand(cmd, args, env = process.env) {
+  if (cmd !== "npx" || args[0] !== "hyperframes") return null;
+  const entry = env.HYPERFRAMES_CLI_ENTRY;
+  if (!entry || !isAbsolute(entry)) throw new Error(MISSING_CLI_MESSAGE);
+  return { cmd: process.execPath, args: [entry, ...args.slice(1).map((arg) => String(arg))] };
+}
+
 export function resolveSpawnCommand(
   cmd,
   args,
@@ -153,6 +180,8 @@ export function resolveSpawnCommand(
   env = process.env,
   pathExists = existsSync,
 ) {
+  const cli = launchingCliCommand(cmd, args, env);
+  if (cli) return { ...cli, opts: { stdio: "ignore", windowsHide: true, ...opts } };
   if (cmd !== "npx" || platform !== "win32") {
     return { cmd, args, opts: { stdio: "ignore", ...opts } };
   }
@@ -175,9 +204,11 @@ export function resolveSpawnCommand(
 // (its ESM exports are non-configurable, so mock.method can't patch it).
 // One-shot so a whole batch of TTS lines doesn't repeat the same diagnostic.
 let _warnedNpxResolution = false;
-/** Test-only: reset the one-shot npx-resolution warning latch. */
+let _warnedMissingCli = false;
+/** Test-only: reset the one-shot npx-resolution warning latches. */
 export function _resetNpxResolutionWarnForTests() {
   _warnedNpxResolution = false;
+  _warnedMissingCli = false;
 }
 
 export function spawnP(
@@ -189,7 +220,16 @@ export function spawnP(
   env = process.env,
   pathExists = existsSync,
 ) {
-  const resolved = resolveSpawnCommand(cmd, args, opts, platform, env, pathExists);
+  let resolved;
+  try {
+    resolved = resolveSpawnCommand(cmd, args, opts, platform, env, pathExists);
+  } catch (error) {
+    if (!_warnedMissingCli) {
+      _warnedMissingCli = true;
+      console.error(`[media-use] ${error.message}`);
+    }
+    return Promise.resolve({ status: -1, error: error.message });
+  }
   if (!resolved) {
     // resolveSpawnCommand only returns null for the npx-on-win32 case where
     // neither npm's configured CLI nor the beside-node fallback exists. Without
@@ -234,7 +274,7 @@ import os, sys
 from elevenlabs.client import ElevenLabs
 from elevenlabs import save
 client = ElevenLabs(api_key=os.environ["ELEVENLABS_API_KEY"])
-text = open(sys.argv[1]).read()
+text = open(sys.argv[1], encoding="utf-8").read()
 audio = client.text_to_speech.convert(
     text=text, voice_id=sys.argv[2],
     model_id="eleven_multilingual_v2", output_format="mp3_44100_128",
@@ -274,23 +314,21 @@ export async function synthesizeOne({
     } catch {
       return { ok: false, words: null };
     }
-    const { cmd, args } = pythonInvocation([
-      "-c",
-      ELEVENLABS_PY,
-      writeTmpText(text),
-      voiceId,
-      wavAbs,
-    ]);
-    const r = await spawnP(cmd, args, {});
-    return synthResult(r, wavAbs, "elevenlabs (python)");
+    return withTmpText(text, async (textPath) => {
+      const { cmd, args } = pythonInvocation(["-c", ELEVENLABS_PY, textPath, voiceId, wavAbs]);
+      const r = await spawnP(cmd, args, {});
+      return synthResult(r, wavAbs, "elevenlabs (python)");
+    });
   }
   // kokoro — via the published CLI; --output is relative to the project dir.
   const wavRel = relTo(hyperframesDir, wavAbs);
-  const args = ["hyperframes", "tts", writeTmpText(text), "--voice", voiceId, "--output", wavRel];
-  if (lang !== "en") args.push("--lang", lang);
-  if (speed !== 1) args.push("--speed", String(speed));
-  const r = await spawnP("npx", args, { cwd: hyperframesDir });
-  return synthResult(r, wavAbs, "kokoro (npx hyperframes tts)");
+  return withTmpText(text, async (textPath) => {
+    const args = ["hyperframes", "tts", textPath, "--voice", voiceId, "--output", wavRel];
+    if (lang !== "en") args.push("--lang", lang);
+    if (speed !== 1) args.push("--speed", String(speed));
+    const r = await spawnP("npx", args, { cwd: hyperframesDir });
+    return synthResult(r, wavAbs, "kokoro (npx hyperframes tts)");
+  });
 }
 
 // Shape a spawn result into { ok, words, error }, naming why on failure so the
@@ -298,7 +336,8 @@ export async function synthesizeOne({
 export function synthResult(r, wavAbs, label) {
   if (r.status === 0 && existsSync(wavAbs)) return { ok: true, words: null };
   const why =
-    r.status !== 0 ? `${label} exited with status ${r.status}` : `${label} produced no wav file`;
+    r.error ??
+    (r.status !== 0 ? `${label} exited with status ${r.status}` : `${label} produced no wav file`);
   return { ok: false, words: null, error: why };
 }
 
@@ -312,6 +351,7 @@ export async function synthesizeHeygen({ text, voiceId, lang, speed, wavAbs }, d
   const fetchImpl = deps.fetch ?? fetch;
   const transcode = deps.transcodeToWav ?? transcodeToWav;
   try {
+    refuseUnderLimit(deps.projectDir ?? process.cwd(), "a HeyGen voice", "voice");
     const body = { text, voice_id: voiceId, speed };
     if (lang !== "en") body.language = lang;
     const payload = await requestJSON(`/voices/speech`, {
@@ -378,11 +418,18 @@ export async function transcribeWav({ wavRel, lang = "en", hyperframesDir }) {
 }
 
 // ── tiny local utils ──────────────────────────────────────────────────────────
-function writeTmpText(text) {
+async function withTmpText(text, run) {
   const td = mkdtempSync(join(tmpdir(), "hf-txt-"));
-  const p = join(td, "line.txt");
-  writeFileSync(p, text);
-  return p;
+  try {
+    const p = join(td, "line.txt");
+    writeFileSync(p, text);
+    return await run(p);
+  } finally {
+    // Cleanup must preserve the synthesis result or the original write/spawn error.
+    try {
+      rmSync(td, { recursive: true, force: true });
+    } catch {}
+  }
 }
 function relTo(base, abs) {
   return abs.startsWith(base + "/") ? abs.slice(base.length + 1) : abs;

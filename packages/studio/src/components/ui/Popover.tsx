@@ -6,9 +6,14 @@
 import { Popover as BasePopover } from "@base-ui/react/popover";
 import type { ComponentPropsWithoutRef, ReactElement, ReactNode } from "react";
 import { cn } from "./cn";
-import { POPUP_LAYER, popupSurface, type PopupPreviewState } from "./Menu";
-
-type PortalContainer = ComponentPropsWithoutRef<typeof BasePopover.Portal>["container"];
+import {
+  POPUP_LAYER,
+  popupSurface,
+  useInlinePortal,
+  type PopupPreviewState,
+  type PortalContainer,
+  useTopLayerEscape,
+} from "./Menu";
 
 /** Matches Menu's gap from its trigger, and its viewport margin. */
 const SIDE_OFFSET = 6;
@@ -31,12 +36,16 @@ interface PopoverProps extends Omit<ComponentPropsWithoutRef<typeof BasePopover.
   side?: "top" | "bottom" | "left" | "right";
   align?: "start" | "center" | "end";
   sideOffset?: number;
+  collisionAvoidance?: ComponentPropsWithoutRef<
+    typeof BasePopover.Positioner
+  >["collisionAvoidance"];
   /** Points the popup at its trigger. Off by default; the default gap from the trigger grows by the arrow's height. */
   arrow?: boolean;
-  /** Portal target. Pass the shadow root when the trigger lives in one. */
+  /** Portal target. Pass the shadow root when the trigger lives in one; `null` keeps it inline. */
   container?: PortalContainer;
   /** Names the popup for assistive tech. */
   "aria-label"?: string;
+  "aria-describedby"?: string;
   /**
    * What to focus on open. Defaults to Base UI's behaviour (the first tabbable
    * element), which is what a rename field wants.
@@ -53,26 +62,33 @@ export function Popover({
   align = "center",
   arrow = false,
   sideOffset = arrow ? SIDE_OFFSET + ARROW_PX : SIDE_OFFSET,
+  collisionAvoidance,
   container,
   className,
   initialFocus,
   "aria-label": ariaLabel,
+  "aria-describedby": describedBy,
   "data-preview-state": previewState,
   ...root
 }: PopoverProps) {
+  const inline = useInlinePortal(container);
+  const escape = useTopLayerEscape(root.onOpenChange);
   return (
-    <BasePopover.Root {...root}>
-      <BasePopover.Trigger render={trigger} />
-      <BasePopover.Portal container={container}>
+    <BasePopover.Root {...root} onOpenChange={escape.onOpenChange}>
+      <BasePopover.Trigger ref={escape.trigger} render={trigger} aria-describedby={describedBy} />
+      {inline.host}
+      <BasePopover.Portal {...inline.portal}>
         <BasePopover.Positioner
           side={side}
           align={align}
           sideOffset={sideOffset}
           collisionPadding={VIEWPORT_MARGIN}
+          collisionAvoidance={collisionAvoidance}
           arrowPadding={ARROW_CORNER_CLEARANCE}
           className={POPUP_LAYER}
         >
           <BasePopover.Popup
+            ref={escape.popup}
             aria-label={ariaLabel}
             initialFocus={initialFocus}
             data-preview-state={previewState}

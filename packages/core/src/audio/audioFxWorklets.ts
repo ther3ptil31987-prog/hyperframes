@@ -1,3 +1,5 @@
+import { TRUE_PEAK_WORKLET_SOURCE } from "./audioFxTruePeak.js";
+
 /**
  * AudioWorklet processors for the effects Web Audio has no native node for.
  *
@@ -9,7 +11,8 @@
  * Kept as a source string so it can be registered from a Blob URL without a
  * separate bundled asset, which keeps the studio's build unchanged.
  */
-const AUDIO_FX_WORKLET_SOURCE = `
+const AUDIO_FX_WORKLET_SOURCE =
+  `
 const dbToLin = (db) => Math.pow(10, db / 20);
 
 /**
@@ -18,7 +21,7 @@ const dbToLin = (db) => Math.pow(10, db / 20);
  * Per channel matters: the followers advance once per sample, so a single shared
  * follower stepped once per channel per sample. On stereo that ran a 20 ms attack
  * as 10 ms, and gave the right channel a gain computed from an envelope that had
- * already traversed the left — so the two channels ducked by different amounts
+ * already traversed the left, so the two channels ducked by different amounts
  * from the same input and the image pumped.
  */
 class EnvBank {
@@ -189,6 +192,7 @@ class HfBitcrush extends AudioWorkletProcessor {
     this.p = o.processorOptions || {};
     this.holds = [];
     this.held = [];
+    this.start = Math.round((this.p.__hfElapsed ?? 0) * sampleRate);
     this.port.onmessage = (e) => {
       if (e.data && e.data.__hfDispose) { this.dead = true; return; }
       this.p = { ...this.p, ...e.data };
@@ -204,8 +208,10 @@ class HfBitcrush extends AudioWorkletProcessor {
     const mix = p.mix ?? 1;
     for (let ch = 0; ch < i.length; ch++) {
       const inp = i[ch], out = o[ch];
-      if (this.held[ch] === undefined) this.held[ch] = 0;
-      if (this.holds[ch] === undefined) this.holds[ch] = 0;
+      // Primed from the input: a counter seeded mid-hold would otherwise play 0 until it wraps.
+      if (this.held[ch] === undefined) this.held[ch] = Math.round(inp[0] * levels) / levels;
+      // The hold counter runs from the file's first sample, so a node built part-way in starts where it would be.
+      if (this.holds[ch] === undefined) this.holds[ch] = this.start % step;
       for (let n = 0; n < inp.length; n++) {
         // Per channel: advancing one shared counter only on the last channel
         // left every earlier channel either unheld or frozen for a whole
@@ -230,7 +236,7 @@ function readTap(ring, write, delaySamples) {
   return ring[i0] * (1 - frac) + ring[i1] * frac;
 }
 
-/** Equal-power-ish crossfade, zero at a tap's reset point — hides the splice. */
+/** Equal-power-ish crossfade, zero at a tap's reset point, which hides the splice. */
 function xfade(phase) {
   return Math.sin(Math.PI * phase);
 }
@@ -242,7 +248,7 @@ function xfade(phase) {
  * out, which hides the splice each tap makes when it wraps.
  *
  * write/phase are block-level state, advanced once per SAMPLE across all
- * channels together (not once per channel) — advancing them inside the
+ * channels together (not once per channel). Advancing them inside the
  * per-channel loop would move the tap 2x/4x too fast on a stereo/quad input.
  */
 class HfPitchshift extends AudioWorkletProcessor {
@@ -252,16 +258,20 @@ class HfPitchshift extends AudioWorkletProcessor {
     this.grain = Math.round(sampleRate * 0.1);
     this.buf = [];
     this.write = 0;
-    this.phase = 0;
+    // The taps sweep at a constant rate from the start of the file, so a node built
+    // part-way in joins the sweep where it would already be.
+    const ratio0 = Math.pow(2, Math.max(-12, Math.min(12, this.p.semitones ?? 0)) / 12);
+    const turns = (this.p.__hfElapsed ?? 0) * sampleRate * ((1 - ratio0) / this.grain);
+    this.phase = turns - Math.floor(turns);
     // Samples written so far, capped at one grain. The taps read up to a grain
     // behind the write head, so until this fills they would read the ring's
-    // zeros — the head of every clip came out attenuated or silent.
+    // zeros, so the head of every clip came out attenuated or silent.
     this.filled = 0;
     // How much of the wet (pitch-shifted) path is currently in the output, and
     // where it is heading. Crossing between dry and wet is a ~50 ms jump in the
     // signal, so it is RAMPED rather than switched: a hard swap either way is a
     // click. Ramping in both directions is also what lets a node return to true
-    // bypass at semitones 0 — a one-way latch left preview stuck with the delay
+    // bypass at semitones 0. A one-way latch left preview stuck with the delay
     // that the render, building a fresh node from the attribute, does not have.
     this.wet = 0;
     this.wetTarget = 0;
@@ -289,7 +299,7 @@ class HfPitchshift extends AudioWorkletProcessor {
 
     // Nothing to shift, or mixed fully out. The grain delay is ~grain/2
     // whatever the ratio, so at semitones=0 this degenerated into a pure 50 ms
-    // delay of the signal — while the copy for that exact setting reads
+    // delay of the signal, while the copy for that exact setting reads
     // "Unchanged pitch".
     this.wetTarget = semitones === 0 ? 0 : mix;
 
@@ -345,7 +355,7 @@ class HfPitchshift extends AudioWorkletProcessor {
   }
 }
 registerProcessor("hf-pitchshift", HfPitchshift);
-`;
+` + TRUE_PEAK_WORKLET_SOURCE;
 
 // Registration is per context, not per module: a processor registered on one
 // AudioContext does not exist on another, so caching a single promise made
@@ -368,7 +378,7 @@ export function ensureAudioFxWorklets(ctx: BaseAudioContext): Promise<void> {
     modulePromise = (async () => {
       if (!ctx.audioWorklet) {
         throw new Error(
-          "AudioWorklet is unavailable — the page needs a secure context (https, localhost or file://)",
+          "AudioWorklet is unavailable: the page needs a secure context (https, localhost or file://)",
         );
       }
       // A data: URL rather than a blob:, because a blob inherits the page origin

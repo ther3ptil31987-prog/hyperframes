@@ -31,9 +31,16 @@ const hashInput: SegmentPlanHashInput = {
   outputWidth: 1920,
   outputHeight: 1080,
   motionBlur: "",
+  pageMotionBlur: undefined,
+  captureQuality: 80,
 };
 
 describe("computeSegmentPlanHash", () => {
+  it("does not reuse authored-blur segments when page blur is explicitly off", () => {
+    expect(computeSegmentPlanHash({ ...hashInput, pageMotionBlur: "off" })).not.toBe(
+      computeSegmentPlanHash(hashInput),
+    );
+  });
   it("is stable and 16 hex chars", () => {
     const a = computeSegmentPlanHash(hashInput);
     expect(a).toMatch(/^[0-9a-f]{16}$/);
@@ -68,6 +75,7 @@ describe("computeSegmentPlanHash", () => {
     expect(computeSegmentPlanHash({ ...hashInput, motionBlur: '{"samplesPerFrame":32}' })).not.toBe(
       a,
     );
+    expect(computeSegmentPlanHash({ ...hashInput, captureQuality: 100 })).not.toBe(a);
   });
 
   it("does not collide across adjacent field boundaries", () => {
@@ -127,7 +135,7 @@ describe("manifest io", () => {
 
   it("segmentDirFor nests under renders/.hf-segments", () => {
     dir = mkdtempSync(join(tmpdir(), "hf-seg-"));
-    expect(segmentDirFor("/p/renders", "abc")).toBe("/p/renders/.hf-segments/abc");
+    expect(segmentDirFor("/p/renders", "abc")).toBe(join("/p/renders", ".hf-segments", "abc"));
   });
 });
 
@@ -180,6 +188,33 @@ describe("validateCompletedSegments", () => {
       ],
     };
     expect((await validateCompletedSegments(manifest, "h", async () => 3)).size).toBe(0);
+  });
+
+  it("a resume whose segment files were removed after a join captures them again rather than failing", async () => {
+    dir = mkdtempSync(join(tmpdir(), "hf-seg-"));
+    const joined = [0, 1].map((index) => join(dir, `segment_0000${index}.mp4`));
+    const manifest: SegmentManifest = {
+      version: 1,
+      planHash: "h",
+      totalFrames: 6,
+      segmentFrames: 3,
+      completed: joined.map((path, index) => ({
+        index,
+        startFrame: index * 3,
+        endFrame: index * 3 + 3,
+        path,
+        bytes: 2,
+        completedAt: "",
+      })),
+    };
+    // The manifest still lists them, but the join deleted the files.
+    let probed = 0;
+    const probe = async () => {
+      probed += 1;
+      return 3;
+    };
+    expect((await validateCompletedSegments(manifest, "h", probe)).size).toBe(0);
+    expect(probed).toBe(0);
   });
 
   it("skips nothing when the plan hash differs", async () => {

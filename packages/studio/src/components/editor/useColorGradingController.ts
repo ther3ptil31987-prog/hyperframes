@@ -24,12 +24,15 @@ import {
   postRuntimeControlMessage,
 } from "../../player/lib/runtimeProtocol";
 import {
+  readSealedColorGradingStatus,
   useColorGradingPreviews,
   type ColorGradingCapturedFrame,
   type ColorGradingPresetPreviews,
   type ColorGradingPreviewOptions,
 } from "./useColorGradingPreviews";
 import { studioApiFetch } from "../../utils/studioApiFetch";
+import { authoredSrcPath } from "../../player/components/thumbnailUtils";
+import { previewFrameOpaque } from "../../player/lib/previewChannel";
 
 export type { ColorGradingPresetPreviews, ColorGradingPreviewOptions };
 
@@ -97,7 +100,7 @@ function resolveProjectAssetPath(
   const sourceDir = sourceFile.includes("/")
     ? sourceFile.slice(0, sourceFile.lastIndexOf("/"))
     : "";
-  const parts = `${sourceDir}/${trimmed}`.split("/");
+  const parts = `${sourceDir}/${authoredSrcPath(trimmed)}`.split("/");
   const normalized: string[] = [];
   for (const part of parts) {
     if (!part || part === ".") continue;
@@ -278,8 +281,9 @@ export function useColorGradingController({
     [element.hfId, element.id, element.selector, element.selectorIndex],
   );
 
+  const statusReadRef = useRef(0);
   const refreshRuntimeStatus = useCallback(() => {
-    setRuntimeStatus(readRuntimeColorGradingStatus(previewIframeRef?.current, target));
+    refreshStatus(previewIframeRef?.current, target, statusReadRef, setRuntimeStatus);
   }, [previewIframeRef, target]);
 
   useEffect(() => {
@@ -351,7 +355,7 @@ export function useColorGradingController({
         const reverted = confirmedGradingRef.current;
         latestGradingRef.current = reverted;
         setGrading(reverted);
-        setRuntimeStatus({ state: "unavailable", message: "Save failed — reverted" });
+        setRuntimeStatus({ state: "unavailable", message: "Save failed, changes reverted" });
       };
       // The callback is the primary result signal; the rejection path supports
       // other setAttributeLive implementations.
@@ -566,4 +570,20 @@ export function useColorGradingController({
       });
     },
   };
+}
+
+function refreshStatus(
+  iframe: HTMLIFrameElement | null | undefined,
+  target: HfColorGradingTarget,
+  reads: { current: number },
+  apply: (status: RuntimeColorGradingStatus) => void,
+): void {
+  if (!iframe || !previewFrameOpaque(iframe)) {
+    apply(readRuntimeColorGradingStatus(iframe, target));
+    return;
+  }
+  const read = ++reads.current;
+  void readSealedColorGradingStatus(iframe, target).then((status) => {
+    if (read === reads.current) apply(status);
+  });
 }

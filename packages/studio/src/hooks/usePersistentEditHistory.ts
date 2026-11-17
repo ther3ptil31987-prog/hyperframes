@@ -3,7 +3,10 @@ import type { HistoryListItem, HistoryResult } from "@hyperframes/studio-server"
 import { studioFileContentVersion, studioWriteHeaders } from "../utils/studioFileVersion";
 import type { RestoreFiles } from "../utils/gsapUndoRestore";
 import { studioApiFetch } from "../utils/studioApiFetch";
-import { setStudioPendingEditClaimClock } from "../utils/studioPendingEdits";
+import {
+  setStudioPendingEditClaimClock,
+  setStudioPendingEditsSettled,
+} from "../utils/studioPendingEdits";
 import type { RecordEditInput } from "../utils/studioFileHistory";
 import { generateId } from "../utils/generateId";
 
@@ -41,6 +44,7 @@ interface HistoryView {
   forward: NextStep | null;
 }
 
+const APP_KEEPS_NO_HISTORY = 404;
 const EMPTY: HistoryView = { entries: [], back: null, forward: null };
 /** ponytail: the newest entries' content is kept; older ones step through the server only. */
 const OWN_ENTRIES_KEPT = 100;
@@ -154,7 +158,9 @@ function claimHeld(reply: Awaited<ReturnType<typeof post>>, label: string): stri
   if (reply.ok)
     return (reply.body as { claimed: { id: string } | null } | null)?.claimed?.id ?? null;
   if (reply.status !== 404)
-    console.error(`"${label}" was not recorded as your edit: ${reply.error}`);
+    console.error(
+      `[history] ${reply.status}: "${label}" was not recorded as your edit: ${reply.error}`,
+    );
   return null;
 }
 
@@ -199,12 +205,28 @@ function redoneAt(view: HistoryView): number | null {
   return view.entries.find((entry) => entry.id === undo?.undoes)?.endedAt ?? null;
 }
 
+function closeHeldClaimWithAClaimOfNothing(
+  projectId: string,
+  heldClaimRef: { current: { paths: string[]; at: number } | null },
+  refresh: () => Promise<void>,
+): Promise<void> {
+  if (!heldClaimRef.current) return Promise.resolve();
+  heldClaimRef.current = null;
+  return post(historyUrl(projectId, "/claim"), { label: "Edited in Studio", paths: [] }).then(
+    (reply) => {
+      if (reply.ok) void refresh();
+    },
+  );
+}
+
 /** Studio's undo over the server's project history: an edit claims what it wrote; Cmd+Z steps the person's. */
+// fallow-ignore-next-line complexity
 export function usePersistentEditHistory({ projectId }: UsePersistentEditHistoryOptions) {
   const [view, setView] = useState<HistoryView>(EMPTY);
   const [loaded, setLoaded] = useState(false);
   // A coalescing claim the server just took, until `refresh()` brings its entry into `view`.
   const heldClaimRef = useRef<{ paths: string[]; at: number } | null>(null);
+  const claimsAfterTheClose = useRef<Promise<void>>(Promise.resolve());
   const projectIdRef = useRef(projectId);
   projectIdRef.current = projectId;
   const [own] = useState(createOwnHistory);
@@ -237,14 +259,28 @@ export function usePersistentEditHistory({ projectId }: UsePersistentEditHistory
     return () => setStudioPendingEditClaimClock(null);
   }, [own]);
 
+  useEffect(() => {
+    if (!projectId) return;
+    setStudioPendingEditsSettled(() => {
+      claimsAfterTheClose.current = closeHeldClaimWithAClaimOfNothing(
+        projectId,
+        heldClaimRef,
+        refresh,
+      );
+    });
+    return () => setStudioPendingEditsSettled(null);
+  }, [projectId, refresh]);
+
   const recordEdit = useCallback(
-    async ({ label, coalesceKey, coalesceMs, files, created = [] }: RecordEditInput) => {
+    async ({ label, coalesceKey, coalesceMs, files, targets, created = [] }: RecordEditInput) => {
       if (!projectId) return;
       const paths = [...Object.keys(files), ...created];
       own.overtake();
+      await claimsAfterTheClose.current;
       const reply = await post(historyUrl(projectId, "/claim"), {
         label,
         paths,
+        ...(targets?.length && { targets }),
         overwrote: await overwroteVersions(files),
         ...(coalesceKey && {
           coalesceKey: claimKey(coalesceKey),
@@ -283,8 +319,8 @@ export function usePersistentEditHistory({ projectId }: UsePersistentEditHistory
         );
         heldClaimRef.current = null;
         void refresh();
-        // 404: this app keeps no history, so there is nothing to step.
-        if (!posted.ok && posted.status === 404) return { ok: false, reason: "empty" };
+        if (!posted.ok && posted.status === APP_KEEPS_NO_HISTORY)
+          return { ok: false, reason: "empty" };
         if (!posted.ok) return { ok: false, reason: "failed", message: posted.error };
         const reply = posted.body as HistoryResult;
         if (!reply.ok) {

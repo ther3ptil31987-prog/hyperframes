@@ -1,5 +1,5 @@
-import { COLOR_GRADING_SOURCE_HIDDEN_ATTR } from "@hyperframes/core/color-grading";
-import { motionPathPluginUrl } from "@hyperframes/core/gsap-cdn";
+import { parseGsapScript } from "@hyperframes/parsers/gsap-parser";
+import { GSAP_BASE_URL_META, motionPathPluginUrl } from "@hyperframes/core/gsap-cdn";
 import { findAuthoredElement } from "./authoredSource";
 import { applyAuthoredInlineOpacity, readStampedAuthoredOpacity } from "./authoredOpacity";
 import {
@@ -12,7 +12,12 @@ import {
 
 type IframeWindow = Window & {
   __timelines?: Record<string, { kill?: () => void; pause?: () => void }>;
-  __player?: { getTime?: () => number; seek?: (t: number) => void };
+  __player?: {
+    getTime?: () => number;
+    seek?: (t: number) => void;
+    isPlaying?: () => boolean;
+    play?: () => void;
+  };
   __hfForceTimelineRebind?: () => void;
   __hfSuppressSceneMutations?: <T>(fn: () => T) => T;
   __hfStudioManualEditsApply?: () => void;
@@ -50,6 +55,13 @@ type IframeWindow = Window & {
 // At most one preview waits for its runtime; a newer load replaces it, so a frame that never boots is not kept alive.
 let pendingReadyRetry: ((event: MessageEvent) => void) | null = null;
 
+function previewMotionPathUrl(doc: Document, version?: string): string {
+  const baseUrl = doc.head.querySelector<HTMLMetaElement>(
+    `meta[name="${GSAP_BASE_URL_META}"]`,
+  )?.content;
+  return motionPathPluginUrl(version, baseUrl);
+}
+
 export function ensureMotionPathPluginLoaded(iframe: HTMLIFrameElement | null): void {
   if (pendingReadyRetry) window.removeEventListener("message", pendingReadyRetry);
   pendingReadyRetry = null;
@@ -86,7 +98,7 @@ export function ensureMotionPathPluginLoaded(iframe: HTMLIFrameElement | null): 
   try {
     win.__hfMotionPathPluginLoading = true;
     const pluginScript = doc.createElement("script");
-    pluginScript.src = motionPathPluginUrl(win.gsap?.version);
+    pluginScript.src = previewMotionPathUrl(doc, win.gsap?.version);
     const finalize = () => {
       win.__hfMotionPathPluginLoading = false;
       try {
@@ -245,9 +257,12 @@ export interface SoftReloadOptions {
  * no-op if the timeline already reports being at that time internally.
  */
 function finalizeSoftReload(win: IframeWindow, currentTime: number): void {
+  // A seek pauses the player, so an edit made while playing resumes it once the timeline is rebuilt.
+  const wasPlaying = win.__player?.isPlaying?.() === true;
   win.__player?.seek?.(currentTime);
   win.__hfForceTimelineRebind?.();
   win.__hfStudioManualEditsApply?.();
+  if (wasPlaying) win.__player?.play?.();
 }
 
 /**
@@ -270,8 +285,8 @@ export function applySoftReloadFinalization(
   currentTime: number,
 ): boolean {
   const win = iframe?.contentWindow as IframeWindow | null;
-  if (!win?.__hfForceTimelineRebind) return false;
   try {
+    if (!win?.__hfForceTimelineRebind) return false;
     if (win.__hfSuppressSceneMutations) {
       win.__hfSuppressSceneMutations(() => finalizeSoftReload(win, currentTime));
     } else {
@@ -280,6 +295,40 @@ export function applySoftReloadFinalization(
     return true;
   } catch {
     return false;
+  }
+}
+
+const animatedBy = (doc: Document, scriptText: string): Set<Element> => {
+  const animated = new Set<Element>();
+  for (const { targetSelector } of parseGsapScript(scriptText).animations) {
+    try {
+      for (const element of doc.querySelectorAll(targetSelector)) animated.add(element);
+    } catch {
+      // A selector this document cannot parse animates nothing in it.
+    }
+  }
+  return animated;
+};
+
+/** Authored style back on the elements the restored script stops animating, before a reload lands. */
+export function repaintDroppedTweenStyle(
+  win: IframeWindow,
+  doc: Document,
+  authored: Document,
+  targetKeys: string[],
+  restoredScript: string | null,
+): void {
+  const live = findGsapScriptElements(doc)
+    .map((script) => script.textContent ?? "")
+    .join("");
+  if (live === (restoredScript ?? "")) return;
+  const kept = restoredScript ? animatedBy(doc, restoredScript) : new Set<Element>();
+  for (const [element, tweened] of collectResetTargets(win, doc, targetKeys)) {
+    if (kept.has(element)) continue;
+    const source = findAuthoredElement(authored, element);
+    const style =
+      source instanceof HTMLElement || source instanceof SVGElement ? source.style : null;
+    restoreAuthoredStyle((element as HTMLElement).style, style, tweened);
   }
 }
 
@@ -414,24 +463,13 @@ export function applySoftReload(
         s.cssText = css;
         restoreAuthoredStyle(s, findAuthoredStyle(el), targets.get(el)!);
         // The restored cssText carries RUNTIME opacity, not authored opacity:
-        // a mid-flight tween's interpolated value, or the color-grading hide
-        // (`opacity: 0 !important`). The re-run script's tweens re-initialize
+        // a mid-flight tween's interpolated value. The re-run script's tweens re-initialize
         // against it — a from() captures it as its END, a to() as its START —
         // turning the transient into the tween's permanent bound (dimmed or
         // invisible elements). Put the AUTHORED inline opacity back; the seek
         // below re-renders the correct animated value either way.
         const authored = readAuthoredOpacity(el);
-        if (authored !== null) {
-          applyAuthoredInlineOpacity(s, authored);
-        } else if (
-          el.hasAttribute(COLOR_GRADING_SOURCE_HIDDEN_ATTR) &&
-          s.getPropertyValue("opacity") === "0" &&
-          s.getPropertyPriority("opacity") === "important"
-        ) {
-          // Authored value unknown, but this is definitely the grading hide —
-          // never let a from() capture 0; fall back to the CSS cascade.
-          s.removeProperty("opacity");
-        }
+        if (authored !== null) applyAuthoredInlineOpacity(s, authored);
       }
     }
     forgetLiveSets(targets);
@@ -480,7 +518,7 @@ export function applySoftReload(
       }
       win.__hfMotionPathPluginLoading = true;
       const pluginScript = doc.createElement("script");
-      pluginScript.src = motionPathPluginUrl(win.gsap?.version);
+      pluginScript.src = previewMotionPathUrl(doc, win.gsap?.version);
       pluginScript.onload = () => {
         win.__hfMotionPathPluginLoading = false;
         executeScript();

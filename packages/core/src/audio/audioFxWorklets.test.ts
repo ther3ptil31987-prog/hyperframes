@@ -1,5 +1,9 @@
 import { describe, expect, it, vi } from "vitest";
 import { audioFxWorkletsReady, ensureAudioFxWorklets } from "./audioFxWorklets.js";
+import {
+  loadProcessors as loadProcessorsAt,
+  type Processor,
+} from "./audioFxProcessors.test-helpers.js";
 
 /** Just enough of a BaseAudioContext for the registration cache to key on. */
 const contextWith = (addModule: (url: string) => Promise<void>): BaseAudioContext =>
@@ -51,33 +55,7 @@ describe("ensureAudioFxWorklets", () => {
  * `addModule`, so this also proves the URL carries what it claims to.
  */
 describe("the worklet processors themselves", () => {
-  /** Evaluate the registered module and hand back the processor classes by name. */
-  async function loadProcessors(): Promise<Map<string, new (o: unknown) => Processor>> {
-    let moduleSource = "";
-    await ensureAudioFxWorklets(
-      contextWith(async (url: string) => {
-        moduleSource = atob(url.replace("data:text/javascript;base64,", ""));
-      }),
-    );
-    const made = new Map<string, new (o: unknown) => Processor>();
-    class Base {
-      port = {
-        onmessage: null as ((e: { data: unknown }) => void) | null,
-        postMessage: (data: unknown) => this.port.onmessage?.({ data }),
-      };
-    }
-    new Function("AudioWorkletProcessor", "registerProcessor", "sampleRate", moduleSource)(
-      Base,
-      (name: string, cls: new (o: unknown) => Processor) => made.set(name, cls),
-      48000,
-    );
-    return made;
-  }
-
-  interface Processor {
-    port: { postMessage(data: unknown): void };
-    process(inputs: Float32Array[][], outputs: Float32Array[][]): boolean;
-  }
+  const loadProcessors = () => loadProcessorsAt(48000);
 
   const block = (): Float32Array[][] => [[new Float32Array(128)]];
 
@@ -89,6 +67,7 @@ describe("the worklet processors themselves", () => {
       "hf-gate",
       "hf-bitcrush",
       "hf-pitchshift",
+      "hf-truepeak",
     ]);
 
     for (const [name, Cls] of processors) {
@@ -100,6 +79,22 @@ describe("the worklet processors themselves", () => {
       p.port.postMessage({ mix: 0.5 });
       expect(p.process(block(), block()), `${name} came back to life`).toBe(false);
     }
+  });
+
+  describe("HfBitcrush", () => {
+    it("does not open with silence when its hold counter starts part-way through a hold", async () => {
+      const HfBitcrush = (await loadProcessors()).get("hf-bitcrush");
+      if (!HfBitcrush) throw new Error("hf-bitcrush not registered");
+      // 251 frames in with a hold of 250: one frame into a hold, with 249 left before the next sample.
+      const p = new HfBitcrush({
+        processorOptions: { bits: 8, samples: 250, mix: 1, __hfElapsed: 251 / 48000 },
+      });
+      const input = new Float32Array(128).fill(0.5);
+      const output = new Float32Array(128);
+      p.process([[input]], [[output]]);
+      expect(Math.abs(output[0] ?? 0)).toBeGreaterThan(0.4);
+      expect(output.every((x) => Math.abs(x) > 0.4)).toBe(true);
+    });
   });
 
   describe("HfPitchshift", () => {

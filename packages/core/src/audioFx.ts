@@ -103,7 +103,7 @@ const freq = (
   automatable: true,
 });
 
-const qParam = (def = 0.707, hint = "Bandwidth — higher is narrower."): HfAudioFxNumberParam => ({
+const qParam = (def = 0.707, hint = "Bandwidth: higher is narrower."): HfAudioFxNumberParam => ({
   kind: "number",
   key: "q",
   label: "Q",
@@ -187,7 +187,7 @@ export const HF_AUDIO_FX: readonly HfAudioFxDef[] = [
     id: "highpass",
     label: "High-pass",
     group: "filter",
-    description: "Remove low frequencies — the usual fix for rumble on a voice.",
+    description: "Remove low frequencies: the usual fix for rumble on a voice.",
     params: [freq("frequency", "Cutoff", 300, 20, 20000), qParam(0.707), poles],
     web: "biquad-highpass",
   },
@@ -195,7 +195,7 @@ export const HF_AUDIO_FX: readonly HfAudioFxDef[] = [
     id: "lowpass",
     label: "Low-pass",
     group: "filter",
-    description: "Remove high frequencies — darkens or muffles a track.",
+    description: "Remove high frequencies, which darkens or muffles a track.",
     params: [freq("frequency", "Cutoff", 8000, 100, 20000), qParam(0.707), poles],
     web: "biquad-lowpass",
   },
@@ -288,7 +288,8 @@ export const HF_AUDIO_FX: readonly HfAudioFxDef[] = [
     id: "limiter",
     label: "Limiter",
     group: "dynamics",
-    description: "Hard ceiling — nothing gets past the limit.",
+    description:
+      "Peak limiter that follows the signal's level. It has no lookahead, so a fast peak or an inter-sample peak can pass the ceiling; use the true-peak limiter for a delivery limit.",
     params: [
       {
         kind: "number",
@@ -333,6 +334,49 @@ export const HF_AUDIO_FX: readonly HfAudioFxDef[] = [
       },
     ],
     web: "worklet-limiter",
+  },
+  {
+    id: "truepeak",
+    label: "True-peak limiter",
+    group: "dynamics",
+    description:
+      "Lookahead limiter that holds a 4x estimate of the inter-sample peak at a dBTP ceiling; full-band noise can land up to about 1.7 dB above it. Adds lookahead plus about 0.3 ms of latency.",
+    params: [
+      {
+        kind: "number",
+        key: "ceiling",
+        label: "Ceiling",
+        unit: "dBTP",
+        min: -24,
+        max: 0,
+        step: 0.1,
+        default: -1,
+        hint: "Target true peak, measured on a 4x oversampled signal. Dense full-band sound can end up to about 1.7 dB above it.",
+      },
+      {
+        kind: "number",
+        key: "lookahead",
+        label: "Lookahead",
+        unit: "ms",
+        min: 0.5,
+        max: 10,
+        step: 0.1,
+        default: 3,
+        hint: "How far ahead the gain starts falling. Longer is smoother and adds the same latency.",
+      },
+      {
+        kind: "number",
+        key: "release",
+        label: "Release",
+        unit: "ms",
+        min: 10,
+        max: 2000,
+        step: 1,
+        default: 80,
+        scale: "log",
+      },
+    ],
+    web: "worklet-truepeak",
   },
   {
     id: "gate",
@@ -490,7 +534,7 @@ export const HF_AUDIO_FX: readonly HfAudioFxDef[] = [
         max: 250,
         step: 1,
         default: 1,
-        hint: "Repeats each sample N times — a crude downsample.",
+        hint: "Repeats each sample N times, a crude downsample.",
       },
       {
         kind: "number",

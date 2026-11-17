@@ -5,7 +5,18 @@ export * from "./ui";
 export { EditorShell } from "./components/EditorShell";
 export type { EditorShellProps } from "./components/EditorShell";
 export { NLEPreview } from "./components/nle/NLEPreview";
-export { DEFAULT_SHORTCUT_SECTIONS } from "./player/components/studioShortcuts";
+export {
+  DEFAULT_SHORTCUT_SECTIONS,
+  DEFAULT_STUDIO_KEYS,
+  buildShortcutSections,
+  getStudioKeys,
+  setStudioKeys,
+  studioKeyClash,
+  useStudioKeys,
+} from "./player/components/studioShortcuts";
+export { formatCombo, matchCombo, parseCombo } from "@hyperframes/core/key-combo";
+export type { Combo } from "@hyperframes/core/key-combo";
+export type { StudioKeyAction, StudioKeys } from "./player/components/studioShortcuts";
 export { ShortcutsButton } from "./player/components/ShortcutsPanel";
 export { dispatchLinkShortcut } from "./hooks/linkShortcuts";
 export type { LinkShortcutCallbacks } from "./hooks/linkShortcuts";
@@ -34,6 +45,32 @@ export {
   formatTime,
 } from "./player";
 export { usePreviewIframeStore } from "./player/store/previewIframeStore";
+export { previewEditingClient, previewFrameOpaque } from "./player/lib/previewChannel";
+export {
+  describePreviewElements,
+  previewAncestors,
+  previewElementsAtPoint,
+  previewGeometry,
+  previewLayers,
+  previewPointerTargets,
+  queryPreviewElements,
+  type PreviewElement,
+  type PreviewElementHit,
+} from "./player/lib/previewElements";
+export {
+  findPreviewElementForSelection,
+  findPreviewElementForTimelineElement,
+  readable,
+  standInFor,
+  standInHandle,
+} from "./components/editor/previewSelection";
+export { PREVIEW_QUALITY_LEVELS, type PreviewQuality } from "@hyperframes/core/preview-quality";
+export type {
+  PlaybackHealth,
+  PreviewCopies,
+  PreviewFacts,
+  PreviewQualityChosenBy,
+} from "./player/store/previewQualitySlice";
 export {
   openAudioGainDialog,
   useAudioGainDialogStore,
@@ -63,6 +100,7 @@ export {
 export { TimelineProvider, useTimelineContext } from "./player/components/TimelineProvider";
 export type { TimelineTheme } from "./player/components/timelineTheme";
 export { TRACK_H } from "./player/components/timelineLayout";
+export { currentTimelineRange, zoomTimelineToRange } from "./player/components/timelineZoomInput";
 export type { TimelineTrackPadding } from "./player/components/timelineLayout";
 export { displayTrackOrder } from "./player/components/useTimelineTrackDerivations";
 export { fadeHandleBoxes } from "./player/components/timelineClipFadeGeometry";
@@ -79,6 +117,7 @@ export { ImageThumbnail } from "./player/components/ImageThumbnail";
 export type { ImageThumbnailProps } from "./player/components/ImageThumbnail";
 export { useRenderClipContent } from "./hooks/useRenderClipContent";
 export { useThumbnailStill } from "./hooks/useThumbnailStill";
+export { fetchParsedAnimations, getAnimationsForElement } from "./hooks/useGsapTweenCache";
 export type { ThumbnailStill, UseThumbnailStillOptions } from "./hooks/useThumbnailStill";
 export type { UseRenderClipContentOptions } from "./hooks/useRenderClipContent";
 export type { ThumbnailPriority } from "./player/lib/thumbnailScheduler";
@@ -160,6 +199,7 @@ export type {
 // can race a write still in flight (see useTrackPendingTimelineEdit.ts).
 export { flushStudioPendingEdits } from "./utils/studioPendingEdits";
 export { revertNewestStudioPendingEdit } from "./utils/studioPendingEdits";
+export { cancelNewestStudioWaitingPress } from "./utils/studioPendingEdits";
 export type { StudioPendingEditsDrainResult } from "./utils/studioPendingEdits";
 export type {
   CanEditTimelineElement,
@@ -200,6 +240,7 @@ export type { UseClipboardOptions } from "./hooks/useClipboard";
 export { useDomEditSession } from "./hooks/useDomEditSession";
 export type { UseDomEditSessionParams } from "./hooks/useDomEditSession";
 export { useLivePreviewIframe } from "./hooks/useLivePreviewIframe";
+export { announcePreviewDocumentLoaded } from "./player/sceneSwap";
 export type { PreviewPromotion } from "./player/sceneSwap";
 export { usePreviewPersistence } from "./hooks/usePreviewPersistence";
 export type { UsePreviewPersistenceParams } from "./hooks/usePreviewPersistence";
@@ -261,7 +302,12 @@ export { useMarqueeGestures } from "./components/editor/marqueeCommit";
 export type { MarqueeGestures, MarqueeGesturesDeps } from "./components/editor/marqueeCommit";
 export { MarqueeOverlay } from "./components/editor/MarqueeOverlay";
 export type { MarqueeOverlayProps } from "./components/editor/MarqueeOverlay";
-export type { Rect as MarqueeRect } from "./utils/marqueeGeometry";
+export type {
+  Rect as MarqueeRect,
+  MarqueeBand,
+  MarqueeSelectionMode,
+} from "./utils/marqueeGeometry";
+export { resolveMarqueeMode } from "./utils/marqueeGeometry";
 
 export { buildStudioTools } from "./webmcp/useStudioAgentTools";
 export type { StudioAgentToolsDeps } from "./webmcp/useStudioAgentTools";

@@ -116,6 +116,14 @@ describe("useDomEditPersist", () => {
       coalesceKey: undefined,
       coalesceMs: undefined,
       files: { "index.html": { before: SOURCE, after: PATCHED } },
+      targets: [
+        {
+          file: "index.html",
+          hfId: "hf-card",
+          selector: '[data-hf-id="hf-card"]',
+          selectorIndex: 0,
+        },
+      ],
     });
     expect(params.forceReloadSdkSession).toHaveBeenCalledTimes(1);
     expect(params.reloadPreview).toHaveBeenCalledTimes(1);

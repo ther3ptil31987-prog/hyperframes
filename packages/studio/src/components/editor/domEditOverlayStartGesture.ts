@@ -1,8 +1,10 @@
+import { createGestureReadout } from "./domEditGestureReadoutState";
 /**
  * Gesture-begin functions: startGroupDrag and startGesture.
  * These are pure "start a new gesture" operations — no draft rect updates.
  */
 import { type DomEditSelection } from "./domEditing";
+import type { EditMoment } from "./manualEditsTypes";
 import {
   applyManualOffsetDragDraft,
   createManualOffsetDragMember,
@@ -32,7 +34,9 @@ import {
   type ResizeHandle,
   type UseDomEditOverlayGesturesOptions,
 } from "./domEditOverlayGestures";
-import { collectSnapContext, buildExcludeElements } from "./snapTargetCollection";
+import { collectSnapContext, buildExcludeElements, type SnapContext } from "./snapTargetCollection";
+import { MOVING_LAYER_UNREADABLE } from "./plainTranslate";
+import type { PreviewGestureStart } from "./previewGestureStartRead";
 import { editsPlainCss } from "../../hooks/gsapRuntimeKeyframes";
 import { logResize, resetResizeMoveLog } from "../../utils/resizeDebug";
 import { logDrag, readDragPositions, resetDragMoveLog } from "../../utils/dragDebug";
@@ -49,6 +53,8 @@ export function notifyBlockedPress(
 export function startGroupDrag(
   e: React.PointerEvent<HTMLElement>,
   opts: UseDomEditOverlayGesturesOptions,
+  at?: EditMoment,
+  snap?: SnapContext,
 ): boolean {
   const items = opts.groupOverlayItemsRef.current;
   if (items.length <= 1) return false;
@@ -62,6 +68,13 @@ export function startGroupDrag(
     notifyBlockedPress(e, opts, blockedSelection);
     return false;
   }
+  const moving = items.find((item) => item.start?.gsap?.moving)?.selection;
+  if (moving) {
+    e.preventDefault();
+    e.stopPropagation();
+    opts.onBlockedMoveRef.current(moving, MOVING_LAYER_UNREADABLE);
+    return false;
+  }
 
   opts.onManualDragStartRef.current?.();
   const dragItems = filterNestedDomEditGroupItems(items);
@@ -73,6 +86,8 @@ export function startGroupDrag(
       element: item.element,
       rect: item.rect,
       gesture: "drag",
+      at,
+      start: item.start,
     });
     if (!result.ok) {
       restoreManualOffsetDragMembers(members);
@@ -104,7 +119,8 @@ export function startGroupDrag(
     const overlayEl = opts.overlayRef.current;
     const iframe = opts.iframeRef.current;
     const snapContext =
-      overlayEl && iframe
+      snap ??
+      (overlayEl && iframe
         ? collectSnapContext({
             overlayEl,
             iframe,
@@ -113,7 +129,7 @@ export function startGroupDrag(
               groupSelections: items.map((i) => i.selection),
             }),
           })
-        : undefined;
+        : undefined);
 
     e.preventDefault();
     e.stopPropagation();
@@ -144,8 +160,15 @@ export function startGesture(
     selection?: DomEditSelection;
     rect?: OverlayRect | null;
     resizeHandle?: ResizeHandle;
+    resizeCorner?: { x: number; y: number };
+    at?: EditMoment;
+    /** Read off a frame Studio cannot script at the press: the element's start and the snap targets. */
+    start?: PreviewGestureStart;
+    snap?: SnapContext;
   },
 ): boolean {
+  const at = options?.at;
+  const start = options?.start;
   const sel = options?.selection ?? opts.selectionRef.current;
   const rect = options?.rect ?? opts.overlayRectRef.current;
   const box = opts.boxRef.current;
@@ -165,8 +188,8 @@ export function startGesture(
   // layout size. offsetWidth/Height are transform-free; the overlay-rect
   // fallback (rect / editScale) includes the element's own GSAP scale and
   // would make a rescaled element's draft grow from the RENDERED size.
-  const layoutWidth = sel.element.offsetWidth;
-  const layoutHeight = sel.element.offsetHeight;
+  const layoutWidth = start?.layout.width ?? sel.element.offsetWidth;
+  const layoutHeight = start?.layout.height ?? sel.element.offsetHeight;
   const actualWidth =
     size.width > 0 ? size.width : layoutWidth > 0 ? layoutWidth : rect.width / rect.editScaleX;
   const actualHeight =
@@ -189,6 +212,11 @@ export function startGesture(
   let pathOffsetMember: ManualOffsetDragMember | undefined;
 
   if (kind === "drag") {
+    if (start?.gsap?.moving) {
+      opts.onBlockedMoveRef.current(sel, MOVING_LAYER_UNREADABLE);
+      e.preventDefault();
+      return false;
+    }
     opts.onManualDragStartRef.current?.();
     const result = createManualOffsetDragMember({
       key: selectionCacheKey(sel),
@@ -196,6 +224,8 @@ export function startGesture(
       element: sel.element,
       rect,
       gesture: "drag",
+      at,
+      start,
     });
     if (!result.ok) {
       opts.onBlockedMoveRef.current(result.selection, result.reason);
@@ -217,6 +247,8 @@ export function startGesture(
         element: sel.element,
         rect,
         gesture: "resize",
+        at,
+        start,
       });
       if (result.ok) {
         pathOffsetMember = result.member;
@@ -225,12 +257,13 @@ export function startGesture(
         // Hold a % translate as the same px now, so a growing box can't drag it along mid-frame.
         if (result.member.plainTranslate) applyManualOffsetDragDraft(result.member, 0, 0);
       } else {
-        manualEditDragToken = beginStudioManualEditGesture(sel.element, "resize");
+        manualEditDragToken = beginStudioManualEditGesture(sel.element, "resize", at);
       }
     } else {
       manualEditDragToken = beginStudioManualEditGesture(
         sel.element,
         kind === "rotate" ? "rotate" : "resize",
+        at,
       );
     }
   }
@@ -257,11 +290,12 @@ export function startGesture(
     }
     const snapContext =
       (kind === "drag" || kind === "resize") && overlayEl && iframe
-        ? collectSnapContext({
+        ? (options?.snap ??
+          collectSnapContext({
             overlayEl,
             iframe,
             excludeElements: buildExcludeElements({ iframe, selection: sel }),
-          })
+          }))
         : undefined;
     e.preventDefault();
     e.stopPropagation();
@@ -269,6 +303,7 @@ export function startGesture(
     opts.rafPausedRef.current = true;
     opts.gestureRef.current = {
       kind,
+      readout: createGestureReadout(overlayEl, iframe, rect),
       mode,
       selection: sel,
       pointerId: e.pointerId,
@@ -296,6 +331,10 @@ export function startGesture(
       manualEditDragToken,
       snapContext,
       resizeHandle: kind === "resize" ? (options?.resizeHandle ?? "se") : undefined,
+      resizePressFromCorner:
+        kind === "resize" && options?.resizeCorner
+          ? { x: e.clientX - options.resizeCorner.x, y: e.clientY - options.resizeCorner.y }
+          : undefined,
       resizeFixedCenterStart,
     };
     if (kind === "resize") {

@@ -1,9 +1,12 @@
 import { failCommand } from "../utils/commandResult.js";
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve, sep } from "node:path";
+import { replaceFileAtomically } from "@hyperframes/core/atomic-file";
+import { makeOutputFolder } from "../utils/outputFolder.js";
+import { readJsonFileText } from "../utils/jsonFlag.js";
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
 import { c } from "../ui/colors.js";
 import { errorBox } from "../ui/format.js";
 import { normalizeErrorMessage as errorMessage } from "../utils/errorMessage.js";
+import type { ReferenceBackground, ReferenceBackgroundResult } from "@hyperframes/producer";
 import {
   loadProjectVariableSchema,
   reportVariableIssues,
@@ -35,7 +38,7 @@ export interface PreparedBatchRender {
   rows: PreparedBatchRow[];
 }
 
-interface BatchRenderResult {
+interface BatchRenderResult extends Partial<ReferenceBackgroundResult> {
   durationMs?: number;
   renderTimeMs: number;
 }
@@ -46,6 +49,7 @@ export interface BatchManifestRow {
   status: "pending" | "running" | "completed" | "failed" | "skipped";
   durationMs: number | null;
   renderTimeMs: number | null;
+  reference_background: ReferenceBackground | null;
   error: string | null;
   startedAt: string | null;
   completedAt: string | null;
@@ -83,6 +87,7 @@ interface RunBatchRenderOptions {
 }
 
 const PLACEHOLDER_RE = /\{([A-Za-z0-9_.-]+)\}/g;
+const ROWS_NAME_WHOLE_OUTPUT_PATH = "{path}";
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value);
@@ -149,6 +154,28 @@ export function resolveOutputTemplate(
   return template.replace(PLACEHOLDER_RE, (_match, key: string) =>
     placeholderValue(row, key, index),
   );
+}
+
+function folderOfPrefix(prefix: string): string {
+  return prefix.endsWith("/") || prefix.endsWith(sep) ? resolve(prefix) : dirname(resolve(prefix));
+}
+
+function checkOutputsInsideTemplateFolder(rows: readonly PreparedBatchRow[], template: string) {
+  if (template === ROWS_NAME_WHOLE_OUTPUT_PATH) return;
+  const firstPlaceholder = template.search(PLACEHOLDER_RE);
+  if (firstPlaceholder < 0) return;
+  const folder =
+    firstPlaceholder === 0 ? resolve() : folderOfPrefix(template.slice(0, firstPlaceholder));
+  for (const row of rows) {
+    const rel = relative(folder, row.outputPath);
+    const outside = rel === "" || rel === ".." || rel.startsWith(`..${sep}`) || isAbsolute(rel);
+    if (!outside) continue;
+    throw new BatchRenderInputError(
+      "Batch output outside --output folder",
+      `Row ${row.index} resolves to ${row.outputPath}, outside ${folder}.`,
+      "Row values may name subfolders of the --output folder but not leave it.",
+    );
+  }
 }
 
 function isSameOrChildPath(path: string, parent: string): boolean {
@@ -241,7 +268,7 @@ function reportBatchVariableIssues(
 
 export function prepareBatchRender(options: PrepareBatchRenderOptions): PreparedBatchRender {
   const batchPath = resolve(options.batchPath);
-  const read = options.readFile ?? ((path: string) => readFileSync(path, "utf8"));
+  const read = options.readFile ?? readJsonFileText;
   let raw: string;
   try {
     raw = read(batchPath);
@@ -258,10 +285,18 @@ export function prepareBatchRender(options: PrepareBatchRenderOptions): Prepared
     variables,
     outputPath: resolve(resolveOutputTemplate(options.outputTemplate, variables, index)),
   }));
+  checkOutputsInsideTemplateFolder(rows, options.outputTemplate);
   const manifestPath = join(
     commonOutputDirectory(rows.map((row) => row.outputPath)),
     "manifest.json",
   );
+  if (manifestPath === batchPath) {
+    throw new BatchRenderInputError(
+      "Batch manifest collision",
+      `The generated manifest would overwrite the batch input: ${batchPath}.`,
+      "Use a separate output directory in --output, such as renders/{index}.mp4.",
+    );
+  }
   checkOutputCollisions(rows, manifestPath);
 
   const variableIssueCount = validateBatchVariables(
@@ -295,6 +330,7 @@ function makeInitialManifest(prepared: PreparedBatchRender): BatchManifest {
       status: "pending",
       durationMs: null,
       renderTimeMs: null,
+      reference_background: null,
       error: null,
       startedAt: null,
       completedAt: null,
@@ -311,8 +347,8 @@ function summarizeManifest(manifest: BatchManifest): void {
 
 function writeManifest(manifest: BatchManifest): void {
   summarizeManifest(manifest);
-  mkdirSync(dirname(manifest.manifestPath), { recursive: true });
-  writeFileSync(manifest.manifestPath, JSON.stringify(manifest, null, 2) + "\n", "utf8");
+  makeOutputFolder(dirname(manifest.manifestPath));
+  replaceFileAtomically(manifest.manifestPath, JSON.stringify(manifest, null, 2) + "\n");
 }
 
 async function renderBatchRow(
@@ -333,11 +369,12 @@ async function renderBatchRow(
   }
 
   try {
-    mkdirSync(dirname(row.outputPath), { recursive: true });
+    makeOutputFolder(dirname(row.outputPath));
     const result = await options.renderOne(row);
     manifestRow.status = "completed";
     manifestRow.durationMs = result.durationMs ?? null;
     manifestRow.renderTimeMs = result.renderTimeMs;
+    manifestRow.reference_background = result.reference_background ?? null;
     manifestRow.completedAt = new Date().toISOString();
     writeManifest(manifest);
     return true;
@@ -434,8 +471,6 @@ export async function runBatchRender(options: RunBatchRenderOptions): Promise<Ba
   return manifest;
 }
 
-// Called through render.ts's lazy batch module; static reachability cannot see it.
-// fallow-ignore-next-line unused-export
 export function exitBatchRenderInputError(error: unknown): never {
   if (error instanceof BatchRenderInputError) {
     errorBox(error.title, error.message, error.hint);

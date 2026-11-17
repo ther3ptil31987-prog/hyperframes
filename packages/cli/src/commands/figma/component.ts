@@ -4,7 +4,7 @@
  * Phase-1 asset import, packaged as a registry item.
  */
 
-import { defineCommand } from "citty";
+import { defineCommand } from "../../utils/defineCommand.js";
 import {
   createFigmaClient,
   FigmaClientError,
@@ -31,6 +31,7 @@ function escapeAttr(value: string): string {
 import { runAssetImport, type AssetImportResult } from "./asset.js";
 import { downloadRender } from "./download.js";
 import { withFigmaErrors } from "./cliError.js";
+import { terminalText } from "@hyperframes/core";
 
 export interface ComponentImportDeps {
   projectDir: string;
@@ -140,7 +141,9 @@ async function rasterizeFallback(
     if (asset === null) {
       failedRasterize.push(req.nodeId);
       console.warn(
-        `could not render node ${req.nodeId} ("${req.name}") as svg or png — leaving its placeholder without src`,
+        terminalText(
+          `could not render node ${req.nodeId} ("${req.name}") as svg or png — leaving its placeholder without src`,
+        ),
       );
       continue;
     }

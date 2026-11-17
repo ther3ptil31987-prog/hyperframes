@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
+import { MEDIA_INPUT_ARGS } from "./mediaExtensions.js";
 import {
   absoluteLoudnessPlan,
+  absoluteOutcome,
   audioTags,
   loudnessMeasureArgs,
   updateAudioVolume,
@@ -11,6 +13,45 @@ const track = (integratedLufs: number, truePeakDbfs: number, volume = 1) => ({
   volume,
   integratedLufs,
   truePeakDbfs,
+});
+
+describe("audioTags playback offsets", () => {
+  it.each([
+    ['data-playback-start="4"', 4],
+    ['data-playback-start="4" data-media-start="1"', 4],
+    ['data-playback-start="0" data-media-start="4"', 0],
+    ['data-playback-start="4" data-media-start="invalid"', 4],
+    ['data-playback-start="-1" data-media-start="3"', 3],
+    ['data-playback-start="1.5s" data-media-start="3"', 3],
+    ['data-playback-start="" data-media-start="3"', 3],
+    ['data-playback-start="invalid"', 0],
+    ['data-media-start="3"', 3],
+  ])("measures the selected in-point for %s", (attributes, expected) => {
+    const html = `<audio id="voice" src="voice.wav" data-duration="2" ${attributes}></audio>`;
+    expect(audioTags(html)[0]).toEqual(expect.objectContaining({ mediaStart: expected }));
+  });
+
+  it("measures a video from its playback in-point at its authored speed", () => {
+    const html = `<video id="talk" src="talk.mp4" data-playback-start="4" data-media-start="1" data-duration="2" data-playback-rate="2"></video>`;
+    const [tag] = audioTags(html);
+    expect(tag).toBeDefined();
+    if (!tag) throw new Error("missing video");
+    const args = loudnessMeasureArgs("talk.mp4", tag, 0);
+    expect(args.slice(args.indexOf("-ss"), args.indexOf("-i"))).toEqual([
+      "-ss",
+      "4",
+      "-t",
+      "4",
+      ...MEDIA_INPUT_ARGS,
+    ]);
+  });
+
+  it("preserves the selected in-point when writing the matched gain", () => {
+    const html = `<audio id="voice" src="voice.wav" data-playback-start="4" data-media-start="1" data-volume="1"></audio>`;
+    const changed = updateAudioVolume(html, "voice", 0.5);
+    expect(changed).toBe(html.replace('data-volume="1"', 'data-volume="0.5"'));
+    expect(audioTags(changed)[0]).toEqual(expect.objectContaining({ mediaStart: 4, volume: 0.5 }));
+  });
 });
 
 describe("audioTags with video", () => {
@@ -62,9 +103,54 @@ describe("audioTags with video", () => {
   });
 });
 
+describe("audioTags with HTML character references", () => {
+  it.each([
+    { src: "Q&amp;A.wav", expected: "Q&A.wav" },
+    { src: "Q&#38;A.wav", expected: "Q&A.wav" },
+    { src: "Q&#x26;A.wav", expected: "Q&A.wav" },
+    { src: "an&#39;s &quot;reply&quot;.wav", expected: 'an\'s "reply".wav' },
+    { src: "Q&amp;amp;A.wav", expected: "Q&amp;A.wav" },
+  ])("decodes $src once for local file lookup", ({ src, expected }) => {
+    const html = `<audio id="vo" src="${src}"></audio>`;
+    expect(audioTags(html)[0]?.src).toBe(expected);
+  });
+
+  it("patches an entity-encoded id while preserving every other authored byte", () => {
+    const html = `<audio id="voice&#45;over" src="Q&amp;A.wav" data-volume="&#49;"></audio>`;
+    expect(audioTags(html)[0]).toEqual(expect.objectContaining({ id: "voice-over", volume: 1 }));
+    expect(updateAudioVolume(html, "voice-over", 0.5)).toBe(
+      `<audio id="voice&#45;over" src="Q&amp;A.wav" data-volume="0.5"></audio>`,
+    );
+  });
+
+  it("decodes video audibility and timing attributes before interpreting them", () => {
+    const html = `<video id="vo" src="Q&amp;A.mp4" data-has-audio="tr&#117;e" data-media-start="&#50;" data-duration="&#51;" data-playback-rate="&#49;"></video>`;
+    expect(audioTags(html)[0]).toEqual(
+      expect.objectContaining({
+        id: "vo",
+        src: "Q&A.mp4",
+        mediaStart: 2,
+        duration: 3,
+        playbackRate: 1,
+      }),
+    );
+  });
+});
+
+describe("loudnessMeasureArgs track", () => {
+  it("measures the audio track it is given, not ffmpeg's first", () => {
+    const args = loudnessMeasureArgs("phone.mov", { mediaStart: 0, duration: null }, 1);
+    expect(args.slice(args.indexOf("-map"), args.indexOf("-map") + 2)).toEqual(["-map", "0:a:1"]);
+  });
+});
+
 describe("loudnessMeasureArgs with a playback rate", () => {
   it("measures the source span a sped-up clip actually plays", () => {
-    const args = loudnessMeasureArgs("clip.mp4", { mediaStart: 0, duration: 4, playbackRate: 2 });
+    const args = loudnessMeasureArgs(
+      "clip.mp4",
+      { mediaStart: 0, duration: 4, playbackRate: 2 },
+      0,
+    );
     expect(args.slice(args.indexOf("-t"), args.indexOf("-t") + 2)).toEqual(["-t", "8"]);
   });
 
@@ -102,6 +188,14 @@ describe("absoluteLoudnessPlan", () => {
     expect(plan.limitedBy).toBe("true-peak");
   });
 
+  it("never cuts a clip that is below the target because its peak is already past the ceiling", () => {
+    const plan = absoluteLoudnessPlan(track(-17.1, -0.5));
+    expect(plan.gainDb).toBeCloseTo(0, 6);
+    expect(plan.changeDb).toBeCloseTo(0, 6);
+    expect(plan.projectedLufs).toBeCloseTo(-17.1, 6);
+    expect(plan.limitedBy).toBe("true-peak");
+  });
+
   it("attenuates a clip that is too loud", () => {
     const plan = absoluteLoudnessPlan(track(-10, 0));
     expect(plan.gainDb).toBeCloseTo(-6, 6);
@@ -135,5 +229,21 @@ describe("audioTags on hostile markup", () => {
   it("still reads tags written with spaces around the slash and name", () => {
     const html = `< audio id="vo" src="vo.mp3">< / audio><a_b></a_b>`;
     expect(audioTags(html).map((t) => t.id)).toEqual(["vo"]);
+  });
+});
+
+describe("absoluteOutcome", () => {
+  it("calls a clip at the target matched", () => {
+    expect(absoluteOutcome(absoluteLoudnessPlan(track(-16, -6, 1)), 1)).toBe("matched");
+  });
+
+  it("calls a clip a limit cannot move held, not matched", () => {
+    const plan = absoluteLoudnessPlan(track(-25, -0.5), -16);
+    expect(plan.limitedBy).toBe("true-peak");
+    expect(absoluteOutcome(plan, 1)).toBe("held");
+  });
+
+  it("calls a clip that needs a different gain a change", () => {
+    expect(absoluteOutcome(absoluteLoudnessPlan(track(-19.2, -8)), 1)).toBe("change");
   });
 });

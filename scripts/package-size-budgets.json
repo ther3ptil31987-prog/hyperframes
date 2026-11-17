@@ -1,0 +1,62 @@
+{
+  "@hyperframes/aws-lambda": {
+    "packed": 80500,
+    "unpacked": 290508
+  },
+  "@hyperframes/cli": {
+    "packed": 8577627,
+    "unpacked": 25500000
+  },
+  "@hyperframes/core": {
+    "packed": 1800000,
+    "unpacked": 4639000
+  },
+  "@hyperframes/engine": {
+    "packed": 510000,
+    "unpacked": 1742862
+  },
+  "@hyperframes/gcp-cloud-run": {
+    "packed": 49412,
+    "unpacked": 170124
+  },
+  "@hyperframes/inspector": {
+    "packed": 933584,
+    "unpacked": 4010650
+  },
+  "@hyperframes/lint": {
+    "packed": 191022,
+    "unpacked": 737342
+  },
+  "@hyperframes/parsers": {
+    "packed": 215500,
+    "unpacked": 915000
+  },
+  "@hyperframes/player": {
+    "packed": 160300,
+    "unpacked": 549900
+  },
+  "@hyperframes/producer": {
+    "packed": 936000,
+    "unpacked": 3491355
+  },
+  "@hyperframes/sdk": {
+    "packed": 90662,
+    "unpacked": 325069
+  },
+  "@hyperframes/shader-transitions": {
+    "packed": 212864,
+    "unpacked": 825937
+  },
+  "@hyperframes/share": {
+    "packed": 148738,
+    "unpacked": 575775
+  },
+  "@hyperframes/studio": {
+    "packed": 6589635,
+    "unpacked": 26703858
+  },
+  "@hyperframes/studio-server": {
+    "packed": 188871,
+    "unpacked": 732018
+  }
+}

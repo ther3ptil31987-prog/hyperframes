@@ -21,11 +21,22 @@ import {
 import { tmpdir } from "node:os";
 import { join, parse } from "node:path";
 import { ensureHfIds } from "@hyperframes/parsers/hf-ids";
-import { STUDIO_PREVIEW_MARK_META } from "@hyperframes/core/studio-preview-mark";
+import {
+  STUDIO_PREVIEW_ERROR_KINDS,
+  STUDIO_PREVIEW_ERRORS,
+  STUDIO_PREVIEW_CAPTURE_MODE,
+  STUDIO_PREVIEW_MARK_META,
+} from "@hyperframes/core/studio-preview-mark";
 import { AFTER_FONTS_SCRIPT_TYPE } from "@hyperframes/core/compiler";
-import { PREVIEW_BUNDLE_OPTIONS, PREVIEW_CAPTURE_PARAM, registerPreviewRoutes } from "./preview";
+import {
+  PREVIEW_BUNDLE_OPTIONS,
+  PREVIEW_CAPTURE_PARAM,
+  registerPreviewRoutes,
+  scriptJson,
+} from "./preview";
 import { registerFileRoutes } from "./files";
 import { createPreviewDocumentStore } from "../helpers/previewDocumentStore";
+import { MAX_OPEN_MEDIA_RANGE_BYTES } from "../helpers/mediaRange";
 import type { StudioApiAdapter } from "../types";
 import {
   affectsPreview,
@@ -38,6 +49,7 @@ const tempDirs: string[] = [];
 
 afterEach(() => {
   vi.useRealTimers();
+  vi.unstubAllEnvs();
   for (const dir of tempDirs.splice(0)) {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -98,6 +110,11 @@ async function getPreviewSignature(projectDir: string): Promise<string> {
   return match![1]!;
 }
 
+const TAGGED_PNG = Buffer.from(
+  "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAIAAACQd1PeAAAABGNJQ1ABAQABlXPCVgAAAAxJREFUeJxj0NfXBwABHgCOTp25kgAAAABJRU5ErkJggg==",
+  "base64",
+);
+
 describe("registerPreviewRoutes", () => {
   it("adds its <base> even when a script mentions one, and keeps an authored <base>", async () => {
     const projectDir = createProjectDir();
@@ -116,6 +133,91 @@ describe("registerPreviewRoutes", () => {
     );
     const authored = await (await app.request("http://localhost/projects/demo/preview")).text();
     expect(authored).not.toContain('<base href="/api/projects/demo/preview/">');
+  });
+
+  it("maps root module paths to the project on the page and in a sub-composition, as render serves them", async () => {
+    const projectDir = createProjectDir();
+    mkdirSync(join(projectDir, "compositions"), { recursive: true });
+    writeFileSync(
+      join(projectDir, "index.html"),
+      `<!doctype html><html><head></head><body><script type="module">await import("/assets/scene.js");</script></body></html>`,
+    );
+    writeFileSync(
+      join(projectDir, "compositions/scene.html"),
+      `<template><section data-composition-id="scene" data-width="1280" data-height="720"></section></template>`,
+    );
+    const app = new Hono();
+    registerPreviewRoutes(app, createAdapter(projectDir));
+    const base = "/api/projects/demo/preview/";
+    for (const path of ["", "/comp/compositions/scene.html"]) {
+      const html = await (
+        await app.request(`http://localhost/projects/demo/preview${path}`)
+      ).text();
+      const maps = [...html.matchAll(/<script type="importmap">([^<]*)<\/script>/g)];
+      expect(maps.map((map) => JSON.parse(map[1] ?? ""))).toEqual([
+        { imports: { "/": base, [base]: base } },
+      ]);
+    }
+  });
+
+  it("serves the composition's root-path media and CSS from the project, as render does, and keeps the server's own", async () => {
+    const projectDir = createProjectDir();
+    mkdirSync(join(projectDir, "compositions"), { recursive: true });
+    writeFileSync(
+      join(projectDir, "index.html"),
+      `<!doctype html><html><head><style>h1 { background: url(/bg.png) }</style></head><body><div data-composition-id="main">
+        <audio id="vo-1" class="clip" src="/assets/vo-1.mp3" data-start="0" data-duration="2"></audio></div></body></html>`,
+    );
+    writeFileSync(
+      join(projectDir, "compositions/scene.html"),
+      `<template><section data-composition-id="scene"><img src="/assets/still.png"></section></template>`,
+    );
+    const app = new Hono();
+    registerPreviewRoutes(app, createAdapter(projectDir));
+    const page = await (await app.request("http://localhost/projects/demo/preview")).text();
+    expect(page).toContain('src="assets/vo-1.mp3"');
+    expect(page).toContain("url(bg.png)");
+    expect(page).toContain('src="/api/runtime.js"');
+    const scene = await (
+      await app.request("http://localhost/projects/demo/preview/comp/compositions/scene.html")
+    ).text();
+    expect(scene).toContain('src="assets/still.png"');
+    expect(scene).toContain('src="/api/runtime.js"');
+  });
+
+  it("adds no module import of its own, so the root-path map reaches only the composition's", async () => {
+    const projectDir = createProjectDir();
+    writeFileSync(
+      join(projectDir, "index.html"),
+      `<!doctype html><html><head>
+        <script data-authored src="https://cdn.jsdelivr.net/npm/gsap@3/dist/gsap.min.js"></script>
+      </head><body><div id="card" class="clip"></div>
+        <script data-authored>
+          const tl = gsap.timeline({ paused: true });
+          tl.to("#card", { motionPath: { path: [{ x: 0, y: 0 }, { x: 100, y: 50 }] }, duration: 1 }, 0);
+          window.__timelines = { index: tl };
+        </script>
+      </body></html>`,
+    );
+    mkdirSync(join(projectDir, ".hyperframes"), { recursive: true });
+    writeFileSync(
+      join(projectDir, ".hyperframes/studio-motion.json"),
+      `{"version":1,"motions":[{"kind":"gsap-motion","target":{"sourceFile":"index.html","id":"card"},"start":0,"duration":1,"ease":"power2.out","from":{"y":32},"to":{"y":0}}]}`,
+    );
+    const app = new Hono();
+    registerPreviewRoutes(app, createAdapter(projectDir));
+    const html = await (await app.request("http://localhost/projects/demo/preview")).text();
+    const added = [...parseHTML(html).document.querySelectorAll("script")].filter(
+      (script) =>
+        !script.hasAttribute("data-authored") && script.getAttribute("type") !== "importmap",
+    );
+    expect(added.map((script) => script.getAttribute("src") ?? "inline")).toEqual(
+      expect.arrayContaining(["/api/runtime.js", expect.stringContaining("MotionPathPlugin")]),
+    );
+    for (const script of added) {
+      expect(script.getAttribute("type")).not.toBe("module");
+      expect(script.textContent).not.toMatch(/\bimport\s*\(|^\s*import[\s{*"']/m);
+    }
   });
 
   it("encodes the project name in <base>, so a '#' or '\"' in it keeps assets in its own folder", async () => {
@@ -180,6 +282,24 @@ describe("registerPreviewRoutes", () => {
     expect(html).toContain("window.AUTHOR_SEEN = 1");
   });
 
+  it("keeps the accelerated-canvas tracker before authored scripts in blur previews", async () => {
+    const projectDir = createProjectDir();
+    writeFileSync(
+      join(projectDir, "index.html"),
+      '<html><head><script>window.AUTHOR_CANVAS = 1</script></head><body data-motion-blur="on"></body></html>',
+    );
+    const app = new Hono();
+    registerPreviewRoutes(app, createAdapter(projectDir));
+    const html = await (await app.request("http://localhost/projects/demo/preview")).text();
+    expect(html.indexOf("data-hf-accel-tracker")).toBeGreaterThan(-1);
+    expect(html.indexOf("data-hf-accel-tracker")).toBeLessThan(
+      html.indexOf("window.AUTHOR_CANVAS"),
+    );
+    expect(html.indexOf('src="/api/runtime.js"')).toBeLessThan(
+      html.indexOf("window.AUTHOR_CANVAS"),
+    );
+  });
+
   it("serves one preview runtime when the page on disk already links one", async () => {
     const projectDir = createProjectDir();
     writeFileSync(
@@ -220,7 +340,122 @@ describe("registerPreviewRoutes", () => {
     expect(html).toContain("<script data-hf-gsap-fallback>");
   });
 
-  it("serves a later scene's image lazy, and captures every image eager with no mark", async () => {
+  it("reports a GSAP script that fails from the CDN and from the fallback, never rejecting unhandled", async () => {
+    const app = new Hono();
+    registerPreviewRoutes(app, createAdapter(createProjectDir()));
+    const html = await (await app.request("http://localhost/projects/demo/preview")).text();
+    const fallback = /<script data-hf-gsap-fallback>([\s\S]*?)<\/script>/.exec(html)?.[1] ?? "";
+    let onDocumentError: (event: { target: unknown }) => void = () => undefined;
+    const appended: { tagName: string; src: string; onerror?: (event: Event) => void }[] = [];
+    const doc = {
+      addEventListener: (_type: string, listener: typeof onDocumentError) => {
+        onDocumentError = listener;
+      },
+      createElement: () => ({ tagName: "SCRIPT", src: "" }),
+      head: { appendChild: (script: (typeof appended)[number]) => appended.push(script) },
+    };
+    const reported: unknown[] = [];
+    new Function("document", "reportError", fallback)(doc, (error: unknown) =>
+      reported.push(error),
+    );
+
+    const authored = "https://cdn.example/npm/gsap@3.14.2/dist/gsap.min.js";
+    onDocumentError({ target: { tagName: "SCRIPT", src: authored } });
+    expect(appended).toHaveLength(1);
+    // The fallback's own failure reaches the document's capture listener first; it must not load or report again.
+    onDocumentError({ target: appended[0] });
+    appended[0]?.onerror?.(new Event("error"));
+
+    await vi.waitFor(() => expect(reported).toHaveLength(1));
+    const message = reported[0] instanceof Error ? reported[0].message : "";
+    expect(message).toContain(authored);
+    expect(message).toContain(appended[0]?.src);
+  });
+
+  it("keeps every error a Studio preview raises from its first script, and leaves captures without it", async () => {
+    const projectDir = createProjectDir();
+    writeFileSync(
+      join(projectDir, "index.html"),
+      '<!DOCTYPE html><html><head><script src="app.js"></script></head><body></body></html>',
+    );
+    const app = new Hono();
+    registerPreviewRoutes(app, createAdapter(projectDir));
+    const url = "http://localhost/projects/demo/preview";
+    const html = await (await app.request(url)).text();
+    const capture = await (await app.request(`${url}?${PREVIEW_CAPTURE_PARAM}=1`)).text();
+    const keeper = new RegExp(`<script>([^<]*${STUDIO_PREVIEW_ERRORS}[^<]*)</script>`);
+    expect(capture).not.toMatch(keeper);
+    const body = keeper.exec(html)?.[1] ?? "";
+    expect(html.indexOf(body)).toBeLessThan(html.indexOf('<script src="app.js">'));
+
+    const previewWindow: Record<string, unknown> = {};
+    let raise: (event: { message: string }) => void = () => undefined;
+    new Function("window", "addEventListener", body)(
+      previewWindow,
+      (_type: string, listener: typeof raise) => (raise = listener),
+    );
+    raise({ message: "Uncaught Error: GSAP could not load" });
+    expect(previewWindow[STUDIO_PREVIEW_ERRORS]).toEqual(["Uncaught Error: GSAP could not load"]);
+  });
+
+  it("writes a value into a script so it cannot close the tag or end the line", () => {
+    const out = scriptJson("</script><!--\u2028\u2029");
+    expect(out).not.toMatch(/<|\u2028|\u2029/);
+    expect(JSON.parse(out)).toBe("</script><!--\u2028\u2029");
+  });
+
+  it("records the kind and origin of each early error, never its text, and leaves the messages as they were", async () => {
+    const projectDir = createProjectDir();
+    writeFileSync(
+      join(projectDir, "index.html"),
+      "<!DOCTYPE html><html><head></head><body></body></html>",
+    );
+    const app = new Hono();
+    registerPreviewRoutes(app, createAdapter(projectDir));
+    const html = await (await app.request("http://localhost/projects/demo/preview")).text();
+    const body =
+      new RegExp(`<script>([^<]*${STUDIO_PREVIEW_ERROR_KINDS}[^<]*)</script>`).exec(html)?.[1] ??
+      "";
+
+    const previewWindow: Record<string, unknown> = {
+      location: { href: "http://localhost/api/projects/demo/preview/", origin: "http://localhost" },
+    };
+    let raise: (event: object) => void = () => undefined;
+    new Function("window", "addEventListener", body)(
+      previewWindow,
+      (_type: string, listener: typeof raise) => (raise = listener),
+    );
+    class Custom extends Error {}
+    raise({
+      message: "a",
+      error: new SyntaxError("secret one"),
+      filename: "http://localhost/api/runtime.js",
+    });
+    raise({
+      message: "b",
+      error: new TypeError("secret two"),
+      filename: "http://localhost/api/projects/demo/preview/app.js",
+    });
+    raise({
+      message: "c",
+      error: new Custom("secret three"),
+      filename: "http://localhost/assets/studio.js",
+    });
+    raise({ message: "d", filename: "https://cdn.example.com/lib.js" });
+    raise({ message: "e", error: new ReferenceError("secret four"), filename: "" });
+
+    expect(previewWindow[STUDIO_PREVIEW_ERRORS]).toEqual(["a", "b", "c", "d", "e"]);
+    expect(previewWindow[STUDIO_PREVIEW_ERROR_KINDS]).toEqual([
+      { name: "SyntaxError", origin: "runtime" },
+      { name: "TypeError", origin: "project" },
+      { name: "other", origin: "studio" },
+      { name: "other", origin: "unknown" },
+      { name: "ReferenceError", origin: "unknown" },
+    ]);
+    expect(JSON.stringify(previewWindow[STUDIO_PREVIEW_ERROR_KINDS])).not.toContain("secret");
+  });
+
+  it("serves a later scene's image lazy, and captures every image eager under a capture-mode mark", async () => {
     const projectDir = createProjectDir();
     const later =
       '<!DOCTYPE html><html><head></head><body><div data-start="5"><img src="b.png"></div></body></html>';
@@ -235,7 +470,10 @@ describe("registerPreviewRoutes", () => {
       expect(preview, path).toMatch(/<img loading="lazy" [^>]*src="b.png">/);
       expect(preview, path).toContain(STUDIO_PREVIEW_MARK_META);
       expect(capture, path).not.toContain("loading=");
-      expect(capture, path).not.toContain(STUDIO_PREVIEW_MARK_META);
+      expect(capture, path).toContain(
+        `<meta name="${STUDIO_PREVIEW_MARK_META}" content="${STUDIO_PREVIEW_CAPTURE_MODE}">`,
+      );
+      expect(preview, path).not.toContain(STUDIO_PREVIEW_CAPTURE_MODE);
       expect(capture, path).toContain("<script data-hf-gsap-fallback>");
     }
   });
@@ -291,6 +529,67 @@ describe("registerPreviewRoutes", () => {
     expect(html).toContain("gsap@3.15.0/dist/CustomEase.min.js");
     expect(html.indexOf("gsap.min.js")).toBeLessThan(html.indexOf("CustomEase.min.js"));
     expect(html.indexOf("CustomEase.min.js")).toBeLessThan(html.indexOf("__hfStudioMotionApply"));
+  });
+
+  it("injects GSAP core before the MotionPathPlugin when Studio motion and a motionPath share a page with no GSAP", async () => {
+    const projectDir = createProjectDir();
+    writeFileSync(
+      join(projectDir, "index.html"),
+      `<!doctype html><html><head></head><body><div id="card"></div>
+        <script>
+          window.__hfPath = { motionPath: { path: [{ x: 0, y: 0 }, { x: 100, y: 50 }] } };
+        </script>
+      </body></html>`,
+    );
+    const manifestDir = join(projectDir, ".hyperframes");
+    mkdirSync(manifestDir, { recursive: true });
+    writeFileSync(
+      join(manifestDir, "studio-motion.json"),
+      `{"version":1,"motions":[{"kind":"gsap-motion","target":{"sourceFile":"index.html","id":"card"},"start":0,"duration":1,"ease":"power2.out","from":{"y":32},"to":{"y":0}}]}`,
+    );
+    const app = new Hono();
+    registerPreviewRoutes(app, createAdapter(projectDir));
+
+    const response = await app.request("http://localhost/projects/demo/preview");
+    const srcs = [...parseHTML(await response.text()).document.querySelectorAll("script[src]")].map(
+      (el) => el.getAttribute("src") ?? "",
+    );
+
+    expect(response.status).toBe(200);
+    const core = srcs.findIndex((src) => src.endsWith("/gsap.min.js"));
+    const plugin = srcs.findIndex((src) => src.endsWith("/MotionPathPlugin.min.js"));
+    expect(core).toBeGreaterThanOrEqual(0);
+    expect(plugin).toBeGreaterThan(core);
+  });
+
+  it.each([
+    ["", ""],
+    ["", "<script>gsap.registerPlugin(MotionPathPlugin);</script>"],
+    ["<script>var early = 1;</script>", "<script>gsap.registerPlugin(MotionPathPlugin);</script>"],
+  ])("injects GSAP core before an authored head MotionPathPlugin (%#)", async (before, after) => {
+    const projectDir = createProjectDir();
+    writeFileSync(
+      join(projectDir, "index.html"),
+      `<!doctype html><html><head>${before}<script src="https://cdn.jsdelivr.net/npm/gsap@3.15.0/dist/MotionPathPlugin.min.js"></script>${after}</head><body><div id="card"></div></body></html>`,
+    );
+    const manifestDir = join(projectDir, ".hyperframes");
+    mkdirSync(manifestDir, { recursive: true });
+    writeFileSync(
+      join(manifestDir, "studio-motion.json"),
+      `{"version":1,"motions":[{"kind":"gsap-motion","target":{"sourceFile":"index.html","id":"card"},"start":0,"duration":1,"ease":"power2.out","from":{"y":32},"to":{"y":0}}]}`,
+    );
+    const app = new Hono();
+    registerPreviewRoutes(app, createAdapter(projectDir));
+
+    const response = await app.request("http://localhost/projects/demo/preview");
+    const srcs = [...parseHTML(await response.text()).document.querySelectorAll("script[src]")].map(
+      (el) => el.getAttribute("src") ?? "",
+    );
+
+    expect(response.status).toBe(200);
+    const core = srcs.findIndex((src) => src.endsWith("/gsap.min.js"));
+    expect(core).toBeGreaterThanOrEqual(0);
+    expect(srcs.findIndex((src) => src.endsWith("/MotionPathPlugin.min.js"))).toBeGreaterThan(core);
   });
 
   it("injects the GSAP MotionPathPlugin when the composition uses a motionPath", async () => {
@@ -353,6 +652,117 @@ describe("registerPreviewRoutes", () => {
     const plugin = scripts[gsapAt + 1];
     expect(plugin?.getAttribute("src")).toContain("gsap@3/dist/MotionPathPlugin.min.js");
     expect(plugin?.getAttribute("type")).toBe(AFTER_FONTS_SCRIPT_TYPE);
+  });
+
+  it("does not inline project files no route serves", async () => {
+    const projectDir = createProjectDir();
+    mkdirSync(join(projectDir, ".hyperframes"), { recursive: true });
+    writeFileSync(join(projectDir, ".hyperframes", "handoff.json"), '{"note":"PRIVATE_RECORD"}');
+    writeFileSync(join(projectDir, ".env"), "TOKEN=PRIVATE_ENV");
+    writeFileSync(
+      join(projectDir, "index.html"),
+      `<!doctype html><html><head><link rel="stylesheet" href=".env"></head><body>
+        <div data-composition-id="root" data-width="320" data-height="180"></div>
+        <script src=".hyperframes/handoff.json"></script>
+      </body></html>`,
+    );
+    const { bundleToSingleHtml } = await import("@hyperframes/core/compiler");
+    const app = new Hono();
+    registerPreviewRoutes(
+      app,
+      createAdapter(projectDir, {
+        bundle: (dir, options) =>
+          bundleToSingleHtml(dir, { ...PREVIEW_BUNDLE_OPTIONS, ...options }),
+      }),
+    );
+
+    const html = await (await app.request("http://localhost/projects/demo/preview")).text();
+
+    expect(html).toContain('data-composition-id="root"');
+    expect(html).not.toContain("PRIVATE_RECORD");
+    expect(html).not.toContain("PRIVATE_ENV");
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "does not serve an env file that index.html links to, but still serves a main file linked from outside",
+    async () => {
+      const { bundleToSingleHtml } = await import("@hyperframes/core/compiler");
+      const preview = async (projectDir: string) => {
+        const app = new Hono();
+        registerPreviewRoutes(
+          app,
+          createAdapter(projectDir, {
+            bundle: async (dir, options) => {
+              try {
+                return await bundleToSingleHtml(dir, { ...PREVIEW_BUNDLE_OPTIONS, ...options });
+              } catch {
+                return null;
+              }
+            },
+          }),
+        );
+        return (await app.request("http://localhost/projects/demo/preview")).text();
+      };
+
+      const linkedToEnv = createProjectDir();
+      writeFileSync(join(linkedToEnv, ".env"), "TOKEN=LINKED_ENV_SECRET");
+      rmSync(join(linkedToEnv, "index.html"));
+      if (!tryCreateSymlink(".env", join(linkedToEnv, "index.html"), "file")) return;
+      expect(await preview(linkedToEnv)).not.toContain("LINKED_ENV_SECRET");
+
+      const shared = mkdtempSync(join(tmpdir(), "hf-preview-shared-main-"));
+      tempDirs.push(shared);
+      writeFileSync(
+        join(shared, "main.html"),
+        "<html><head></head><body>SHARED_MAIN</body></html>",
+      );
+      const linkedOut = createProjectDir();
+      rmSync(join(linkedOut, "index.html"));
+      if (!tryCreateSymlink(join(shared, "main.html"), join(linkedOut, "index.html"), "file"))
+        return;
+      expect(await preview(linkedOut)).toContain("SHARED_MAIN");
+    },
+  );
+
+  it("asks for private files to be refused with plain data, so a build thread can join same-content builds", async () => {
+    const projectDir = createProjectDir();
+    writeFileSync(
+      join(projectDir, "index.html"),
+      `<!doctype html><html><head></head><body><div data-composition-id="root"></div></body></html>`,
+    );
+    const { bundleToSingleHtml } = await import("@hyperframes/core/compiler");
+    // A host that builds on another thread: only plain data crosses, and builds with equal data are shared.
+    const shared = new Map<string, Promise<string>>();
+    const sent: unknown[] = [];
+    let builds = 0;
+    const threaded: StudioApiAdapter["bundle"] = (dir, options = {}) => {
+      const { onRead: _onRead, ...data } = options;
+      expect(Object.values(data).some((value) => typeof value === "function")).toBe(false);
+      sent.push(structuredClone(data));
+      const key = `${dir}\0${JSON.stringify(data)}`;
+      let build = shared.get(key);
+      if (!build) {
+        builds++;
+        build = bundleToSingleHtml(dir, { ...PREVIEW_BUNDLE_OPTIONS, ...data });
+        shared.set(key, build);
+      }
+      return build;
+    };
+    const first = new Hono();
+    const second = new Hono();
+    registerPreviewRoutes(first, createAdapter(projectDir, { bundle: threaded }));
+    registerPreviewRoutes(second, createAdapter(projectDir, { bundle: threaded }));
+
+    await Promise.all([
+      first.request("http://localhost/projects/demo/preview"),
+      second.request("http://localhost/projects/demo/preview"),
+    ]);
+
+    expect(sent).toEqual([
+      { stampHfIds: true, privateFiles: "studio" },
+      { stampHfIds: true, privateFiles: "studio" },
+    ]);
+    expect(builds).toBe(1);
   });
 
   async function previewScriptSrcs(bodyGsapTag: string) {
@@ -825,7 +1235,7 @@ describe("built preview reuse", () => {
         app,
         createAdapter(projectDir, {
           bundle,
-          previewDocuments: createPreviewDocumentStore(projectDir, salt),
+          previewDocuments: createPreviewDocumentStore(projectDir, salt, "secret"),
         } as Partial<StudioApiAdapter>),
       );
       const html = await (await app.request("http://localhost/projects/demo/preview")).text();
@@ -848,7 +1258,7 @@ describe("built preview reuse", () => {
         app,
         createAdapter(projectDir, {
           bundle,
-          previewDocuments: createPreviewDocumentStore(projectDir, "build-a"),
+          previewDocuments: createPreviewDocumentStore(projectDir, "build-a", "secret"),
         } as Partial<StudioApiAdapter>),
       );
       for (const path of paths) await app.request(`http://localhost/projects/demo/${path}`);
@@ -1251,10 +1661,20 @@ describe("hf-proxy negotiation and media codec map injection (U3)", () => {
   >;
 
   async function loadPreviewModule(opts: {
+    copyProgress?: number;
+    retried?: string[];
     resolveProxyImpl?: (
       projectDir: string,
       absoluteSourcePath: string,
       variant?: "h264" | "vp8",
+      box?: { width: number; height: number },
+    ) => Promise<string>;
+    resolveStillImpl?: (
+      projectDir: string,
+      absoluteSourcePath: string,
+      at: number,
+      box?: { width: number; height: number },
+      startUncachedStill?: (make: () => Promise<string>) => Promise<string>,
     ) => Promise<string>;
     scanMapImpl?: ScanMapImpl;
     probeAssetCodecImpl?: () => Promise<{
@@ -1262,6 +1682,7 @@ describe("hf-proxy negotiation and media codec map injection (U3)", () => {
       browserHostile: boolean;
       representativeMime: string | null;
       hasAlpha: boolean;
+      source?: { width: number; height: number; bitDepth: number; bitrate: number };
     } | null>;
   }): Promise<typeof import("./preview.js")> {
     vi.resetModules();
@@ -1274,17 +1695,29 @@ describe("hf-proxy negotiation and media codec map injection (U3)", () => {
           "",
         );
       });
-    const { waitForProxy, ProxyWaitTimeoutError, PROXY_PENDING_RETRY_AFTER_SECONDS } =
-      await vi.importActual<typeof import("../helpers/proxyTranscoder.js")>(
-        "../helpers/proxyTranscoder.js",
-      );
-    vi.doMock("../helpers/proxyTranscoder.js", () => ({
-      resolveProxy,
+    const {
       waitForProxy,
       ProxyWaitTimeoutError,
       PROXY_PENDING_RETRY_AFTER_SECONDS,
+      StillPastEndError,
+    } = await vi.importActual<typeof import("../helpers/proxyTranscoder.js")>(
+      "../helpers/proxyTranscoder.js",
+    );
+    vi.doMock("../helpers/proxyTranscoder.js", () => ({
+      resolveProxy,
+      resolveStill:
+        opts.resolveStillImpl ??
+        (async () => {
+          throw new Error("no resolveStill impl configured for this test");
+        }),
+      waitForProxy,
+      ProxyWaitTimeoutError,
+      PROXY_PENDING_RETRY_AFTER_SECONDS,
+      proxyCopyProgress: () => opts.copyProgress,
+      retryProxyCopy: (_dir: string, file: string) => void opts.retried?.push(file),
       ProxyTranscodeError: FakeProxyTranscodeError,
       ProxyCapacityError: FakeProxyCapacityError,
+      StillPastEndError,
       PROXY_PARAMS_VERSION: "v1",
       getProxyCachePath: () => "",
     }));
@@ -1296,7 +1729,10 @@ describe("hf-proxy negotiation and media codec map injection (U3)", () => {
       ...(await vi.importActual<typeof import("../helpers/mediaCodecMap.js")>(
         "../helpers/mediaCodecMap.js",
       )),
-      scanProjectMediaCodecMap: opts.scanMapImpl ?? (async () => ({})),
+      scanProjectMedia: async (...args: Parameters<ScanMapImpl>) => ({
+        codecMap: await (opts.scanMapImpl ?? (async () => ({})))(...args),
+        sourceFacts: {},
+      }),
       createMediaCodecProbeCache: () => new Map(),
       probeAssetCodec:
         opts.probeAssetCodecImpl ??
@@ -1306,18 +1742,6 @@ describe("hf-proxy negotiation and media codec map injection (U3)", () => {
           representativeMime: null,
           hasAlpha: false,
         })),
-      decideMediaProxyEligibility: (
-        facts: {
-          browserHostile: boolean;
-          hasAlpha: boolean;
-        } | null,
-      ) => {
-        if (!facts) return { eligible: false, reason: "unknown_codec" };
-        if (!facts.browserHostile) {
-          return { eligible: false, reason: "browser_safe_codec" };
-        }
-        return { eligible: true };
-      },
       isProxyVariant: (value: string) => value === "h264" || value === "vp8",
       isProxyVariantRequest: (value: string) =>
         value === "auto" || value === "h264" || value === "vp8",
@@ -1336,6 +1760,71 @@ describe("hf-proxy negotiation and media codec map injection (U3)", () => {
     }));
     return import("./preview.js");
   }
+
+  it.each(["bundled", "disk after null bundle", "disk after failed bundle"])(
+    "installs preview hooks before authored head consumers with flags, facts and error capture already present (%s)",
+    async (path) => {
+      const projectDir = createProjectDir();
+      const authored = `<!doctype html><html><head>
+        <script data-hf-accel-tracker>window.TRACKER_KEPT = true;</script>
+        <script data-hyperframes-preview-runtime="1" src="/stale-runtime.js"></script>
+        <script id="head-consumer">window.HEAD_CONSUMER = document.createElement("video").requestVideoFrameCallback;</script>
+        <script id="head-library" src="assets/head-library.js"></script>
+      </head><body><main data-composition-id="main" data-duration="2" data-motion-blur="on"></main>
+        <script id="body-consumer">window.BODY_CONSUMER = true;</script>
+      </body></html>`;
+      writeFileSync(join(projectDir, "index.html"), authored);
+      writeFileSync(
+        join(projectDir, "scene.html"),
+        `<template><main data-composition-id="scene" data-duration="2"></main><script id="body-consumer">window.BODY_CONSUMER = true;</script></template>`,
+      );
+      const { registerPreviewRoutes: register } = await loadPreviewModule({
+        scanMapImpl: async () => ({
+          "/clip.webm": {
+            codecName: "vp9",
+            browserHostile: true,
+            representativeMime: 'video/webm; codecs="vp09.00.10.08"',
+          },
+        }),
+      });
+      const app = new Hono();
+      register(
+        app,
+        createAdapter(projectDir, {
+          bundle: async () => {
+            if (path === "disk after failed bundle") throw new Error("bundler unavailable");
+            return path === "bundled" ? authored : null;
+          },
+        }),
+      );
+      for (const suffix of ["", "/comp/scene.html"]) {
+        const response = await app.request("http://localhost/projects/demo/preview" + suffix);
+        expect(response.status).toBe(200);
+        const html = await response.text();
+        const runtime = html.indexOf('src="/api/runtime.js"');
+        expect(runtime).toBeGreaterThan(-1);
+        for (const early of [
+          `name="${STUDIO_PREVIEW_MARK_META}"`,
+          `window.${STUDIO_PREVIEW_ERRORS}=`,
+          "window.__HF_MEDIA_CODEC_MAP__=",
+          "window.__HF_MEDIA_SOURCE_FACTS__=",
+        ]) {
+          expect(html.indexOf(early)).toBeGreaterThan(-1);
+          expect(html.indexOf(early)).toBeLessThan(runtime);
+        }
+        for (const authoredId of ["head-consumer", "head-library", "body-consumer"])
+          expect(runtime).toBeLessThan(html.indexOf(`id="${authoredId}"`));
+        expect(html).not.toContain("stale-runtime.js");
+        expect(
+          parseHTML(html).document.querySelectorAll("script[data-hyperframes-preview-runtime]"),
+        ).toHaveLength(1);
+        expect(
+          parseHTML(html).document.querySelectorAll("script[data-hf-accel-tracker]"),
+        ).toHaveLength(1);
+        expect(html).toContain("window.TRACKER_KEPT = true;");
+      }
+    },
+  );
 
   describe("?hf-proxy=h264 on the static asset route", () => {
     it("serves proxy bytes with Accept-Ranges on a full request, and a 206 range slice on a Range request", async () => {
@@ -1365,6 +1854,8 @@ describe("hf-proxy negotiation and media codec map injection (U3)", () => {
         projectDir,
         join(projectDir, "clip.mp4"),
         "h264",
+        undefined,
+        { priority: false },
       );
 
       const ranged = await app.request(
@@ -1376,6 +1867,254 @@ describe("hf-proxy negotiation and media codec map injection (U3)", () => {
       expect(ranged.status).toBe(206);
       expect(await ranged.text()).toBe("0123456789");
       expect(ranged.headers.get("Content-Range")).toBe("bytes 0-9/20");
+    });
+
+    it("makes the copy at background priority when the request says it is for later", async () => {
+      const projectDir = createProjectDir();
+      writeFileSync(join(projectDir, "clip.mp4"), "original-hevc-bytes");
+      const resolveProxyMock = vi.fn(async () => {
+        const proxyPath = join(projectDir, "proxy.mp4");
+        writeFileSync(proxyPath, "proxybytes");
+        return proxyPath;
+      });
+      const { registerPreviewRoutes: register } = await loadPreviewModule({
+        resolveProxyImpl: resolveProxyMock,
+      });
+      const app = new Hono();
+      register(app, createAdapter(projectDir));
+
+      await app.request("http://localhost/projects/demo/preview/clip.mp4?hf-proxy=h264", {
+        headers: { "X-HF-Proxy-Priority": "0" },
+      });
+      expect(resolveProxyMock).toHaveBeenCalledWith(
+        projectDir,
+        join(projectDir, "clip.mp4"),
+        "h264",
+        undefined,
+        { background: true },
+      );
+    });
+
+    it("puts the copy ahead of the queue when the request says the video is at the playhead", async () => {
+      const projectDir = createProjectDir();
+      writeFileSync(join(projectDir, "clip.mp4"), "original-hevc-bytes");
+      const resolveProxyMock = vi.fn(async () => {
+        const proxyPath = join(projectDir, "proxy.mp4");
+        writeFileSync(proxyPath, "proxybytes");
+        return proxyPath;
+      });
+      const { registerPreviewRoutes: register } = await loadPreviewModule({
+        resolveProxyImpl: resolveProxyMock,
+      });
+      const app = new Hono();
+      register(app, createAdapter(projectDir));
+
+      await app.request("http://localhost/projects/demo/preview/clip.mp4?hf-proxy=h264", {
+        headers: { "X-HF-Proxy-Priority": "1" },
+      });
+      expect(resolveProxyMock).toHaveBeenCalledWith(
+        projectDir,
+        join(projectDir, "clip.mp4"),
+        "h264",
+        undefined,
+        { priority: true },
+      );
+    });
+
+    it("serves one frame of the video as a JPEG while its copy is made, behind the same gate", async () => {
+      const projectDir = createProjectDir();
+      writeFileSync(join(projectDir, "clip.mp4"), "original-hevc-bytes");
+      const resolveStillMock = vi.fn(async () => {
+        const stillPath = join(projectDir, "still.jpg");
+        writeFileSync(stillPath, "jpegbytes");
+        return stillPath;
+      });
+      const { registerPreviewRoutes: register } = await loadPreviewModule({
+        resolveStillImpl: resolveStillMock,
+      });
+      const app = new Hono();
+      register(app, createAdapter(projectDir));
+      const url = "http://localhost/projects/demo/preview/clip.mp4?hf-proxy=h264";
+
+      const still = await app.request(`${url}&hf-proxy-still=12.34`);
+      expect(still.status).toBe(200);
+      expect(still.headers.get("Content-Type")).toBe("image/jpeg");
+      expect(await still.text()).toBe("jpegbytes");
+      expect(resolveStillMock).toHaveBeenCalledWith(
+        projectDir,
+        join(projectDir, "clip.mp4"),
+        12.34,
+        undefined,
+        expect.any(Function),
+        expect.any(AbortSignal),
+      );
+
+      expect((await app.request(`${url}&hf-proxy-still=-1`)).status).toBe(404);
+      expect((await app.request(`${url}&hf-proxy-still=abc`)).status).toBe(404);
+      expect(
+        (await app.request("http://localhost/projects/demo/preview/clip.mp4?hf-proxy-still=1"))
+          .status,
+      ).toBe(404);
+      expect(resolveStillMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("answers a still past the end of the video with a 404", async () => {
+      const projectDir = createProjectDir();
+      writeFileSync(join(projectDir, "clip.mp4"), "original-hevc-bytes");
+      const { registerPreviewRoutes: register } = await loadPreviewModule({
+        resolveStillImpl: async () => {
+          const { StillPastEndError } = await import("../helpers/proxyTranscoder.js");
+          throw new StillPastEndError();
+        },
+      });
+      const app = new Hono();
+      register(app, createAdapter(projectDir));
+
+      const res = await app.request(
+        "http://localhost/projects/demo/preview/clip.mp4?hf-proxy=h264&hf-proxy-still=9999",
+      );
+      expect(res.status).toBe(404);
+    });
+
+    it("makes at most four new stills at once, and serves a finished still without waiting", async () => {
+      const projectDir = createProjectDir();
+      writeFileSync(join(projectDir, "clip.mp4"), "original-hevc-bytes");
+      const stillPath = join(projectDir, "still.jpg");
+      writeFileSync(stillPath, "jpegbytes");
+      const finishers: Array<() => void> = [];
+      let running = 0;
+      let mostRunning = 0;
+      const resolveStillMock = vi.fn(
+        async (
+          _dir: string,
+          _file: string,
+          at: number,
+          _box?: { width: number; height: number },
+          startUncachedStill?: (make: () => Promise<string>) => Promise<string>,
+        ) => {
+          if (at === 99) return stillPath;
+          return startUncachedStill!(async () => {
+            mostRunning = Math.max(mostRunning, ++running);
+            await new Promise<void>((resolve) => finishers.push(resolve));
+            running--;
+            return stillPath;
+          });
+        },
+      );
+      const { registerPreviewRoutes: register } = await loadPreviewModule({
+        resolveStillImpl: resolveStillMock,
+      });
+      const app = new Hono();
+      register(app, createAdapter(projectDir));
+      const url = "http://localhost/projects/demo/preview/clip.mp4?hf-proxy=h264&hf-proxy-still=";
+
+      const made = Array.from({ length: 20 }, (_, i) => app.request(`${url}${i}`));
+      await vi.waitFor(() => expect(finishers).toHaveLength(4));
+      const finished = await app.request(`${url}99`);
+      expect(finished.status).toBe(200);
+      expect(finishers).toHaveLength(4);
+
+      let ended = 0;
+      while (ended < 20) {
+        await vi.waitFor(() => expect(finishers.length).toBeGreaterThan(0));
+        finishers.shift()?.();
+        ended++;
+      }
+      for (const res of await Promise.all(made)) expect(res.status).toBe(200);
+      expect(mostRunning).toBe(4);
+    });
+
+    it("turns a still away with a 503 once four are being made and sixteen wait", async () => {
+      const projectDir = createProjectDir();
+      writeFileSync(join(projectDir, "clip.mp4"), "original-hevc-bytes");
+      const stillPath = join(projectDir, "still.jpg");
+      writeFileSync(stillPath, "jpegbytes");
+      const finishers: Array<() => void> = [];
+      const resolveStillMock = vi.fn(
+        async (
+          _dir: string,
+          _file: string,
+          _at: number,
+          _box?: { width: number; height: number },
+          startUncachedStill?: (make: () => Promise<string>) => Promise<string>,
+        ) =>
+          startUncachedStill!(async () => {
+            await new Promise<void>((resolve) => finishers.push(resolve));
+            return stillPath;
+          }),
+      );
+      const { registerPreviewRoutes: register } = await loadPreviewModule({
+        resolveStillImpl: resolveStillMock,
+      });
+      const app = new Hono();
+      register(app, createAdapter(projectDir));
+      const url = "http://localhost/projects/demo/preview/clip.mp4?hf-proxy=h264&hf-proxy-still=";
+
+      const accepted = Array.from({ length: 20 }, (_, i) => app.request(`${url}${i}`));
+      await vi.waitFor(() => expect(resolveStillMock).toHaveBeenCalledTimes(20));
+      const turnedAway = await app.request(`${url}20`);
+      expect(turnedAway.status).toBe(503);
+      expect(turnedAway.headers.get("Retry-After")).toBe("5");
+
+      for (let ended = 0; ended < 20; ended++) {
+        await vi.waitFor(() => expect(finishers.length).toBeGreaterThan(0));
+        finishers.shift()?.();
+      }
+      for (const res of await Promise.all(accepted)) expect(res.status).toBe(200);
+    });
+
+    it("makes a still again for a request that shared a waiter whose client left", async () => {
+      const projectDir = createProjectDir();
+      writeFileSync(join(projectDir, "clip.mp4"), "original-hevc-bytes");
+      const stillPath = join(projectDir, "still.jpg");
+      writeFileSync(stillPath, "jpegbytes");
+      const finishers: Array<() => void> = [];
+      const inFlight = new Map<number, Promise<string>>();
+      const made: number[] = [];
+      const resolveStillMock = vi.fn(
+        (
+          _dir: string,
+          _file: string,
+          at: number,
+          _box?: { width: number; height: number },
+          startUncachedStill?: (make: () => Promise<string>) => Promise<string>,
+        ) => {
+          const shared = inFlight.get(at);
+          if (shared) return shared;
+          const making = startUncachedStill!(async () => {
+            made.push(at);
+            await new Promise<void>((resolve) => finishers.push(resolve));
+            return stillPath;
+          }).finally(() => inFlight.delete(at));
+          inFlight.set(at, making);
+          return making;
+        },
+      );
+      const { registerPreviewRoutes: register } = await loadPreviewModule({
+        resolveStillImpl: resolveStillMock,
+      });
+      const app = new Hono();
+      register(app, createAdapter(projectDir));
+      const url = "http://localhost/projects/demo/preview/clip.mp4?hf-proxy=h264&hf-proxy-still=";
+
+      const busy = [1, 2, 3, 4].map((at) => app.request(`${url}${at}`));
+      await vi.waitFor(() => expect(finishers).toHaveLength(4));
+      const leaving = new AbortController();
+      const first = app.request(`${url}10`, { signal: leaving.signal }).catch(() => null);
+      await vi.waitFor(() => expect(resolveStillMock).toHaveBeenCalledTimes(5));
+      const second = app.request(`${url}10`);
+      await vi.waitFor(() => expect(resolveStillMock).toHaveBeenCalledTimes(6));
+      leaving.abort();
+      await first;
+      await vi.waitFor(() => expect(resolveStillMock).toHaveBeenCalledTimes(7));
+
+      for (let ended = 0; ended < 5; ended++) {
+        await vi.waitFor(() => expect(finishers.length).toBeGreaterThan(0));
+        finishers.shift()?.();
+      }
+      expect((await second).status).toBe(200);
+      for (const res of await Promise.all(busy)) expect(res.status).toBe(200);
+      expect(made).toEqual([1, 2, 3, 4, 10]);
     });
 
     it("honors If-None-Match on a repeat request with a 304, without re-invoking resolveProxy", async () => {
@@ -1409,6 +2148,128 @@ describe("hf-proxy negotiation and media codec map injection (U3)", () => {
       expect(second.status).toBe(304);
       // The 304 shortcut never needs the proxy — no second transcode call.
       expect(resolveProxyMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("makes the copy for the shown size, under its own tag", async () => {
+      const projectDir = createProjectDir();
+      writeFileSync(join(projectDir, "clip.mp4"), "original-hevc-bytes");
+      pastSettleWindow();
+      const resolveProxyMock = vi.fn(async () => {
+        const proxyPath = join(projectDir, "proxy.mp4");
+        writeFileSync(proxyPath, "proxy-bytes");
+        return proxyPath;
+      });
+      const { registerPreviewRoutes: register } = await loadPreviewModule({
+        resolveProxyImpl: resolveProxyMock,
+      });
+      const app = new Hono();
+      register(app, createAdapter(projectDir));
+
+      const sized = await app.request(
+        "http://localhost/projects/demo/preview/clip.mp4?hf-proxy=h264&hf-proxy-box=1448x2048",
+      );
+      expect(sized.status).toBe(200);
+      expect(resolveProxyMock).toHaveBeenLastCalledWith(
+        projectDir,
+        join(projectDir, "clip.mp4"),
+        "h264",
+        { width: 1448, height: 2048 },
+        { priority: false },
+      );
+      const full = await app.request(
+        "http://localhost/projects/demo/preview/clip.mp4?hf-proxy=h264",
+      );
+      expect(resolveProxyMock).toHaveBeenLastCalledWith(
+        projectDir,
+        join(projectDir, "clip.mp4"),
+        "h264",
+        undefined,
+        { priority: false },
+      );
+      expect(sized.headers.get("ETag")).toBeTruthy();
+      expect(sized.headers.get("ETag")).not.toBe(full.headers.get("ETag"));
+    });
+
+    describe("a lighter copy of a file Chrome can play", () => {
+      const playable = (width: number, height: number) => async () => ({
+        codecName: "h264",
+        browserHostile: false,
+        representativeMime: null,
+        hasAlpha: false,
+        source: { width, height, bitDepth: 8, bitrate: 10_000_000 },
+      });
+
+      it("is made at the asked box when the file is heavy there", async () => {
+        const projectDir = createProjectDir();
+        writeFileSync(join(projectDir, "clip.mp4"), "original-bytes");
+        const resolveProxyMock = vi.fn(async () => {
+          const proxyPath = join(projectDir, "light.mp4");
+          writeFileSync(proxyPath, "light-bytes");
+          return proxyPath;
+        });
+        const { registerPreviewRoutes: register } = await loadPreviewModule({
+          resolveProxyImpl: resolveProxyMock,
+          probeAssetCodecImpl: playable(3840, 2160),
+        });
+        const app = new Hono();
+        register(app, createAdapter(projectDir));
+
+        const res = await app.request(
+          "http://localhost/projects/demo/preview/clip.mp4?hf-proxy=h264&hf-proxy-light=1&hf-proxy-box=724x362",
+        );
+
+        expect(res.status).toBe(200);
+        expect(await res.text()).toBe("light-bytes");
+        expect(resolveProxyMock).toHaveBeenCalledWith(
+          projectDir,
+          join(projectDir, "clip.mp4"),
+          "h264",
+          { width: 724, height: 362 },
+          { priority: false },
+        );
+      });
+
+      it("is refused when the file is not heavy at that box, and without the ask", async () => {
+        const projectDir = createProjectDir();
+        writeFileSync(join(projectDir, "clip.mp4"), "original-bytes");
+        const resolveProxyMock = vi.fn(async () => "should-not-be-called");
+        const { registerPreviewRoutes: register } = await loadPreviewModule({
+          resolveProxyImpl: resolveProxyMock,
+          probeAssetCodecImpl: playable(1920, 1080),
+        });
+        const app = new Hono();
+        register(app, createAdapter(projectDir));
+
+        const small = await app.request(
+          "http://localhost/projects/demo/preview/clip.mp4?hf-proxy=h264&hf-proxy-light=1&hf-proxy-box=2048x1218",
+        );
+        const unasked = await app.request(
+          "http://localhost/projects/demo/preview/clip.mp4?hf-proxy=h264&hf-proxy-box=724x362",
+        );
+
+        expect(small.status).toBe(422);
+        expect(unasked.status).toBe(422);
+        expect(resolveProxyMock).not.toHaveBeenCalled();
+      });
+    });
+
+    it.each([
+      ["a size off the ladder", "?hf-proxy=h264&hf-proxy-box=1000x2000"],
+      ["a size without a copy", "?hf-proxy-box=1448x2048"],
+      ["a lighter copy without a size", "?hf-proxy=h264&hf-proxy-light=1"],
+    ])("refuses %s before making anything", async (_name, query) => {
+      const projectDir = createProjectDir();
+      writeFileSync(join(projectDir, "clip.mp4"), "original-hevc-bytes");
+      const resolveProxyMock = vi.fn(async () => "should-not-be-called");
+      const { registerPreviewRoutes: register } = await loadPreviewModule({
+        resolveProxyImpl: resolveProxyMock,
+      });
+      const app = new Hono();
+      register(app, createAdapter(projectDir));
+
+      const res = await app.request(`http://localhost/projects/demo/preview/clip.mp4${query}`);
+      expect(res.status).toBe(404);
+      expect(resolveProxyMock).not.toHaveBeenCalled();
     });
 
     it("tags no asset written in the last moments, so a same-size rewrite cannot reuse its tag", async () => {
@@ -1518,6 +2379,8 @@ describe("hf-proxy negotiation and media codec map injection (U3)", () => {
         projectDir,
         join(projectDir, "clip.mov"),
         "vp8",
+        undefined,
+        { priority: false },
       );
     });
 
@@ -1657,6 +2520,28 @@ describe("hf-proxy negotiation and media codec map injection (U3)", () => {
       expect(mediaProxyDemand().proxyRequests - before).toBe(1);
     });
 
+    it("says how far a copy has got on the 202, and forgets a failure when asked to retry", async () => {
+      const projectDir = createProjectDir();
+      writeFileSync(join(projectDir, "clip.mp4"), "original-hevc-bytes");
+      const retried: string[] = [];
+      const { registerPreviewRoutes: register } = await loadPreviewModule({
+        resolveProxyImpl: () => new Promise<string>(() => {}),
+        copyProgress: 0.4249,
+        retried,
+      });
+      const app = new Hono();
+      register(app, createAdapter(projectDir));
+      const url = "http://localhost/projects/demo/preview/clip.mp4?hf-proxy=h264";
+
+      const first = await app.request(url);
+      expect(first.status).toBe(202);
+      expect(first.headers.get("X-HF-Proxy-Progress")).toBe("0.425");
+      expect(retried).toEqual([]);
+
+      await app.request(`${url}&hf-proxy-box=1448x2048&hf-proxy-retry=1`);
+      expect(retried).toEqual([join(projectDir, "clip.mp4")]);
+    });
+
     it("rejects a path-traversal attempt through the proxied path (404, no transcode)", async () => {
       const projectDir = createProjectDir();
       const resolveProxyMock = vi.fn(async () => "should-not-be-called");
@@ -1706,7 +2591,7 @@ describe("hf-proxy negotiation and media codec map injection (U3)", () => {
       const html = await res.text();
       expect(html).not.toContain("data-hf-media-codec-map");
     });
-    it("injects the scanned map naming the hostile fixture, and pre-warms resolveProxy for it", async () => {
+    it("injects the scanned map naming the hostile fixture, and makes no copy before the page asks for its size", async () => {
       const projectDir = createProjectDir();
       const resolveProxyMock = vi.fn(async () => join(projectDir, ".transcode-cache", "x.mp4"));
       const scanMapMock = vi.fn(async () => ({
@@ -1732,14 +2617,8 @@ describe("hf-proxy negotiation and media codec map injection (U3)", () => {
       expect(html).not.toContain("h264.mp4");
       expect(scanMapMock).toHaveBeenCalled();
 
-      // Pre-warm: fire-and-forget resolveProxy for the hostile entry.
-      await Promise.resolve();
-      await Promise.resolve();
-      expect(resolveProxyMock).toHaveBeenCalledWith(
-        projectDir,
-        join(projectDir, "/videos/hevc.mp4"),
-        "h264",
-      );
+      // A source-size pre-warm would be a copy Studio never shows.
+      expect(resolveProxyMock).not.toHaveBeenCalled();
     });
 
     it("injects and serves a proxy for a hostile video through an external asset symlink", async () => {
@@ -1784,6 +2663,8 @@ describe("hf-proxy negotiation and media codec map injection (U3)", () => {
         projectDir,
         join(projectDir, "assets", "shared", "clip.mov"),
         "h264",
+        undefined,
+        { priority: false },
       );
     });
 
@@ -2280,6 +3161,29 @@ describe("preview asset byte ranges", () => {
     expect(res.status).toBe(416);
     expect(res.headers.get("Content-Range")).toBe("bytes */3");
   });
+
+  it("answers an open-ended media range with a bounded piece, not the rest of the file", async () => {
+    // A media element reads `bytes=N-` until its buffer is full, then leaves the response open.
+    // Served to EOF, each <video> held one of the browser's six connections, so seven clips on
+    // one file left every other request queued (#6029).
+    const projectDir = createProjectDir();
+    const size = 3 * 1024 * 1024 * 1024;
+    const fd = openSync(join(projectDir, "clip.mp4"), "w");
+    ftruncateSync(fd, size);
+    closeSync(fd);
+
+    const app = new Hono();
+    registerPreviewRoutes(app, createAdapter(projectDir));
+    const res = await app.request("http://localhost/projects/demo/preview/clip.mp4", {
+      headers: { Range: "bytes=5000000-" },
+    });
+    expect(res.status).toBe(206);
+    expect(res.headers.get("Content-Range")).toBe(
+      `bytes 5000000-${5000000 + MAX_OPEN_MEDIA_RANGE_BYTES - 1}/${size}`,
+    );
+    expect(res.headers.get("Content-Length")).toBe(String(MAX_OPEN_MEDIA_RANGE_BYTES));
+    expect((await res.arrayBuffer()).byteLength).toBe(MAX_OPEN_MEDIA_RANGE_BYTES);
+  });
 });
 
 describe("the desktop app's private folder", () => {
@@ -2300,6 +3204,53 @@ describe("the desktop app's private folder", () => {
       expect(await res.text()).not.toContain("secret");
     }
   });
+  it("is not served from a nested project's folder either", async () => {
+    const projectDir = createProjectDir();
+    mkdirSync(join(projectDir, "sub", ".hyperframes"), { recursive: true });
+    writeFileSync(
+      join(projectDir, "sub", ".hyperframes", "app-history.jsonl"),
+      '{"text":"secret"}',
+    );
+    const app = new Hono();
+    registerPreviewRoutes(app, createAdapter(projectDir));
+    for (const route of ["preview", "preview/comp"]) {
+      for (const path of [
+        "sub/.hyperframes/app-history.jsonl",
+        "SUB/.HyperFrames./App-History.JSONL",
+      ]) {
+        const res = await app.request(`http://localhost/projects/demo/${route}/${path}`);
+        expect(res.status).toBe(404);
+        expect(await res.text()).not.toContain("secret");
+      }
+    }
+  });
+  it("is joined by credentials and tool state, which neither preview route serves", async () => {
+    const projectDir = createProjectDir();
+    const credentials = [
+      ".npmrc",
+      ".mcp.json",
+      ".claude/x.json",
+      ".aws/credentials",
+      "id_ed25519",
+      "cert.pem",
+      ".dev.vars",
+      ".vault-token",
+      ".cargo/credentials.toml",
+      "infra/terraform.tfstate",
+    ];
+    for (const folder of [".claude", ".aws", ".cargo", "infra"])
+      mkdirSync(join(projectDir, folder), { recursive: true });
+    for (const file of credentials) writeFileSync(join(projectDir, file), "secret");
+    const app = new Hono();
+    registerPreviewRoutes(app, createAdapter(projectDir));
+    for (const route of ["preview", "preview/comp"]) {
+      for (const file of credentials) {
+        const res = await app.request(`http://localhost/projects/demo/${route}/${file}`);
+        expect(res.status).toBe(404);
+        expect(await res.text()).not.toContain("secret");
+      }
+    }
+  });
   it("still serves the app's request pictures", async () => {
     const projectDir = createProjectDir();
     mkdirSync(join(projectDir, ".hyperframes", "requests", "1"), { recursive: true });
@@ -2310,5 +3261,342 @@ describe("the desktop app's private folder", () => {
       "http://localhost/projects/demo/preview/.hyperframes/requests/1/before.png",
     );
     expect(res.status).toBe(200);
+  });
+});
+
+describe("GSAP mirror configuration", () => {
+  const mirror = "http://localhost:8080/vendor/npm";
+  const metaName = "hyperframes-gsap-base-url";
+  const previewUrl = "http://localhost/projects/demo/preview";
+
+  function appForMirror(
+    projectDir: string,
+    base: string,
+    overrides: Partial<StudioApiAdapter> = {},
+  ) {
+    vi.stubEnv("HYPERFRAMES_GSAP_BASE_URL", base);
+    const app = new Hono();
+    registerPreviewRoutes(app, createAdapter(projectDir, overrides));
+    return app;
+  }
+
+  it.each(["/relative/npm", "https://mirror.example/npm?token=1", "file:///npm"])(
+    "rejects invalid configuration before registering routes: %s",
+    (base) => {
+      expect(() => appForMirror(createProjectDir(), base)).toThrow("HYPERFRAMES_GSAP_BASE_URL");
+    },
+  );
+
+  it.each(["bundle", "disk fallback", "capture", "subcomposition"])(
+    "uses server metadata and the configured plugin in the %s document",
+    async (mode) => {
+      const projectDir = createProjectDir();
+      const authored = "https://authored.example/gsap@3.14.2/dist/gsap.min.js";
+      const source = `<html><head><meta name="${metaName}" content="https://authored.example/npm"><script src="${authored}"></script></head><body><script>gsap.to("#card", { motionPath: {} });</script></body></html>`;
+      writeFileSync(join(projectDir, "index.html"), source);
+      writeFileSync(join(projectDir, "scene.html"), source);
+      const app = appForMirror(projectDir, mirror, {
+        bundle: async () => {
+          if (mode === "disk fallback") throw new Error("test bundle failure");
+          return source;
+        },
+      });
+      const suffix =
+        mode === "subcomposition" ? "/comp/scene.html" : mode === "capture" ? "?hf-capture=1" : "";
+      const response = await app.request(previewUrl + suffix);
+      expect(response.status).toBe(200);
+      const html = await response.text();
+      const doc = parseHTML(html).document;
+      expect(doc.querySelector(`meta[name="${metaName}"]`)?.getAttribute("content")).toBe(mirror);
+      expect(doc.querySelector(`script[src="${authored}"]`)).not.toBeNull();
+      expect(doc.querySelector('script[src*="MotionPathPlugin"]')?.getAttribute("src")).toBe(
+        `${mirror}/gsap@3.14.2/dist/MotionPathPlugin.min.js`,
+      );
+      expect(html).not.toContain("cdn.jsdelivr.net");
+    },
+  );
+
+  it("uses the mirror for generated GSAP, CustomEase, and standalone GSAP", async () => {
+    const projectDir = createProjectDir();
+    mkdirSync(join(projectDir, ".hyperframes"));
+    writeFileSync(
+      join(projectDir, ".hyperframes", "studio-motion.json"),
+      JSON.stringify({
+        version: 1,
+        motions: [
+          {
+            kind: "gsap-motion",
+            target: { sourceFile: "index.html", id: "card" },
+            start: 0,
+            duration: 1,
+            customEase: { id: "custom", data: "M0,0 C0.18,0.9 0.32,1 1,1" },
+            from: { y: 32 },
+            to: { y: 0 },
+          },
+        ],
+      }),
+    );
+    writeFileSync(join(projectDir, "scene.html"), "<template><section>Scene</section></template>");
+    const app = appForMirror(projectDir, mirror);
+    const root = parseHTML(await (await app.request(previewUrl)).text()).document;
+    const urls = [...root.querySelectorAll("script[src]")].map((script) =>
+      script.getAttribute("src"),
+    );
+    expect(urls).toContain(`${mirror}/gsap@3.15.0/dist/gsap.min.js`);
+    expect(urls).toContain(`${mirror}/gsap@3.15.0/dist/CustomEase.min.js`);
+    const scene = parseHTML(
+      await (await app.request(previewUrl + "/comp/scene.html")).text(),
+    ).document;
+    expect(scene.querySelector('script[src$="/gsap.min.js"]')?.getAttribute("src")).toBe(
+      `${mirror}/gsap@3.15.0/dist/gsap.min.js`,
+    );
+  });
+
+  it("preserves authored plugins and the default CDN when the override is unset", async () => {
+    const projectDir = createProjectDir();
+    const plugin = "https://authored.example/MotionPathPlugin.min.js";
+    writeFileSync(
+      join(projectDir, "index.html"),
+      `<html><head><script src="${plugin}"></script></head><body><script>gsap.to("#card", { motionPath: {} });</script></body></html>`,
+    );
+    const configured = await (await appForMirror(projectDir, mirror).request(previewUrl)).text();
+    expect(
+      parseHTML(configured).document.querySelectorAll('script[src*="MotionPathPlugin"]'),
+    ).toHaveLength(1);
+    expect(configured).toContain(`src="${plugin}"`);
+    const defaults = await (await appForMirror(projectDir, "").request(previewUrl)).text();
+    expect(
+      parseHTML(defaults)
+        .document.querySelector(`meta[name="${metaName}"]`)
+        ?.getAttribute("content"),
+    ).toBe("https://cdn.jsdelivr.net/npm");
+    expect(defaults).toContain('var cdnBase="https://cdn.jsdelivr.net/npm/gsap@3.15.0/dist/"');
+  });
+
+  it("normalizes and escapes metadata without letting authored metadata override it", async () => {
+    const projectDir = createProjectDir();
+    writeFileSync(
+      join(projectDir, "index.html"),
+      `<html><head><meta name="${metaName}" content="https://authored.example/npm"></head><body></body></html>`,
+    );
+    const app = appForMirror(projectDir, " https://mirror.example/a&copy;/npm/// ");
+    const html = await (await app.request(previewUrl)).text();
+    expect(html).toContain('content="https://mirror.example/a&amp;copy;/npm"');
+    expect(
+      parseHTML(html).document.querySelector(`meta[name="${metaName}"]`)?.getAttribute("content"),
+    ).toBe("https://mirror.example/a&copy;/npm");
+  });
+
+  it("invalidates root, subcomposition, and persistent preview caches when the mirror changes", async () => {
+    const projectDir = createProjectDir();
+    writeFileSync(join(projectDir, "scene.html"), "<template><section>Scene</section></template>");
+    const bundle = vi.fn(
+      async () =>
+        '<html><head></head><body><div data-hf-scene="a">Cached preview</div></body></html>',
+    );
+    const overrides = {
+      bundle,
+      previewDocuments: createPreviewDocumentStore(projectDir, "same-build", "secret"),
+    };
+    const first = appForMirror(projectDir, mirror, overrides);
+    const root = await first.request(previewUrl);
+    const scene = await first.request(previewUrl + "/comp/scene.html");
+    const secondBase = "https://other.example/npm";
+    const second = appForMirror(projectDir, secondBase, overrides);
+    const rootNext = await second.request(previewUrl, {
+      headers: { "If-None-Match": root.headers.get("ETag")! },
+    });
+    const sceneNext = await second.request(previewUrl + "/comp/scene.html", {
+      headers: { "If-None-Match": scene.headers.get("ETag")! },
+    });
+    expect(rootNext.status).toBe(200);
+    expect(sceneNext.status).toBe(200);
+    expect(rootNext.headers.get("ETag")).not.toBe(root.headers.get("ETag"));
+    expect(sceneNext.headers.get("ETag")).not.toBe(scene.headers.get("ETag"));
+    expect(bundle).toHaveBeenCalledTimes(2);
+    const firstHtml = parseHTML(await root.text()).document;
+    const nextHtml = parseHTML(await rootNext.text()).document;
+    expect(nextHtml.querySelector(`meta[name="${metaName}"]`)?.getAttribute("content")).toBe(
+      secondBase,
+    );
+    expect(nextHtml.querySelector('meta[name="hf-scene-parts"]')?.getAttribute("content")).not.toBe(
+      firstHtml.querySelector('meta[name="hf-scene-parts"]')?.getAttribute("content"),
+    );
+    const normalized = appForMirror(projectDir, ` ${secondBase}/// `, overrides);
+    expect(
+      (
+        await normalized.request(previewUrl, {
+          headers: { "If-None-Match": rootNext.headers.get("ETag")! },
+        })
+      ).status,
+    ).toBe(304);
+    vi.stubEnv("HYPERFRAMES_GSAP_BASE_URL", mirror);
+    expect((await second.request(previewUrl)).headers.get("ETag")).toBe(
+      rootNext.headers.get("ETag"),
+    );
+  });
+
+  it("retries an authored GSAP failure only on the selected mirror and reports mirror failure", async () => {
+    const app = appForMirror(createProjectDir(), mirror);
+    const html = await (await app.request(previewUrl)).text();
+    const fallback = /<script data-hf-gsap-fallback>([\s\S]*?)<\/script>/.exec(html)?.[1] ?? "";
+    let onError: (event: { target: unknown }) => void = () => undefined;
+    const scripts: { tagName: string; src: string; onerror?: (event: Event) => void }[] = [];
+    const doc = {
+      addEventListener: (_type: string, listener: typeof onError) => {
+        onError = listener;
+      },
+      createElement: () => ({ tagName: "SCRIPT", src: "" }),
+      head: { appendChild: (script: (typeof scripts)[number]) => scripts.push(script) },
+    };
+    const reported = vi.fn();
+    new Function("document", "reportError", fallback)(doc, reported);
+    onError({
+      target: { tagName: "SCRIPT", src: "https://authored.example/gsap@3.14.2/dist/gsap.min.js" },
+    });
+    expect(scripts).toHaveLength(1);
+    expect(scripts[0]?.src).toBe(`${mirror}/gsap@3.15.0/dist/gsap.min.js`);
+    onError({ target: scripts[0] });
+    scripts[0]?.onerror?.(new Event("error"));
+    await vi.waitFor(() => expect(reported).toHaveBeenCalledTimes(1));
+    expect(scripts).toHaveLength(1);
+    expect(html).not.toContain("cdn.jsdelivr.net");
+  });
+});
+
+describe("bundled GSAP local root", () => {
+  const localRoot = "/api/vendor/npm";
+  const metaName = "hyperframes-gsap-base-url";
+  const previewUrl = "http://localhost/projects/demo/preview";
+
+  function appForHost(projectDir: string, env = "", overrides: Partial<StudioApiAdapter> = {}) {
+    vi.stubEnv("HYPERFRAMES_GSAP_BASE_URL", env);
+    const app = new Hono();
+    registerPreviewRoutes(
+      app,
+      createAdapter(projectDir, { gsapLocalRoot: localRoot, ...overrides }),
+    );
+    return app;
+  }
+
+  function writeMotionProject(projectDir: string): void {
+    mkdirSync(join(projectDir, ".hyperframes"));
+    writeFileSync(
+      join(projectDir, ".hyperframes", "studio-motion.json"),
+      JSON.stringify({
+        version: 1,
+        motions: [
+          {
+            kind: "gsap-motion",
+            target: { sourceFile: "index.html", id: "card" },
+            start: 0,
+            duration: 1,
+            customEase: { id: "custom", data: "M0,0 C0.18,0.9 0.32,1 1,1" },
+            from: { y: 32 },
+            to: { y: 0 },
+          },
+        ],
+      }),
+    );
+    writeFileSync(join(projectDir, "scene.html"), "<template><section>Scene</section></template>");
+  }
+
+  it("loads every GSAP dependency Studio adds from the host's bundled copy", async () => {
+    const projectDir = createProjectDir();
+    writeMotionProject(projectDir);
+    const app = appForHost(projectDir);
+    const html = await (await app.request(previewUrl)).text();
+    const root = parseHTML(html).document;
+    const urls = [...root.querySelectorAll("script[src]")].map((s) => s.getAttribute("src"));
+    expect(root.querySelector(`meta[name="${metaName}"]`)?.getAttribute("content")).toBe(localRoot);
+    expect(urls).toContain(`${localRoot}/gsap@3.15.0/dist/gsap.min.js`);
+    expect(urls).toContain(`${localRoot}/gsap@3.15.0/dist/CustomEase.min.js`);
+    expect(html).toContain(`var cdnBase="${localRoot}/gsap@3.15.0/dist/"`);
+    expect(html).not.toContain("jsdelivr");
+
+    const scene = await (await app.request(`${previewUrl}/comp/scene.html`)).text();
+    expect(
+      parseHTML(scene).document.querySelector('script[src$="/gsap.min.js"]')?.getAttribute("src"),
+    ).toBe(`${localRoot}/gsap@3.15.0/dist/gsap.min.js`);
+    expect(scene).not.toContain("jsdelivr");
+
+    writeFileSync(
+      join(projectDir, "index.html"),
+      `<html><head><script src="vendor/gsap.min.js"></script></head><body><script>gsap.to("#card", { motionPath: {} });</script></body></html>`,
+    );
+    const withPath = await (await app.request(previewUrl)).text();
+    expect(
+      parseHTML(withPath)
+        .document.querySelector('script[src*="MotionPathPlugin"]')
+        ?.getAttribute("src"),
+    ).toBe(`${localRoot}/gsap@3.15.0/dist/MotionPathPlugin.min.js`);
+    expect(withPath).not.toContain("jsdelivr");
+  });
+
+  it("loads a plugin for another GSAP version from jsDelivr", async () => {
+    const projectDir = createProjectDir();
+    writeFileSync(
+      join(projectDir, "index.html"),
+      `<html><head><script src="vendor/gsap@3.14.2/dist/gsap.min.js"></script></head><body><script>gsap.to("#card", { motionPath: {} });</script></body></html>`,
+    );
+    const html = await (await appForHost(projectDir).request(previewUrl)).text();
+    expect(
+      parseHTML(html)
+        .document.querySelector('script[src*="MotionPathPlugin"]')
+        ?.getAttribute("src"),
+    ).toBe("https://cdn.jsdelivr.net/npm/gsap@3.14.2/dist/MotionPathPlugin.min.js");
+  });
+
+  it("prefers HYPERFRAMES_GSAP_BASE_URL over the bundled copy", async () => {
+    const projectDir = createProjectDir();
+    writeMotionProject(projectDir);
+    const mirror = "https://mirror.example/npm";
+    const html = await (await appForHost(projectDir, mirror).request(previewUrl)).text();
+    const doc = parseHTML(html).document;
+    expect(doc.querySelector(`meta[name="${metaName}"]`)?.getAttribute("content")).toBe(mirror);
+    expect(doc.querySelector('script[src$="/gsap.min.js"]')?.getAttribute("src")).toBe(
+      `${mirror}/gsap@3.15.0/dist/gsap.min.js`,
+    );
+    expect(html).not.toContain(localRoot);
+    expect(html).not.toContain("jsdelivr");
+  });
+
+  it("changes the preview ETag when the bundled copy replaces jsDelivr", async () => {
+    const projectDir = createProjectDir();
+    vi.stubEnv("HYPERFRAMES_GSAP_BASE_URL", "");
+    const cdnApp = new Hono();
+    registerPreviewRoutes(cdnApp, createAdapter(projectDir));
+    const before = await cdnApp.request(previewUrl);
+    const after = await appForHost(projectDir).request(previewUrl, {
+      headers: { "If-None-Match": before.headers.get("ETag")! },
+    });
+    expect(after.status).toBe(200);
+    expect(after.headers.get("ETag")).not.toBe(before.headers.get("ETag"));
+  });
+
+  it("rejects a remote plain-HTTP mirror and a local root that leaves the origin", () => {
+    const projectDir = createProjectDir();
+    expect(() => appForHost(projectDir, "http://mirror.example/npm")).toThrow(
+      "HYPERFRAMES_GSAP_BASE_URL",
+    );
+    expect(() => appForHost(projectDir, "", { gsapLocalRoot: "//cdn.example/npm" })).toThrow(
+      "same-origin path",
+    );
+  });
+});
+
+describe("preview asset colour tags", () => {
+  it("serves a BT.709-tagged PNG without the tag, so the file's own values show", async () => {
+    const projectDir = createProjectDir();
+    writeFileSync(join(projectDir, "tagged.png"), TAGGED_PNG);
+    const app = new Hono();
+    registerPreviewRoutes(app, createAdapter(projectDir));
+
+    const response = await app.request("http://localhost/projects/demo/preview/tagged.png");
+
+    const body = Buffer.from(await response.arrayBuffer());
+    expect(body.includes("cICP")).toBe(false);
+    expect(body.includes("IDAT")).toBe(true);
+    expect(response.headers.get("Content-Length") ?? String(body.length)).toBe(String(body.length));
   });
 });

@@ -1,14 +1,18 @@
 // Shared "what counts as motion" classifier, injected before layout-audit.browser.js and motion-sample.browser.js.
 // The frozen-sweep guard (sweep_static) and keepsMoving liveness (motion_frozen) meet in one decision, so both
 // must count the same channels as motion; only quantization differs (liveness buckets 2px and 0.08 opacity).
+// Where both read still, check asks framesDiffer below, which compares the rendered frames.
 // A channel reader returns a string equal across samples iff it did not visibly change, "" when it does not apply.
 (function () {
   const IGNORE_TAGS = new Set(["SCRIPT", "STYLE", "TEMPLATE", "NOSCRIPT", "META", "LINK"]);
   const MEDIA_TAGS = new Set(["CANVAS", "VIDEO", "IMG"]);
+  const COARSE_MEDIA_SAMPLE_SIDE = 8;
+  const LIVENESS_MEDIA_SAMPLE_SIDE = 32;
   const FNV_OFFSET_BASIS = 2166136261;
   const FNV_PRIME = 16777619;
   const LIVENESS_POSITION_BUCKET_PX = 2;
   const LIVENESS_OPACITY_BUCKET = 0.08;
+  const LIVENESS_MEDIA_TIME_BUCKET_SEC = 0.1;
   const IGNORE_SELECTOR = "[data-layout-ignore], [data-layout-check='ignore']";
   // counter(name) / counters(name, sep) in generated content. A list-item box
   // whose ::marker content is `normal` paints counter(list-item) implicitly.
@@ -24,6 +28,8 @@
     visibilityProperty: true,
     contentVisibilityAuto: true,
   };
+  // Core's timedClipHide hides these clips' whole subtrees; layout-audit skips them the same way.
+  const RUNTIME_HIDDEN_CLIP = "[data-hf-clip-hidden]";
   // Stand-in for the ::before/::after of an element whose contents are skipped:
   // no pseudo box exists, so nothing it declares (content, counter-*) paints.
   const NO_BOX = Object.freeze({ display: "none" });
@@ -139,6 +145,41 @@
     return clip ? hashFields([clip]) : "";
   }
 
+  // Paint that moves no geometry: a filter, color, background, shadow or SVG paint tween restyles a box in place.
+  function paintChannel(properties) {
+    return (element, ctx) => {
+      const values = properties.map((property) => cssValue(ctx.style[property]));
+      return values.some(Boolean) ? hashFields(values) : "";
+    };
+  }
+  const backgroundPaintChannel = paintChannel([
+    "filter",
+    "backdropFilter",
+    "backgroundColor",
+    "backgroundImage",
+    "backgroundPosition",
+    "boxShadow",
+  ]);
+
+  const STROKE_EDGES = ["borderTop", "borderRight", "borderBottom", "borderLeft", "outline"];
+  // Blink computes border and outline colors as `currentColor` even when none is drawn, so they follow `color`.
+  function drawnColor(style, edge) {
+    const drawn = style[`${edge}Style`] !== "none" && Number.parseFloat(style[`${edge}Width`]) > 0;
+    return drawn ? style[`${edge}Color`] : "";
+  }
+  function strokePaintChannel(element, ctx) {
+    const values = STROKE_EDGES.map((edge) => drawnColor(ctx.style, edge));
+    return values.some(Boolean) ? hashFields(values) : "";
+  }
+  const contentPaintChannel = paintChannel([
+    "color",
+    "textShadow",
+    "fill",
+    "stroke",
+    "strokeDashoffset",
+    "strokeDasharray",
+  ]);
+
   // Direct text nodes only: descendants are signed separately, and a hidden
   // descendant's text mutation must not masquerade as visible motion.
   function textChannel(element) {
@@ -188,28 +229,35 @@
     return before || after ? hashFields([before, after]) : "";
   }
 
+  function unreadableMedia(element) {
+    return "x" + (element.currentSrc || element.getAttribute("src") || "");
+  }
+
   // Pixel-only media motion (canvas repaint, playing video, same-size <img> swap) is invisible to DOM channels,
-  // so fold in an 8x8 downsample. Unreadable media hashes to a constant; iframe media is a separate document.
+  // so fold in a downsample: fine for liveness (a small sprite moving), coarse for the frozen-sweep guard,
+  // which a wall-clock repaint between seeks would fool. Unreadable media hashes to its source.
   // fallow-ignore-next-line complexity
-  function mediaPixelChannel(element) {
+  function mediaPixelChannel(element, ctx) {
     if (!MEDIA_TAGS.has(element.tagName)) return "";
     try {
       const rect = element.getBoundingClientRect();
       const sourceWidth = element.videoWidth || element.width || rect.width;
       const sourceHeight = element.videoHeight || element.height || rect.height;
-      if (!sourceWidth || !sourceHeight) return "x";
+      if (!sourceWidth || !sourceHeight) return unreadableMedia(element);
       const off = document.createElement("canvas");
-      off.width = 8;
-      off.height = 8;
+      const side = ctx && ctx.quantize ? LIVENESS_MEDIA_SAMPLE_SIDE : COARSE_MEDIA_SAMPLE_SIDE;
+      off.width = side;
+      off.height = side;
       const ctx2d = off.getContext("2d");
-      if (!ctx2d) return "x";
-      ctx2d.drawImage(element, 0, 0, 8, 8);
-      const data = ctx2d.getImageData(0, 0, 8, 8).data;
+      if (!ctx2d) return unreadableMedia(element);
+      if (side === LIVENESS_MEDIA_SAMPLE_SIDE) ctx2d.imageSmoothingQuality = "high";
+      ctx2d.drawImage(element, 0, 0, side, side);
+      const data = ctx2d.getImageData(0, 0, side, side).data;
       let hash = 0;
       for (let i = 0; i < data.length; i++) hash = (hash * 31 + data[i]) >>> 0;
       return String(hash);
     } catch {
-      return "x";
+      return unreadableMedia(element);
     }
   }
 
@@ -223,12 +271,15 @@
     fontAxesChannel,
     clipPathChannel,
     controlWidgetChannel,
+    backgroundPaintChannel,
+    strokePaintChannel,
   ];
   const CONTENT_CHANNELS = [
     textChannel,
     controlValueChannel,
     generatedContentChannel,
     mediaPixelChannel,
+    contentPaintChannel,
   ];
   const ELEMENT_CHANNELS = [...BOX_CHANNELS, ...CONTENT_CHANNELS];
 
@@ -302,6 +353,20 @@
     return parts;
   }
 
+  // Media time moves under seek where no pixel can be read: a graded video is drawn into a WebGL canvas that
+  // reads back blank, and audio has no box. Audio shows the timeline ran but is no picture, so it is kept apart.
+  function mediaTimeParts(root, quantize, selector) {
+    const parts = [];
+    for (const media of root.querySelectorAll(selector)) {
+      if (isOptedOut(media, root)) continue;
+      const time = media.currentTime;
+      parts.push(
+        String(quantize ? Math.round(time / LIVENESS_MEDIA_TIME_BUCKET_SEC) : round(time)),
+      );
+    }
+    return parts;
+  }
+
   // One signature of everything under `root`, root included, that a viewer could see change between seeks.
   // Opted-out elements inside the root may animate off the timeline, so they are neither signed nor counter
   // consumers, but stay counter owners; the root itself is always measured.
@@ -318,14 +383,21 @@
     const skippedHosts = new Set();
     for (const element of [root, ...root.querySelectorAll("*")]) {
       if (IGNORE_TAGS.has(element.tagName)) continue;
-      const style = getComputedStyle(element);
       const parent = element.parentElement;
+      if (
+        unrenderedBelow.has(parent) ||
+        (element !== root && element.matches(RUNTIME_HIDDEN_CLIP))
+      ) {
+        unrenderedBelow.add(element);
+        continue;
+      }
+      const style = getComputedStyle(element);
       const platformDecides = typeof element.checkVisibility === "function";
       const noBox = platformDecides
         ? !element.checkVisibility(RENDERED_BOX_OPTIONS)
         : style.display === "none";
       const boxlessOwner = style.display === "contents" && !skippedHosts.has(parent);
-      if (unrenderedBelow.has(parent) || (noBox && !boxlessOwner)) {
+      if (noBox && !boxlessOwner) {
         unrenderedBelow.add(element);
         continue;
       }
@@ -353,9 +425,60 @@
       const channels = skipped ? BOX_CHANNELS : ELEMENT_CHANNELS;
       parts.push(channels.map((channel) => channel(element, ctx)).join(","));
     }
-    parts.push(...counterParts(root, boxOwners));
+    parts.push(...counterParts(root, boxOwners), ...mediaTimeParts(root, quantize, "video"));
     return parts.join("|");
   }
+
+  // --- Rendered frames: the last word where DOM channels cannot see paint ------
+  // A frame moved when enough pixels changed by more than render noise (antialiasing, dither) on some channel.
+  // ponytail: fewer than FRAME_MIN_CHANGED_PIXELS changed pixels reads as still; lower it for tinier motion.
+  const FRAME_CHANNEL_NOISE = 24;
+  const FRAME_MIN_CHANGED_PIXELS = 16;
+  let reference = { png: "", pixels: null };
+
+  // Decoded in the page like the contrast pass, so no image library is needed.
+  async function framePixels(png) {
+    const image = new Image();
+    image.src = "data:image/png;base64," + png;
+    await image.decode();
+    const canvas = document.createElement("canvas");
+    canvas.width = image.naturalWidth;
+    canvas.height = image.naturalHeight;
+    const ctx2d = canvas.getContext("2d", { willReadFrequently: true });
+    ctx2d.drawImage(image, 0, 0);
+    return ctx2d.getImageData(0, 0, canvas.width, canvas.height);
+  }
+
+  function pixelChanged(a, b, i) {
+    return (
+      Math.abs(a[i] - b[i]) > FRAME_CHANNEL_NOISE ||
+      Math.abs(a[i + 1] - b[i + 1]) > FRAME_CHANNEL_NOISE ||
+      Math.abs(a[i + 2] - b[i + 2]) > FRAME_CHANNEL_NOISE ||
+      Math.abs(a[i + 3] - b[i + 3]) > FRAME_CHANNEL_NOISE
+    );
+  }
+
+  // Base64 PNG screenshots in, "did anything visible change" out. The first frame is usually a run's
+  // reference compared against many, so its decode is kept.
+  // fallow-ignore-next-line complexity
+  async function framesDiffer(first, second) {
+    if (first === second) return false;
+    if (!first || !second) return true;
+    if (reference.png !== first) reference = { png: first, pixels: await framePixels(first) };
+    return pixelsDiffer(reference.pixels, await framePixels(second));
+  }
+
+  // fallow-ignore-next-line complexity
+  function pixelsDiffer(a, b) {
+    if (a.width !== b.width || a.height !== b.height) return true;
+    let changed = 0;
+    for (let i = 0; i < a.data.length; i += 4) {
+      if (pixelChanged(a.data, b.data, i) && ++changed >= FRAME_MIN_CHANGED_PIXELS) return true;
+    }
+    return false;
+  }
+
+  window.__hyperframesFramesDiffer = framesDiffer;
 
   window.__hyperframesMotionSignature = {
     compositionRoot,
@@ -369,6 +492,9 @@
   // The name predates the textual/media channels and is kept for driver
   // compatibility.
   window.__hyperframesLayoutGeometry = function collectLayoutGeometry() {
-    return compositionSignature(compositionRoot(), { quantize: false });
+    const root = compositionRoot();
+    // AUDIO_TIME_SEPARATOR in utils/checkPipeline.ts: what follows it is audio time, not something seen.
+    const audio = root ? mediaTimeParts(root, false, "audio").join("|") : "";
+    return `${compositionSignature(root, { quantize: false })}\u001f${audio}`;
   };
 })();

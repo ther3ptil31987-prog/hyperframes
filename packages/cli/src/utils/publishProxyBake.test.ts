@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 
@@ -20,7 +20,10 @@ const mocks = vi.hoisted(() => {
     }
   }
   return {
-    resolveProxy: vi.fn<(projectDir: string, absoluteSourcePath: string) => Promise<string>>(),
+    resolveProxy:
+      vi.fn<
+        (projectDir: string, absoluteSourcePath: string, variant?: string) => Promise<string>
+      >(),
     scanProjectMediaCodecMap: vi.fn<
       (...args: unknown[]) => Promise<
         Record<
@@ -35,16 +38,16 @@ const mocks = vi.hoisted(() => {
       >
     >(),
     ProxyTranscodeError: FakeProxyTranscodeError,
-    waitForProxy: vi.fn(<T>(promise: Promise<T>, _timeoutMs?: number) => promise),
   };
 });
 const FakeProxyTranscodeError = mocks.ProxyTranscodeError;
 
 vi.mock("@hyperframes/studio-server/proxy-transcoder", () => ({
-  resolveProxy: mocks.resolveProxy,
+  resolveProxies: (projectDir: string, sources: Array<{ sourcePath: string; variant: string }>) =>
+    Promise.allSettled(
+      sources.map(({ sourcePath, variant }) => mocks.resolveProxy(projectDir, sourcePath, variant)),
+    ),
   ProxyTranscodeError: mocks.ProxyTranscodeError,
-  waitForProxy: mocks.waitForProxy,
-  TRANSCODE_TIMEOUT_MS: 15 * 60 * 1000,
 }));
 
 vi.mock("@hyperframes/studio-server/media-codec-map", () => ({
@@ -53,6 +56,7 @@ vi.mock("@hyperframes/studio-server/media-codec-map", () => ({
 }));
 
 const { bakeMediaProxies, PROXY_ARCHIVE_PREFIX } = await import("./publishProxyBake.js");
+const { buildPublishFileMap } = await import("./publishProject.js");
 
 // No real project directory is touched: `scanProjectMediaCodecMap` (which
 // would otherwise walk `projectDir`) and `resolveProxy` (which would
@@ -114,7 +118,6 @@ describe("bakeMediaProxies", () => {
       join(PROJECT_DIR, "clip.mp4"),
       "h264",
     );
-    expect(mocks.waitForProxy).toHaveBeenCalledWith(expect.any(Promise), 15 * 60 * 1000);
     expect(manifest).toEqual({ proxied: ["/clip.mp4"], skippedAlpha: [], failed: [] });
   });
 
@@ -274,4 +277,52 @@ describe("bakeMediaProxies", () => {
     expect(mocks.scanProjectMediaCodecMap).not.toHaveBeenCalled();
     expect(fileContents.size).toBe(1);
   });
+
+  it("never bakes a hostile video staging left out", async () => {
+    mocks.scanProjectMediaCodecMap.mockResolvedValue({
+      "/secret.mov": { codecName: "prores", browserHostile: true, representativeMime: null },
+    });
+    const fileContents = new Map<string, Buffer>([
+      ["index.html", indexHtml(`<video src="secret.mov" muted></video>`)],
+    ]);
+
+    const manifest = await bakeMediaProxies(PROJECT_DIR, fileContents);
+
+    expect(mocks.resolveProxy).not.toHaveBeenCalled();
+    expect([...fileContents.keys()]).toEqual(["index.html"]);
+    expect(manifest.proxied).toEqual([]);
+  });
+
+  it.skipIf(process.platform === "win32")(
+    "never bakes a received file's video reached through a linked folder",
+    async () => {
+      const root = mkdtempSync(join(tmpdir(), "hf-publish-proxy-received-"));
+      tempDirs.push(root);
+      mkdirSync(join(root, "shared"));
+      writeFileSync(join(root, "shared", "secret.mov"), "PRORES");
+      mkdirSync(join(root, "p", ".hyperframes"), { recursive: true });
+      symlinkSync(join(root, "shared"), join(root, "p", "linked"));
+      writeFileSync(join(root, "p", "index.html"), `<video src="linked/secret.mov"></video>`);
+      writeFileSync(
+        join(root, "p", ".hyperframes", "received-files.json"),
+        JSON.stringify({ files: ["index.html"] }),
+      );
+      mocks.scanProjectMediaCodecMap.mockResolvedValue({
+        "/linked/secret.mov": {
+          codecName: "prores",
+          browserHostile: true,
+          representativeMime: null,
+        },
+      });
+      const warnings: string[] = [];
+      const fileContents = buildPublishFileMap(join(root, "p"), (w) => warnings.push(w));
+
+      const manifest = await bakeMediaProxies(join(root, "p"), fileContents);
+
+      expect(warnings).toHaveLength(1);
+      expect(mocks.resolveProxy).not.toHaveBeenCalled();
+      expect([...fileContents.keys()]).toEqual(["index.html"]);
+      expect(manifest.proxied).toEqual([]);
+    },
+  );
 });
